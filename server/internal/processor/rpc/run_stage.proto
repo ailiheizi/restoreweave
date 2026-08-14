@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package restoreweave.processor.v1;
+
+option go_package = "github.com/ailiheizi/restoreweave/server/internal/processor/rpc";
+
+// Private experimental control schema. Large bytes travel on pre-opened
+// file descriptors (SCM_RIGHTS), never in these messages. grpc-go wrapping
+// uses the same field numbers over a Unix handshake that still passes FDs
+// out of band. This is not a public ABI.
+
+message RunStageRequest {
+  string attempt_id = 1;
+  int64 fence_token = 2;
+  string capability_id = 3;
+  string stage = 4;
+  int64 max_output_bytes = 5;
+  int32 source_fd_index = 6;
+  int32 staging_fd_index = 7;
+}
+
+message RunStageResponse {
+  string status = 1;
+  string determinism_class = 2;
+  string schema_ref = 3;
+  string media_type = 4;
+  bool sealed = 5;
+  string reason = 6;
+}

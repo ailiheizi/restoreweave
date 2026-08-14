@@ -1,0 +1,16 @@
+---
+description: RestoreWeave owns identity and recovery, not FUSE or foreign mounts
+alwaysApply: true
+---
+
+# Owned surface
+
+Read `docs/technical/remaining-work-and-closed-decisions.md` before planning mount, FUSE, VM, or engine work.
+
+- Occam: do not add a subsystem when restore, `FileAccess`, or an existing HTTP API already suffices. Clients speak OpenSubsonic, OPDS, or Inbox JSON — not the Unix-socket envelope.
+- Own: identity, catalog, annotations, daemon commands, Inbox page, OpenSubsonic/OPDS HTTP APIs, `FileAccess` / `content.*`, verify, restore.
+- Clients we keep: `rw`, read-only MCP, one Inbox page. Everything else is a foreign app on those HTTP APIs. No native suite, no full WebUI.
+- Do not own: kernel FUSE, macFUSE, WebDAV/SMB servers, `allow_other`, or “make it mountable.” `gateway.mount` stays unimplemented. Operators restore, then use rclone, sshfs, or NAS SMB.
+- The in-tree `server/internal/gateway/fuse` adapter is leftover. Do not qualify it, adapt it for Darwin, or treat `/dev/fuse` as remaining product work.
+- Do not replace the fake CAS or name Kopia/Restic as the release engine. Do not expand requirement documents. Do not embed a player, reader, or media server in `restoreweaved`.
+- Darwin can run catalog and facades. Do not use `sandbox-exec` as bubblewrap. Processor failure must not block exact ingest/verify/restore.

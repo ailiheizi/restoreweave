@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RestoreWeave Inbox</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; line-height: 1.45; }
+    header, main { max-width: 880px; margin: 0 auto; padding: 16px; }
+    header { border-bottom: 1px solid color-mix(in srgb, currentColor 16%, transparent); }
+    h1 { font-size: 1.25rem; margin: 0 0 8px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    input, button, textarea { font: inherit; padding: 6px 8px; }
+    input[type=search], input[type=text] { flex: 1; min-width: 12rem; }
+    button { cursor: pointer; }
+    .muted { opacity: 0.7; font-size: 0.9rem; }
+    .hit, .panel { border: 1px solid color-mix(in srgb, currentColor 16%, transparent); padding: 12px; margin: 10px 0; }
+    .hit { cursor: pointer; }
+    .hit:hover { background: color-mix(in srgb, currentColor 6%, transparent); }
+    audio, pre { width: 100%; }
+    pre { white-space: pre-wrap; max-height: 20rem; overflow: auto; }
+    .err { color: #b00020; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>RestoreWeave Inbox</h1>
+    <p class="muted">Thin Inbox over HTTP APIs. Not a WebUI product. Recovery still works if this page is gone.</p>
+    <div class="row">
+      <input id="q" type="search" placeholder="Search titles, tags, paths">
+      <button id="searchBtn" type="button">Search</button>
+      <button id="verifyBtn" type="button">Verify snapshot</button>
+    </div>
+    <p id="status" class="muted"></p>
+  </header>
+  <main>
+    <div id="hits"></div>
+    <section id="item" class="panel" hidden>
+      <h2 id="itemTitle"></h2>
+      <p id="itemMeta" class="muted"></p>
+      <div id="preview"></div>
+      <div class="row">
+        <input id="dest" type="text" placeholder="Restore destination directory">
+        <button id="restoreBtn" type="button">Restore snapshot</button>
+      </div>
+      <p id="itemMsg" class="muted"></p>
+    </section>
+  </main>
+  <script>
+    const token = new URLSearchParams(location.search).get("token") || "";
+    const api = (path, opts = {}) => {
+      const url = new URL(path, location.origin);
+      if (token) url.searchParams.set("token", token);
+      return fetch(url, Object.assign({ headers: { "Accept": "application/json" } }, opts));
+    };
+    const $ = (id) => document.getElementById(id);
+    const status = $("status");
+    const hits = $("hits");
+    const item = $("item");
+    let current = null;
+
+    async function loadStatus() {
+      const res = await api("/inbox/api/status");
+      const data = await res.json();
+      status.textContent = data.workspace_id
+        ? `workspace ${data.workspace_id}  snapshot ${data.snapshot_ref || "(latest)"}`
+        : (data.error || "unavailable");
+    }
+    async function runSearch() {
+      const q = $("q").value.trim();
+      const res = await api("/inbox/api/search?q=" + encodeURIComponent(q));
+      const data = await res.json();
+      hits.innerHTML = "";
+      (data.hits || []).forEach((hit) => {
+        const el = document.createElement("div");
+        el.className = "hit";
+        el.textContent = (hit.name || hit.subject_ref) + (hit.path ? "  —  " + hit.path : "");
+        el.onclick = () => openItem(hit.subject_ref);
+        hits.appendChild(el);
+      });
+      if (!(data.hits || []).length) hits.textContent = data.error || "No hits.";
+    }
+    async function openItem(id) {
+      const res = await api("/inbox/api/item?id=" + encodeURIComponent(id));
+      const data = await res.json();
+      current = data;
+      item.hidden = false;
+      $("itemTitle").textContent = data.title || data.name || id;
+      $("itemMeta").textContent = [
+        data.kind, data.subject_ref, data.content_id
+      ].filter(Boolean).join(" · ");
+      const preview = $("preview");
+      preview.innerHTML = "";
+      if (data.kind === "audio") {
+        const audio = document.createElement("audio");
+        audio.controls = true;
+        const src = new URL("/inbox/api/preview", location.origin);
+        src.searchParams.set("id", id);
+        if (token) src.searchParams.set("token", token);
+        audio.src = src.toString();
+        audio.addEventListener("timeupdate", () => {
+          if (!audio.duration) return;
+          api("/inbox/api/progress", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              subject_ref: id,
+              position_ms: Math.floor(audio.currentTime * 1000),
+              completed: audio.ended
+            })
+          });
+        });
+        preview.appendChild(audio);
+      } else if (data.kind === "text" || data.kind === "epub") {
+        const pre = document.createElement("pre");
+        pre.textContent = data.preview_text || "(no extracted text)";
+        preview.appendChild(pre);
+      }
+    }
+    $("searchBtn").onclick = runSearch;
+    $("q").addEventListener("keydown", (e) => { if (e.key === "Enter") runSearch(); });
+    $("verifyBtn").onclick = async () => {
+      const res = await api("/inbox/api/verify", { method: "POST" });
+      const data = await res.json();
+      status.textContent = data.ok ? `verify ok · ${data.files || 0} files` : (data.error || "verify failed");
+    };
+    $("restoreBtn").onclick = async () => {
+      const dest = $("dest").value.trim();
+      const res = await api("/inbox/api/restore", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ destination: dest })
+      });
+      const data = await res.json();
+      $("itemMsg").textContent = data.ok
+        ? `restored ${data.files || 0} files to ${data.destination}`
+        : (data.error || "restore failed");
+    };
+    loadStatus();
+  </script>
+</body>
+</html>
