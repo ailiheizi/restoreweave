@@ -1,0 +1,407 @@
+# Core MVP Execution Plan
+
+> **Status:** Normative implementation order, updated 2026-08-20. This plan does not add a new product surface. It translates the product requirements into one dependency-ordered path for the content, protection, discovery, export, and recovery core. FUSE, network filesystem servers, players, readers, and domain facades are outside this plan.
+
+## 1. What We Are Building
+
+The first useful RestoreWeave core is one operator loop:
+
+```text
+configure data location, storage profile, and embedding profile
+-> inspect an explicit source
+-> choose exact, exact-with-external-fallback, link-only, or metadata-only protection
+-> create a reviewable plan
+-> apply and publish immutable records
+-> retain names, metadata, descriptions, and recovery references
+-> search lexical + structured + semantic information
+-> freeze an ExportManifest
+-> materialize and verify selected output
+-> restore exact bytes or explicitly reacquire an external reference
+```
+
+The core owns the records and evidence. A model, repository, external URL, or client can be replaced without changing the meaning of a `Subject`, `ContentIdentity`, `ProtectionRecord`, `DescriptionDocument`, or `ExportManifest`.
+
+## 2. Current Baseline
+
+The checkout already contains useful foundations:
+
+- raw and display namespace names, path keys, and a portion of filesystem metadata;
+- SHA-256 exact placement in a development raw directory CAS and an opt-in embedded whole-file zstd candidate;
+- SQLite operational records for observations, namespace entries, file versions, representations, artifacts, annotations, plans, jobs, and publications;
+- portable snapshot JSON, self-digest checks, and catalog-free exact restore tests;
+- lexical FTS foundations and fixture dimension/fusion contracts;
+- CLI, Unix command protocol, read-only MCP, and optional compatibility facades.
+
+These foundations are not release completion. In particular, fixture embeddings are not a real semantic provider; neither the raw directory CAS nor the local zstd candidate is a qualified production repository. The checkout now also has the first signed publication-closure path and a `snapshot.v2` partial portable-fact projection. That projection authenticates hard-link, sparse indication, boundary, detection, and explicit unsupported extended-metadata states, but signs `PARTIAL` coverage plus the remaining omissions instead of claiming the full recovery contract. A separate signed post-commit child authenticates deterministic terminal processor-attempt provenance without changing the exact commit. Artifact bodies and portable subject mapping, descriptions/annotations, actual extended-metadata capture, and per-field name/ownership/mode/time provenance are still open; the trust anchor must be retained independently. A catalog-free recovery-reader daemon now validates a v2 recovery reference against an independently retained anchor and read-only repository, and admits the existing v1 bundle over a narrow socket without SQLite, indexes, or signing material. A snapshot's embedded digest alone detects accidental modification but is not an independent trust anchor: a writer who can replace the JSON can recompute that digest.
+
+## 3. Phase Order
+
+| Phase | Name | Depends on | User-visible result | Exit gate |
+| --- | --- | --- | --- | --- |
+| 0 | Contract and config freeze | None | One unambiguous configuration and status vocabulary | Normative docs and traceability matrix agree |
+| 1 | Protection and portable facts | 0 | `STORE_EXACT`, `STORE_EXACT_WITH_EXTERNAL_FALLBACK`, `LINK_ONLY`, and `METADATA_ONLY` decisions produce canonical, honest outcomes | Clean manifest preserves names, metadata, and recovery state |
+| 2 | Plan/review/apply integrity | 1 | Preview is non-mutating; apply is digest-bound and idempotent | Stale or altered plans fail closed |
+| 3 | Recovery closure | 1, 2 | A clean machine can verify and restore without SQLite or indexes | Signed closure/publication and corruption tests pass |
+| 4 | Descriptions and complete discovery | 1, 3 | Users can search filename, metadata, text, tags, notes, descriptions, and semantic meaning | Structured coverage and segment provenance are complete |
+| 5 | Simple qualified storage savings | 2, 3 | Real physical savings are measured and recoverable | Repository codec/dedup qualification passes |
+| 6 | Export and operator ergonomics | 2, 3, 4, 5 | Users select by view and export without internal IDs | View -> manifest -> materialize -> verify passes |
+| 7 | Release hardening | 3, 4, 5, 6 | Native personal-use installation and upgrade path | Full `RW-MVP-1` acceptance passes |
+
+The order is deliberate. Semantic features must not be allowed to hide missing recovery evidence, and neural compression must not be allowed to decide exact identity or postpone a trustworthy restore path.
+
+The dependency graph is:
+
+```text
+Phase 0 -> Phase 1 -> Phase 2 -> Phase 3
+                                  |-> Phase 4: descriptions + complete discovery --|
+                                  |-> Phase 5: qualified simple storage -----------|
+                                                                                   v
+                                                                        Phase 6 -> Phase 7
+```
+
+Phases 4 and 5 may proceed in parallel only after the Phase 3 portable-record shapes are frozen. Phase 6 waits for both: an export cannot make a qualified recovery or net-savings claim against an unqualified repository, and the ordinary selection loop is incomplete without the default discovery experience.
+
+Every phase uses the same completion rule:
+
+1. **Only in scope:** the records, operations, and user outcome named by that phase.
+2. **Explicitly out of scope:** adapters and algorithms that do not close its exit gate.
+3. **Entry evidence:** every dependency gate is closed or a narrowly documented interface stub is sufficient for parallel work.
+4. **Exit evidence:** executable acceptance tests plus visible status; types, fixtures, mocks, and protocol handshakes alone do not close a phase.
+5. **User result:** one ordinary workflow that does not require internal IDs or knowledge of repository/index internals.
+
+### Implementation checkpoint (2026-08-20)
+
+This table is checkout status, not a change to phase gates:
+
+| Phase | Current checkout | Still required before the phase gate closes |
+| --- | --- | --- |
+| 0 | Strict persisted `restoreweave.config.v1`; XDG paths; `rw config init/validate/show --effective`; config digest on ingest plans, snapshots, and publications; local ONNX/BGE + zvec selected as the target default profile | Bind provider/profile digests to every representation, description, and real index generation; package and validate the selected providers. The runtime provider is not wired in this checkout |
+| 1 | `ProtectionRecord`, `RecoveryReference`, `SourceBinding`, multiple credential-free `ExternalLocator` rows, raw names/paths and before/after metadata in the manifest; per-file `STORE_EXACT`, `STORE_EXACT_WITH_EXTERNAL_FALLBACK`, `LINK_ONLY`, and `METADATA_ONLY` decisions bound by a protection digest; typed planned outcome/reason/identity; visible exact fallback for unresolved readable content; failed/unstable entries retained with requested mode, `BLOCKED`/`UNAVAILABLE` outcome, path, state, and reason in a non-executable plan; a narrow successor-plan resolution admits only explicitly selected, stable rooted regular-file read failures as `METADATA_ONLY` and preserves `INCOMPLETE` scan authority; immutable per-subject processor attempts persist terminal outcomes and a signed post-commit child binds their deterministic bundle to the exact parent; `snapshot.v2` records typed hard-link, sparse indication, boundary, detection, and explicit unsupported xattr/ACL/extent/stream/fork/flag facts with per-record provenance digests | Add portable artifact bodies and subject mapping, descriptions, and annotations through signed successor records; add actual qualified extended-metadata and sparse-extent capture plus per-field name/ownership/mode/time provenance; prove portable locator/reference persistence without pretending to reacquire; and pass full portable rebuild tests |
+| 2 | **Sub-items complete in this checkout:** non-mutating ingest and restore planning, digest-bound apply, source/config/manifest/destination revalidation, same-plan replay, committed-publication reconciliation, verified completed-restore reconciliation, typed ingest-protection revision with reinspection/recomputation, fail-closed apply for blocked plans, per-subject degraded processor reporting, and durable append-only processor terminal outcomes. The exact apply Job remains successful after post-publication processor/index failure. **The Phase 2 gate remains open.** | Add processor retry/reconciliation semantics and a formal async worker model beyond the in-process lease model; production repository qualification and release acceptance belong to Phases 5 and 7 |
+| 3 | **Signed foundation implemented:** Ed25519 `PREPARED_CLOSURE`, `PUBLICATION_COMMIT`, and post-commit `PROCESSOR_ATTEMPT_CLOSURE` records; payload aggregate receipts; authenticated metadata evidence; immutable placement/readback checks; commit discovery; generation/parent lineage; catalog-free list/verify/restore and processor-attempt validation; recovery export bundles; SQLite projection reconciliation; a signed `PARTIAL` portable-fact coverage declaration whose digest covers the full manifest projection; and a catalog-free recovery-reader daemon with independent-anchor validation and v1 bundle import. The daemon enables signed publication by default | Close the remaining signed omissions listed above; qualify no-follow traversal and portable reader behavior for admitted records; add explicit processor retry/successor lineage and cross-process fencing/lease. Production repository selection remains Phase 5. Phase 3 remains open |
+| 4 | Durable metadata facts and append-only description revisions exist; `description.create/list/get` and `rw description` provide bounded 16 MiB UTF-8 input, single-successor revision chains, and source-aligned segment spans; broad lexical feed fields include descriptions | Portable authenticated description export/recovery, config/profile binding, typed structured filters, real ONNX/BGE execution, zvec generations, segment-hit provenance, and the hybrid query broker |
+| 5 | `local-zstd-v1` is an opt-in, no-Compose candidate with whole-file SHA-256 deduplication, checksummed zstd payloads, transparent decode-and-hash verification, physical-byte placement receipts, profile mismatch protection, relocation tests, concurrent no-replace placement, and catalog-free signed restore coverage | Encryption, chunk deduplication, reachability/GC, repair, crash/corruption qualification, complete space accounting, representative corpus measurements, reader closure, and a release decision. Phase 5 remains open |
+| 6-7 | Interface foundations only | Views/exports, packaging, upgrade, and release acceptance |
+
+`capability.list` is fail-closed: without a real semantic provider it reports `SEMANTIC_INDEX_UNAVAILABLE`. Acoustic, semantic, and multimodal fixtures are available only to an explicitly enabled qualification harness and are never default capabilities.
+
+### Immediate work lock
+
+Until Phase 3 closes, implementation work is restricted to this order:
+
+1. Complete the portable file-fact profile and bind description/annotation references, artifact bodies, and portable subject mapping. Keep terminal processor attempts in their authenticated post-commit child; any retry or reprocessing must first gain an explicit signed successor lineage.
+2. Qualify the implemented clean-install import/reader and independently retained trust-anchor workflow across supported platforms.
+3. Add cross-process publication fencing and unknown-outcome reconciliation.
+4. Prove corruption rejection, relocation, and reader-dependency handling for the portable closure and currently admitted profiles; full repository repair, migration, and engine selection remain Phase 5.
+
+After that, Phase 4 and Phase 5 may run in parallel. Phase 4 first delivers the real local ONNX/BGE worker, zvec generation, complete field coverage, segment provenance, and fused query. Phase 5 measures `local-zstd-v1` and selects and qualifies one mature repository target from the common evidence. Only then does Phase 6 implement views and exports.
+
+During this lock there are no new Inbox, OpenSubsonic, OPDS, MCP, or other facade features; no FUSE or network filesystem; no OpenList fork or dependency; no player, domain-reader, or WebUI surface; no additional acoustic/graph/multimodal dimension; and no RWKV/Transformer codec implementation. The portable recovery reader required by Phase 3 remains core work. Existing optional adapters are maintenance-only and cannot count toward a phase gate.
+
+The first locked item uses the normative `PORTABLE_FACT_CLOSURE` v1 shape. It
+is a complete-state signed successor chain over the one exact parent, not a new
+publication. Implementation order inside that item is: immutable catalog
+revision exports and subject mapping; content-addressed body attachments;
+signed child placement/discovery/conflict validation; catalog-free rebuild;
+then actual platform fact capture and restore-degradation receipts. Merely
+defining the structs or placing a child does not close the item.
+
+## 4. Phase 0: Contract and Configuration Freeze
+
+### In scope
+
+Freeze these records and enums before adding more adapters:
+
+- `ContentIdentity = (sha256 digest, logical length)`;
+- `ProtectionRecord` modes: `STORE_EXACT`, `STORE_EXACT_WITH_EXTERNAL_FALLBACK`, `LINK_ONLY`, `METADATA_ONLY`;
+- visible outcomes: `EXACT_PROTECTED`, `EXACT_FALLBACK`, `EXTERNAL_REPLAYABLE`, `LINK_ONLY_UNPROTECTED`, `EXPLICITLY_UNPROTECTED`, `BLOCKED`, `UNAVAILABLE`;
+- `RecoveryReference` kinds: exact, reversible, external locator, and user recipe;
+- `MetadataBundle`, `DescriptionDocument`, `DescriptionRevision`, and `SemanticSegment` provenance;
+- `ConfigProfile` and `config_digest` binding rules;
+- local embedding as the personal default, online/hybrid as explicit profiles;
+- no built-in mount or network filesystem service.
+
+The persisted configuration is the operator's small set of choices, not an arbitrary plugin manifest. The first schema contains paths, repository profile, default protection mode, link-only policy, compression profile, embedding mode/profile/backend, description policy, and recovery policy. Credentials are references, not plaintext configuration values.
+
+### Required commands
+
+```text
+rw config init
+rw config validate
+rw config show --effective
+```
+
+Path precedence is `one-shot CLI flag -> environment override -> persisted config -> platform default`. The resolved, redacted configuration is printed at startup and its digest is bound into plans, representations, descriptions, index generations, and publications.
+
+### Out of scope
+
+- model download orchestration;
+- RWKV codec implementation;
+- external retrieval execution;
+- UI or protocol facade changes.
+
+### Exit tests
+
+1. An unknown config field or schema is rejected.
+2. A relative path is resolved once and reported as an absolute effective path.
+3. Secrets never appear in `config show --effective` or plan JSON.
+4. Changing an embedding or storage profile creates a new plan/generation and cannot reinterpret old records.
+
+## 5. Phase 1: Protection and Portable Facts
+
+### 5.1 Protection record
+
+Every namespace subject receives a `ProtectionRecord` independent of whether a local payload exists. It records the selected mode, outcome, expected content identity/length, local representation references, external binding references, policy decision, and last verification.
+
+`LINK_ONLY` is never inferred from a failed processor or an unavailable repository. It is an explicit plan decision. When source bytes are readable, the plan shows the exact-storage alternative and the loss of local protection before the operator confirms link-only mode.
+
+The current command shape supports a tree default plus explicit per-file overrides:
+
+```text
+rw ingest <root> --protection LINK_ONLY --confirm-link-only \
+  --locator 'relative/path.ext=https://example.invalid/path.ext' \
+  --locator 'relative/path.ext=ipfs://content-address/path.ext'  # creates READY plan
+rw plan apply <plan-id> --workspace <workspace-id> --digest <plan-digest>
+```
+
+For a mixed tree, repeat `--file-protection 'relative/path=MODE'`. The READY plan lists each regular file's planned outcome, reason, expected SHA-256 identity and length, and locator count; all of those facts contribute to `protection_digest` and the outer plan digest.
+
+The first command is read-only and must be reviewed before the digest-bound `plan.apply`; it does not publish repository data by itself.
+
+An unscoped `--locator URI` is accepted only when the capture contains exactly one regular file. Repeating `--locator` records alternatives for that subject. The current implementation hashes readable source bytes and records the expected digest and length, but it does not fetch the locator; therefore the outcome remains `LINK_ONLY_UNPROTECTED` and validation remains `UNVALIDATED`. Human output must say this explicitly so a successful catalog write cannot be mistaken for successful protection.
+
+### 5.2 External references
+
+Implement structured `SourceBinding` and `ExternalLocator` records rather than placing URLs in generic metadata. One binding may have multiple locators with priority, type, expected length/digest, immutable revision, credential reference, rights evidence, availability, expiry, and validation history.
+
+Portable locator fields are credential-free. Userinfo, URI fragments, and query strings are rejected by the current inert recorder because signed URLs and bearer parameters would otherwise leak into snapshots, recovery exports, and search indexes. Access material belongs behind `credential_ref`. A future `RetrieverDriver` may define a narrower typed set of public locator parameters, but it must still keep secret material out of portable records.
+
+Reacquisition is always explicit:
+
+```text
+external locator
+-> quarantine acquisition
+-> independent digest/length and component validation
+-> new local exact representation
+-> new placement and recovery reference
+```
+
+A link-only subject remains link-only until this process succeeds. A mutable URL without expected identity is discovery evidence, not a recovery claim.
+
+### 5.3 Portable namespace closure
+
+Extend the portable record so each entry retains:
+
+- raw filename bytes and safe display name;
+- raw parent/path component relation, not only a UTF-8 joined path;
+- entry type, source identity, before/after metadata, and change evidence;
+- size, allocated size, timestamps, mode, ownership, link count, hard-link group, sparse facts, xattrs/ACL references, and declared unsupported fields;
+- suffix/magic/detection evidence and processing warnings;
+- namespaced `MetadataBundle` facts with per-field provenance and authority;
+- protection mode/outcome;
+- representation and recovery-reference IDs;
+- external locator metadata without credentials.
+
+The display path is for humans. Restore resolves the raw component sequence under the destination profile and reports any fidelity loss explicitly.
+
+### Exit tests
+
+1. A regular file may have no local representation only when its protection mode is link-only or metadata-only and the state is visible; a readable source may still have a computed `ContentIdentity`.
+2. Multiple URLs for one subject survive catalog rebuild and portable export.
+3. A clean reader can reconstruct the original filename and metadata from the portable record.
+4. Link-only content never reports `RESTORE_VERIFIED` without a fresh, independently verified acquisition.
+
+## 6. Phase 2: Plan, Review, and Apply Integrity
+
+Planning must be genuinely non-mutating. The plan contains the resolved config digest, source/capture basis, per-entry protection decision, expected repository target, processing profiles, description policy, index scope, recovery policy, and canonical plan digest.
+
+The lifecycle is:
+
+```text
+doctor/preflight (read only)
+-> plan create (read only, immutable)
+-> plan show / plan revise (read only, successor plan)
+-> plan apply (digest-bound mutation)
+-> reconcile / publish / job events
+```
+
+Apply MUST revalidate the source basis, destination/repository identity, profile digests, and link-only decisions. Processor failure can fail its derived branch but cannot block readable exact fallback. A retry uses idempotency and fencing and cannot create a second logical publication.
+
+Restore and export planning are also non-mutating. A destination is checked before any write, and a changed destination or manifest digest fails closed. The current completed-restore crash reconciliation is intentionally narrower than the final recovery contract: after a worker crash it accepts only a complete, non-empty destination whose path set, entry types, file lengths, SHA-256 values, and symlink targets exactly match the manifest. Partial, changed, or extra output fails closed; an empty snapshot has no output evidence with which to distinguish "not started" from "already complete" and is not covered by this reconciliation claim.
+
+### Exit tests
+
+1. Plan creation leaves repository, catalog publication, and destination bytes unchanged.
+2. Applying with a wrong digest, stale capture, changed config, or changed destination is rejected.
+3. Applying the same plan twice returns the same logical result.
+4. A processor panic, timeout, or unavailable model leaves exact protection and recovery usable.
+5. Per-entry outcomes explain why a file is exact, fallback, link-only, blocked, or unavailable.
+
+## 7. Phase 3: Recovery Closure
+
+The first signed closure slice is implemented. It is deliberately narrower than the final recovery contract. `PREPARED_CLOSURE` is an immutable, content-addressed envelope containing the manifest/protection/metadata evidence currently admitted by the exact lane; `PUBLICATION_COMMIT` is a separately signed commit marker that binds the prepared-closure digest, payload receipt aggregate, generation, and parent lineage. An Ed25519 trust anchor is exported separately and is never inferred from repository companion data.
+
+The final closure still needs a portable `RecoveryRecipe` for every non-raw representation. Such a recipe binds codec/decoder implementation, model/tokenizer/dictionary digests, framing/chunk index, encoded placement, decoded length, and verification profile. `snapshot.v2` now includes typed hard-link, sparse-indication, boundary, and detection facts plus explicit unsupported declarations for the currently absent xattr, ACL, extent-map, alternate-stream, resource-fork, and flag capture capabilities. Its signed base metadata evidence deliberately says `PARTIAL` and lists processor attempts, descriptions, annotations, and per-field name/ownership/mode/time provenance as omissions. A separate signed `PROCESSOR_ATTEMPT_CLOSURE` now closes the deterministic terminal-attempt bundle after exact commitment while leaving artifact bodies, portable subject mapping, explicit retry/successor lineage, descriptions, and annotations open. Link-only records must include their credential-free locators and unprotected outcome; executing external reacquisition belongs to the later `RetrieverDriver` profile and is not a Phase 3 gate.
+
+The publication sequence is:
+
+```text
+payload placements
+-> metadata and protection closure
+-> signed PREPARED_CLOSURE placement and readback
+-> signed PUBLICATION_COMMIT placement and readback
+-> SQLite projection (rebuildable)
+-> optional processing and immutable terminal-attempt rows
+-> signed PROCESSOR_ATTEMPT_CLOSURE child placement and readback
+```
+
+The operational SQLite catalog and all search stores remain projections. Orphan payloads, prepared-only closures, and invalid signatures are not published. A single daemon publication mutex serializes the current implementation; it is not cross-process fencing or a lease protocol.
+
+The current signed mode supports catalog-free discovery, verification, diff, restore planning, restore, and recovery export from the repository plus an independently supplied trust anchor. The catalog-free recovery-reader daemon validates the v2 reference at startup and imports the existing v1 export bundle without opening SQLite or signing material. The export bundle contains the commit and prepared closure and does not contain a private signing key; retaining it and the trust anchor separately is still an operator responsibility and does not establish a fully qualified independent failure domain.
+
+### Current tests and remaining gate
+
+Implemented tests cover:
+
+1. Delete SQLite and index projections; repository commit discovery authenticates and lists the committed snapshot.
+2. Restore exact files and compare digest plus logical length from the signed publication path.
+3. Inject missing, truncated, or modified payload/closure objects, or use the wrong trust anchor; recovery fails closed.
+4. A commit created before a missing SQLite projection can reconcile that projection without publishing a second snapshot.
+5. Recovery export includes commit/prepared closure records and no private key.
+6. A failed processor attempt is authenticated by a post-commit child that a reader without SQLite verifies; tampering, a missing committed parent, and a conflicting bundle fail the processor-provenance read closed while exact discovery and restore remain usable.
+7. A clean-install daemon test deletes SQLite and signing material, validates an independently retained v2 reference, imports a v1 bundle, and restores exact bytes over the recovery socket without creating a catalog.
+
+The Phase 3 gate remains open until all of the following are true:
+
+1. Every retained recovery-relevant fact, including processor-attempt provenance and xattr/ACL/sparse/detection state, has a portable authenticated closure.
+2. The clean-install import/reader and independently retained trust-anchor workflows are qualified on the supported platforms.
+3. No-follow traversal, cross-process fencing/lease, and recovery-record corruption/relocation behavior are qualified for the admitted profile.
+4. Every reversible representation decodes with its pinned closure and matches the source identity; every link-only reference round-trips with its honest unprotected state, while any future acquisition remains explicit and never silently falls back to a mutable URL.
+5. Every published subject with a recovery reference can export a signed, independently retainable token set; metadata-only subjects export only their unprotected record.
+
+## 8. Phase 4: Descriptions and Complete Discovery
+
+### 8.1 Durable description model
+
+Use a versioned `DescriptionDocument` rather than overloading `Annotation.NOTE` or `ProcessorArtifact.Body`. Kinds include user-authored, imported, extracted, AI summary, and AI analysis. Each revision records language, body digest, source artifacts/spans, producer/model profile, confidence/coverage, visibility, acceptance, predecessor, and timestamps. Structured facts such as language, edition, platform, characters, or game metadata belong in a namespaced `MetadataBundle` with per-field provenance; they are not silently flattened into prose.
+
+Long descriptions are split into ordered `SemanticSegment` records. Segment embeddings point back to the document revision and subject, and search results return the matched segment and provenance.
+
+An embedding model is not automatically a description generator. The config therefore has a semantic embedding profile and an optional description provider profile. A local description model or online model is selected explicitly, with egress policy and credential reference. Generated descriptions are retained as labeled evidence and never overwrite user facts.
+
+### 8.2 Search feed
+
+The complete baseline feed must cover:
+
+- raw/display filename and path;
+- entry type, suffix and magic evidence;
+- full captured metadata and time/size facets;
+- exact digest/length and duplicate groups;
+- protection/recovery status and external locator metadata;
+- tags, notes, user descriptions, imported descriptions, extracted text, and model descriptions;
+- processing state, warnings, provenance, language, and available representations.
+
+The query broker fuses lexical, structured, and semantic segment results. It aggregates segments to subjects without discarding the matched text or source. The local ONNX/BGE + zvec profile is the default; online and hybrid profiles are replaceable and require explicit egress authorization.
+
+### Exit tests
+
+1. Search by filename, metadata, checksum, duplicate group, tag, note, extracted text, and description returns the same authorized subject.
+2. A semantic hit identifies its matched segment and description provenance.
+3. Deleting every index preserves descriptions, annotations, protection records, and recovery.
+4. Switching local/online embedding profiles creates a new generation and does not rewrite old descriptions or vectors.
+5. Semantic provider failure leaves lexical/structured search and exact recovery available with an explicit degraded state.
+
+## 9. Phase 5: Simple Qualified Storage Savings
+
+The first storage path is intentionally conservative:
+
+1. SHA-256 plus logical length for identity.
+2. Whole-content exact deduplication.
+3. Lossless repository compression behind `RepositoryDriver`.
+4. Optional content-defined chunking only after independent chunk readback and corruption tests.
+
+The controller reports logical bytes, duplicate savings, compression savings, repository growth, metadata/index/model overhead, and net physical savings separately.
+
+The current `local-zstd-v1` candidate implements items 1-3 with whole-file zstd and no external service. `Receipt.Bytes` is always logical decoded length and `Receipt.StoredBytes` is physical object length; signed payload receipts continue to bind logical length only. This is enough to test exactness and gather corpus evidence, not enough to close the phase. It has no encryption, chunking, destructive GC, repair workflow, or complete operator-facing space report. The generated config therefore remains on `directory-cas-dev-v1` until a release profile is qualified.
+
+Phase 5 does not begin with a selected repository brand. Every candidate is scored against the same dated qualification record: complete `RepositoryDriver` operations, immutable logical identity, exact readback, crash/corruption behavior, encryption and credential handling, reachability/GC ownership, repair, relocation, migration/rollback, supported-platform packaging, independently installable reader closure, measured net savings, and license/support risk. Exactly one tuple may become the release default only after all mandatory gates pass; if none passes, `RW-MVP-1` remains blocked rather than silently promoting `local-zstd-v1`, Kopia, Restic, or another candidate.
+
+RWKV/Transformer prediction plus arithmetic/range coding is a later `EXACT_REVERSIBLE` codec profile. It must implement probe, estimate, encode, decode, verify, dependency closure, and migration fallback. It is not selected by default and cannot retire raw/lossless fallback until cold decode, model absence, corruption, upgrade, and net-saving tests pass.
+
+### Exit tests
+
+1. Identical bytes across different paths share exact identity while paths and metadata remain separate.
+2. Lossless compression and chunking read back to the original digest and length.
+3. Repository corruption is detected before a healthy claim.
+4. Total dependency overhead is included in net-savings reports.
+5. Removing an experimental codec does not make retained data unreadable.
+
+## 10. Phase 6: Export and Operator Ergonomics
+
+Implement the user-facing organization loop:
+
+```text
+rw view create <name> --query <query>
+rw view list
+rw export create --view <name> --to-manifest <file>
+rw export apply <manifest> --to <directory>
+rw export verify <manifest> --to <directory>
+```
+
+Saved views remain dynamic. `ExportManifest` freezes membership, representations, output names, metadata/sidecar policy, config/profile digests, and verification requirements. Replaying a manifest is reproducible; reevaluating a view is not.
+
+Normal commands SHOULD accept a view, subject, path, or search expression and SHOULD print stable human references. Internal workspace/root/entry IDs remain available in JSON diagnostics but are not required for the ordinary loop.
+
+### Exit tests
+
+1. View membership may change while an existing manifest does not.
+2. Export destination collisions, unsafe reuse, symlink attacks, and metadata degradation are explicit.
+3. Every materialized item has an exact or declared non-exact receipt.
+4. Re-running the same manifest is idempotent and verifies the same bytes.
+
+## 11. Phase 7: Release Hardening
+
+Only after phases 0-6 pass:
+
+- select and qualify exactly one production repository profile and supported backend tuple from the Phase 5 evidence; no engine name is normative before that dated decision, and `local-zstd-v1` remains only a single-machine measurement candidate until it passes every applicable gate;
+- package the local model, tokenizer, ONNX runtime, and zvec native library;
+- implement native install, config migration, backup/restore, and upgrade checks;
+- run the full `RW-MVP-1` acceptance corpus on local and NAS-like sources;
+- publish measured search coverage, semantic latency, storage savings, recovery time, and resource limits.
+
+### Exit tests
+
+1. A clean supported host installs without Docker Compose or first-query downloads, validates the generated config, and reports the exact repository, embedding, vector, reader, and trust profiles.
+2. The full ordinary loop succeeds: configure -> ingest plan -> review/apply -> fused search -> description/tag -> saved view -> frozen manifest -> materialize/verify -> clean restore.
+3. Removing SQLite and every index still permits authenticated clean discovery of committed recovery records and exact restore with an independently supplied trust anchor.
+4. Removing the semantic generation produces explicit degradation; rebuilding it restores the same profile-bound coverage without changing subjects or durable descriptions.
+5. Upgrade, interrupted upgrade, rollback, repository relocation, corruption, low-space, process crash, and reboot tests preserve or fail closed on every durable contract.
+6. Published corpus results include logical bytes, whole-file duplicate savings, repository compression/chunk savings, physical growth, temporary space, catalog/index/model overhead, and net savings without double counting.
+7. No release acceptance step depends on a facade, mount, OpenList, media client, internal database ID, or an online model.
+
+## 12. Explicitly Deferred
+
+These are not blockers for the core plan and must not be pulled forward:
+
+- FUSE or any RestoreWeave mount service;
+- SMB/WebDAV/NFS/S3 gateways;
+- embedded players/readers or domain-specific UI;
+- automatic source deletion, destructive GC, or writable synchronization;
+- Qdrant/Milvus personal-use defaults;
+- OpenList as a core dependency, storage engine, catalog authority, or fork base;
+- OCR/ASR/CLIP/Chromaprint packs beyond the qualified baseline;
+- P2P/reacquisition automation without a separate `RetrieverDriver` profile;
+- RWKV/Transformer neural compression before the simple lossless profile is qualified;
+- enterprise HA, multitenancy, or distributed control plane.
+
+## 13. Traceability Rule
+
+Every implementation change must link to one phase, one normative requirement, one exit test, and one visible status. A fixture, facade handshake, or unit test may prove an interface shape, but it cannot mark a production provider, recovery contract, or user loop complete.
+
+The following review rules are mandatory:
+
+1. Work outside the currently unlocked phase is rejected unless it is a narrowly documented prerequisite for that phase; an adapter, extra index dimension, protocol method, or experimental codec is never such a prerequisite by assertion alone.
+2. A status may advance only when the canonical matrix in [Content Store, Views, and Export Requirements](../requirements/content-store-views-and-exports.md) and the corresponding executable exit evidence change together.
+3. Changing a frozen decision requires the product requirement, durable schema/config migration, compatibility analysis, and acceptance tests in the same reviewed change. Editing an informative plan cannot change scope.
+4. Words such as “complete”, “default”, “available”, and “supported” must use the frozen status vocabulary. Fixture-contract and adapter-harness evidence remain explicitly prefixed and receive no release credit.
+5. If a proposed feature does not improve the ordinary configure -> protect -> describe/search -> view/export -> verify/restore loop or close one of its safety gates, it stays outside the core queue.

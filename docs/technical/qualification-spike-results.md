@@ -127,3 +127,76 @@ Notes:
 - Re-run with `scripts/qualification-spike.sh --corpus-dir <dir> --work-dir <dir> [--size-mb N]` (pure bash + awk + dd; no bubblewrap/container sandbox needed — it is a plain user-space corpus + repo run). Engine paths are overridable via `KOPIA_BIN`/`RESTIC_BIN`/`PLAKAR_BIN` (default `PATH`); results land in `<work-dir>/results.tsv` and `results.md`.
 - Run as a regular user: Kopia and Plakar need no privileges; `restic restore` may need `root` or `--allow-root` if the snapshot contains root-owned files (and `restic check` is fully offline). The openat2/`O_BENEATH`-style hardening topics are Linux implementation details and are not exercised by this script.
 - Plakar's first-backup cold-start cost (~50 s+ on this host) is expected; FUSE is only needed for `plakar mount` (requires libfuse on Linux) and is not part of this qualification. Note for Plakar v1.1.x: `plakar -disable-security-check create` exits 0 but creates nothing — the script uses plain `plakar create`.
+
+## local-zstd-v1 candidate measurement (2026-08-21)
+
+**This is candidate measurement, not qualification.** It measures the in-tree
+profiles with the mechanism-separated report implemented by
+`server/internal/repository/savings.go` (`MeasureSavings`) and run through
+`scripts/savings-report.sh`. No engine is selected; no engine name becomes
+normative. `local-zstd-v1` remains a candidate pending encryption, chunking,
+GC, repair, migration, reader-closure, and representative-corpus gates.
+
+### Method
+
+Deterministic 11-file corpus (5,601,451 logical bytes / 5.3 MiB) covering the
+behaviors the report must keep separate:
+
+- `texts/` — 3 near-identical text files (dedup-friendly, ~3 KB each)
+- `dupe_0/` + `dupe_1/` — 2 dirs × 3 byte-identical `dup_*.dat` files (~584 KB each; dedup target)
+- `zeros/` — 2 × 2 MB all-zero files (compress target)
+- `rand/` — 3 × ~300 KB seeded-LCG pseudo-random binaries (incompressible; bounds the claim)
+
+Placement recorded every `Receipt` (logical + physical bytes, dedup reuse),
+then `MeasureSavings` re-verified every stored object (decompressing for zstd)
+before reporting. Run on the same host as the engine spike above (macOS 26.5.2,
+Apple Silicon, APFS).
+
+### Measured report
+
+| Metric | `directory-cas-dev-v1` (raw) | `local-zstd-v1` (zstd) |
+| --- | ---: | ---: |
+| Logical bytes | 5,601,451 | 5,601,451 |
+| Duplicate files (reused placements) | 4 | 4 |
+| Duplicate bytes saved | 2,337,152 | 2,337,152 |
+| Compression saved bytes | 0 | 2,363,637 |
+| Physical stored bytes | 3,264,299 | 900,719 |
+| Overhead bytes (profile + identity) | 59 | 52 |
+| Net physical savings | 2,337,093 | 4,700,680 |
+| Physical / logical ratio | 0.583 | 0.161 |
+| Mechanisms reported | whole-file-deduplication | whole-file-deduplication, compression |
+
+The zstd candidate's `physical/logical` ratio of 0.161 is on a corpus that is
+~72% zeros; the same report on a general corpus would not compress that well.
+The seeded-random binaries did not compress (they are incompressible), so the
+0.161 is not a general claim. No engine is selected on the strength of either
+column, and this table must not be compared against the Kopia/Restic/Plakar
+rows above as if they shared one measurement method: those engines were
+measured with `du -sk` on their own repositories on a different corpus and
+date.
+
+### Honesty constraints enforced by the measurement
+
+- Logical bytes come from placement receipts and decompressed readback, never
+  from filename, mode, or metadata.
+- Duplicate savings are counted once per reused placement and never as stored
+  bytes; a repository alone cannot know how many times an object was requested,
+  so `MeasureSavings` requires the placements observed during ingest.
+- Compression savings count only objects where physical < logical; the raw
+  profile reports 0, never a negative "compression".
+- Physical bytes are re-measured from the repository and every object is
+  re-verified first; corruption, absence, or an unmeasurable driver returns an
+  explicit error rather than a fabricated zero report.
+- Repository overhead (profile marker + repository identity) is measured and
+  subtracted before net savings; the in-tree profiles keep no separately stored
+  index/model on the repository path, so index/model overhead is not fabricated.
+
+### Remaining qualification gates (all open)
+
+`local-zstd-v1` is not the release profile. Before any production claim it must
+pass: repository encryption and credential handling, content-defined chunking,
+reachability/GC ownership, repair workflow, crash/corruption qualification,
+relocation, migration/rollback, independently installable reader closure,
+representative corpus measurement, and a dated engine-selection decision. Until
+then the generated config stays on `directory-cas-dev-v1` and this document
+reports a candidate measurement, not a conclusion.
