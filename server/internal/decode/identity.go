@@ -23,9 +23,9 @@ var (
 	ErrBudgetExceeded   = errors.New("decode exceeded host budget")
 )
 
-// IdentityDecoder copies one encoded range to the logical output. Exact
-// representations use a 1:1 mapping; this is DECODE_REPRESENTATION for the
-// fake CAS and any later engine that stores raw exact bytes.
+// IdentityDecoder copies one RepositoryDriver logical range to the output.
+// Backend-private compression is already decoded by the driver, so current
+// exact representations retain a 1:1 mapping here.
 type IdentityDecoder struct{}
 
 func (IdentityDecoder) ID() string { return IdentityDecoderID }

@@ -12,7 +12,9 @@ Where broader documents describe semantic, perceptual, neural, enterprise, or wr
 
 RestoreWeave MVP performs one complete job:
 
-> Connect a heterogeneous local or NAS-mounted tree, identify and process its contents through strong defaults, minimize exact storage, publish a searchable and recoverable filesystem view, and prove that view can be restored on a fresh installation.
+> Connect a heterogeneous local or NAS-mounted tree, identify and process its contents through strong defaults, minimize exact storage, search it through lexical, structured, and local semantic dimensions, freeze export manifests, and prove selected content can be restored on a fresh installation.
+
+The storage, view, export, and embedding defaults in [Content Store, Views, and Export Requirements](content-store-views-and-exports.md) supersede any older wording in this document that treats FUSE as an MVP gate or embeddings as optional. Exact ingest and restore remain independent of the semantic index, but the reference distribution MUST ship the local semantic profile enabled.
 
 The golden path is:
 
@@ -33,12 +35,12 @@ preflight source, processors, working space, and repository
 -> build the baseline metadata and content index
 -> index durable tag and note records
 -> perform deterministic sampled-content verification
--> browse, search, mount, and read the published namespace
+-> browse, search, and read the published namespace; materialize exports when a path-shaped result is needed
 -> restore selected paths or the full tree
 -> compare exact bytes and declared filesystem metadata
 ```
 
-This path must work without an AI model, embedding provider, CLIP provider, WebUI, REST service, agent runtime, or platform-specific snapshot API.
+Exact ingest, verification, and restore must continue without an AI model or semantic index. The qualified reference experience nevertheless includes the pinned local embedding profile; semantic-index failure is an explicit degraded capability, not a reason to silently claim the default experience is complete.
 
 ### 2.1 Managed-archive boundary
 
@@ -50,7 +52,7 @@ The MVP reports repository storage reduction and index overhead precisely. It MU
 
 | Dimension | `RW-MVP-1` choice |
 | --- | --- |
-| Product shape | Self-hosted controller, CLI, and read-only Linux FUSE adapter, usable as a native process or container where qualified |
+| Product shape | Self-hosted controller, CLI, export materializer, and local semantic-search profile, usable as a native process or container where qualified |
 | Target operator | NAS, homelab, archive, and small technical-team operator |
 | Source | One configured local or mounted filesystem root |
 | Platform | NAS/server-oriented; no required vendor, Linux distribution, or filesystem |
@@ -61,11 +63,11 @@ The MVP reports repository storage reduction and index overhead precisely. It MU
 | Exact identity | SHA-256 and length for every published regular-file content identity |
 | Repository | One qualified mature exact repository through `RepositoryDriver`; the release applicability matrix names the selected engine and version |
 | Storage reduction | Exact duplicate grouping plus repository compression and deduplication |
-| Namespace | Authenticated read-only `SnapshotTree` and bounded `FileAccess`, with a bundled single-principal, single-root, immutable-snapshot Linux FUSE projection |
-| Search | Bundled SQLite FTS5 lexical projection over path, metadata, class, checksum, duplicate, tag, note, processing state, common media metadata, and extracted text; the SQLite schema is private and rebuildable |
+| Namespace | Authenticated read-only `SnapshotTree` and bounded `FileAccess`, materialized through explicit export manifests |
+| Search | Bundled hybrid lexical + structured + local semantic generations; the SQLite and zvec schemas are private and rebuildable |
 | Annotations | Durable whole-subject tag and plain-text note CRUD with portable export |
 | Interfaces | Human CLI, stable JSON/JSONL, and local read-only stdio MCP |
-| AI | No embedded model, prompt loop, agent harness, or AI dependency |
+| AI | No embedded agent or prompt loop; the reference profile includes a bundled local embedding worker and may use an explicitly configured description/online provider |
 
 An independently qualified snapshot-capable `CaptureDriver` may make a stronger point-in-time claim. The generic local or mounted-tree profile remains valid without any native snapshot driver and reports only the consistency it actually achieved.
 
@@ -75,10 +77,15 @@ Every selected namespace entry has one visible managed-ingest outcome:
 
 | Outcome | Meaning |
 | --- | --- |
-| `EXACT` | A byte-exact recoverable representation was placed and admitted. |
+| `EXACT_PROTECTED` | A byte-exact recoverable representation was placed, read back, and admitted. |
 | `EXACT_FALLBACK` | Readable bytes were preserved exactly because identification or processing was unknown, unsupported, conflicting, stale, unavailable, or failed. |
+| `EXTERNAL_REPLAYABLE` | No local payload is retained, but an immutable external binding, expected identity, and cold-acquisition evidence make explicit reacquisition possible. This is not local protection. |
+| `LINK_ONLY_UNPROTECTED` | The operator chose to retain metadata and one or more links without a verified local or replayable recovery claim. |
 | `EXPLICITLY_UNPROTECTED` | A human or already-published policy deliberately accepted non-recoverability. |
 | `BLOCKED` | The declared exact contract could not be satisfied, for example because bytes were unreadable or the source changed without a valid capture basis. |
+| `UNAVAILABLE` | A retained subject or recovery reference currently has no usable recovery path and cannot satisfy coverage. |
+
+These are the canonical `ProtectionOutcome` values defined by [Content Store, Views, and Export Requirements](content-store-views-and-exports.md). `ProtectionMode` records the requested decision; it is never substituted for the achieved outcome.
 
 `RW-MVP-1` publishes one source-recovery class: exact bytes. Repository compression and deduplication are physical implementation details and do not weaken that contract.
 
@@ -102,7 +109,7 @@ Each regular file's identification branch is evaluated in this order:
 
 Magic evidence may outweigh a suffix for routing, but it does not erase the suffix observation. Conflicts are visible in the plan, catalog, and processing provenance.
 
-Learned or AI classification is not a default MVP dependency. A later learned detector uses the same evidence record and cannot override the safety floor.
+The default local embedding profile is an MVP dependency for the reference discovery experience. A learned detector or embedding worker uses the same evidence and provenance records and cannot override the exact-storage safety floor.
 
 ### 5.2 Default routes
 
@@ -161,9 +168,9 @@ The baseline search index covers:
 
 Every result returns a stable subject reference and resolves to the same snapshot namespace used by browse, read, and restore. Search must expose incomplete extraction coverage and stale index generations.
 
-The bundled `RW-MVP-1` implementation uses SQLite FTS5 for its lexical `IndexProvider` and `QueryProvider`. Each immutable `IndexGenerationRef` owns one physically separate disposable database. The SQLite schema, row IDs, token tables, and query syntax are private implementation details, not portable records or public ABI. Deleting and rebuilding every index database must not change published content, namespace, tag or note revisions, plans, or verification evidence.
+The bundled `RW-MVP-1` implementation uses SQLite FTS5 for lexical/structured fields and in-process zvec for the default semantic space. Each immutable `IndexGenerationRef` owns a separate zvec collection directory. The SQLite and zvec schemas, row IDs, token tables, collection names, and query syntax are private implementation details, not portable records or public ABI. Deleting and rebuilding every index must not change published content, namespace, tag or note revisions, plans, or verification evidence.
 
-Embedding, CLIP, vector, hybrid, multimodal, and external-knowledge providers are a staged product expansion. They must attach to the same subjects and result model. Their absence from `RW-MVP-1` removes neither the semantic-search direction nor the processor and index boundaries required to add them later.
+Embedding, CLIP, vector, hybrid, multimodal, and external-knowledge providers attach to the same subjects and result model. The local text embedding profile is in `RW-MVP-1`; alternate semantic spaces and multimodal providers remain staged expansions.
 
 ## 8. Recoverable namespace
 
@@ -179,7 +186,7 @@ The baseline supports:
 - Hard-link and symlink reconstruction where the source and destination profiles support them.
 - Explicit metadata degradation for unsupported ownership, permissions, names, sparse regions, extended attributes, or other filesystem features.
 
-Repository-private packs, chunks, object keys, and deduplication layout are never the user namespace. `RW-MVP-1` bundles a read-only Linux FUSE projection over the same `SnapshotTree` and `FileAccess` contracts. One mount binds one principal, one export root, and one immutable snapshot. It verifies `ro,nodev,nosuid,noexec`, refuses `allow_other` and arbitrary mount-option passthrough, supports lookup, scoped directory enumeration, attributes, raw representable names, symbolic-link reads, hard links, sparse-file semantics, bounded or streaming regular-file reads, collision-resolved mount-local stable inodes, and stable snapshot pinning, and returns `EROFS` for every write-capable open and mutation opcode. Cache, open-handle, page-cache, `mmap`, expiry, revocation, and unmount behavior are part of the qualified compatibility profile. If revocation cannot meet the declared bound, the mount is reported as a local-trust surface. Future SMB, NFS, WebDAV, S3, media-server, or alternate FUSE gateways must project the same namespace rather than inventing another mapping.
+Repository-private packs, chunks, object keys, and deduplication layout are never the user namespace. `RW-MVP-1` materializes a frozen `ExportManifest` through `SnapshotTree` and `FileAccess` to an explicit destination. RestoreWeave does not implement mount, SMB, NFS, WebDAV, S3, media-server, or alternate filesystem gateways.
 
 An explicitly unprotected entry may remain visible as a decision record, but it has no payload and is never presented as readable or recoverable.
 
@@ -308,7 +315,6 @@ restoreweave note set <subject-ref> --from-file <file> [--expected-revision <rev
 restoreweave note remove <subject-ref> [--expected-revision <revision>]
 restoreweave browse [<snapshot-ref>[:<path>]]
 restoreweave cat <snapshot-ref>:<path> [--to-file <new-file>]
-restoreweave mount <snapshot-ref> <mountpoint> [--foreground]
 restoreweave verify <snapshot-ref> [--mode authenticated-metadata|sampled-content|full-bytes]
 restoreweave recovery export <snapshot-ref> --to-file <new-file>
 restoreweave restore <snapshot-ref>:<path> <destination>
@@ -324,10 +330,10 @@ Every non-raw-content command supports `--format human|json|jsonl`. Human output
 - `apply` performs the declared repository or restore mutation after revalidation.
 - `profile run` creates a fresh plan and auto-applies only monotonic exact changes.
 - `status` separates processing coverage, storage savings, index freshness, placement, verification, and required action.
-- `search` queries the baseline metadata and extracted-content index and returns subject and namespace references.
+- `search` queries the generation-pinned baseline lexical, structured, and local-semantic indexes and returns subject and namespace references; if the semantic generation is unavailable, it reports the degraded state while lexical and structured search remain usable.
 - `tag` and `note` mutate durable subject-bound annotation records through optimistic revision checks; they do not write disposable index rows directly.
 - `browse` and `cat` use the authenticated snapshot namespace rather than repository-private paths.
-- `mount` starts the bundled read-only Linux FUSE projection pinned to one immutable snapshot.
+- `export` materializes a frozen `ExportManifest` to an explicit destination. RestoreWeave provides no mount adapter; external mounting or sharing is outside the MVP command contract.
 - `verify` records the selected evidence level without relabeling sampled work as full verification.
 - `recovery export` produces an independently retainable recovery reference without plaintext credentials or private signing keys.
 - `restore` creates and applies an exact restore plan; non-interactive and machine clients retain explicit plan/apply separation.
@@ -349,7 +355,7 @@ The following are important product directions but not dependencies of the first
 
 - Learned or AI file identification.
 - OCR and ASR beyond the qualified default extraction set.
-- Embeddings, CLIP, vector search, hybrid ranking, multimodal retrieval, and external knowledge enrichment.
+- Distributed vector stores such as Milvus, multimodal retrieval beyond the default local text profile, and external knowledge enrichment.
 - Collections, ratings, relationship graphs, recovery-intent services, and machine-suggested annotation workflows.
 - Alternate repository engines and multiple failure-independent placements.
 - Lossless class-specific codecs.
@@ -371,7 +377,7 @@ Staged semantic capabilities must use the same subjects, processor provenance, i
 1. A fresh self-hosted installation completes doctor, plan, apply, sampled verification, baseline search, browse, recovery export, and exact restore through the documented CLI against one qualified repository.
 2. The qualification corpus includes both a local filesystem root and a mounted NAS-like root. Each receives an honest capture-consistency result.
 3. The product completes the reference flow on the qualified Linux/NAS environment without any optional platform-specific capture helper.
-4. Every selected namespace entry is accounted for as `EXACT`, `EXACT_FALLBACK`, `EXPLICITLY_UNPROTECTED`, or `BLOCKED`.
+4. Every selected namespace entry is accounted for with one canonical outcome: `EXACT_PROTECTED`, `EXACT_FALLBACK`, `EXTERNAL_REPLAYABLE`, `LINK_ONLY_UNPROTECTED`, `EXPLICITLY_UNPROTECTED`, `BLOCKED`, or `UNAVAILABLE`.
 5. Suffix evidence is recorded before magic-byte evidence, both remain inspectable, and a conflict produces a visible route decision rather than silent evidence loss.
 6. Each supported content class enters its declared default route; unknown content enters the generic exact route.
 7. A missing, crashed, timed-out, incompatible, or malformed optional processor on readable data produces exact fallback and does not prevent exact ingest and publication.
@@ -401,7 +407,7 @@ Staged semantic capabilities must use the same subjects, processor provenance, i
 31. Source deletion and destructive repository pruning are disabled in the reference profile.
 32. Ordered durable job events resume after client disconnect through both CLI JSON and the applicable read-only MCP event surface.
 33. Whole-subject tags and notes support create, read/list, update, tombstoned delete, portable export, and re-import with exact revision and SubjectRef preservation. Deleting every index loses none of them.
-34. The bundled Linux FUSE view binds one principal, one export root, and one immutable snapshot; verifies `ro,nodev,nosuid,noexec` with no `allow_other`; and lists and reads the same raw names, paths, metadata, hard links, sparse files, symbolic links, and exact bytes as `SnapshotTree`, CLI browse, and content reads. Collision-resolved inodes remain stable for the mount, directory cookies cannot be replayed across handles or scopes, and every write-capable open and mutation opcode returns `EROFS` without side effects. Qualification exercises cache reuse, concurrent handles, authorization expiry and revocation through open handles, page cache, and `mmap`, plus clean and crash-driven unmount.
+34. A saved view can be frozen into an `ExportManifest`, applied to an empty explicit destination, and verified item-by-item. Re-evaluating the view may change membership; replaying the manifest may not. Optional presentation adapters do not change these receipts.
 35. Capture qualification replaces each ancestor in turn with a symlink, renamed directory, bind mount, remounted share, and different filesystem object; removes or substitutes snapshot lifecycle protection before consumer start; and races regular files with FIFO or device-like objects under a deadline. The capture either remains bound to the originally validated object or blocks explicitly, never reads the replacement, never escapes the configured scope, and never publishes an unsafe observation. A final-component-only no-follow implementation fails qualification.
 36. A filesystem watcher or journal is only a change hint. Non-recursive coverage, overflow, reset, rollback, truncation, loss, uncertain continuity, or use on an unqualified NFS, SMB, or FUSE source invalidates the incremental checkpoint and requires a complete baseline before absence can become deletion evidence.
 37. A snapshot-backed capture remains publishable only while its recorded root, mount, filesystem or volume identity, snapshot identity, read-only state, retention hold or deletion protection, and traversal properties revalidate for every required consumer.
@@ -435,6 +441,6 @@ Staged semantic capabilities must use the same subjects, processor provenance, i
 - Baseline search makes freshness and coverage visible and returns useful results within the declared qualification envelope.
 - Interrupted apply, verify, indexing, and restore jobs resume or reconcile without contradictory publications.
 - A recurring exact profile can be invoked by an external scheduler and blocks for review whenever a weaker or unresolved decision appears.
-- FUSE qualification publishes cold and warm first-byte latency, large-directory `readdir` and qualified `READDIRPLUS` scaling, sequential and random-read throughput, repository request and byte amplification, process and kernel-cache memory, concurrent file and directory handle limits, cache behavior, revocation residuals, and clean and crash-driven unmount results for the declared tuple.
+- Export qualification publishes destination collision behavior, exact byte verification, metadata degradation, restart/retry behavior, and per-item/final materialization receipts for the declared tuple.
 
 The release is not successful if it proves only that files can be sent to a repository. It must demonstrate the combined product: measurable exact storage savings, useful heterogeneous discovery, a recoverable original namespace, replaceable processing, and verified restore.

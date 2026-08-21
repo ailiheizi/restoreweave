@@ -4,7 +4,7 @@
 
 ## 1. Conclusion
 
-RestoreWeave should be assembled from mature components around a small authority-owning core. It should not rebuild repository compression, general file parsers, a search engine, a workflow runtime, or a FUSE protocol stack.
+RestoreWeave should be assembled from mature components around a small authority-owning core. It should not rebuild repository compression, general file parsers, a search engine, a workflow runtime, or filesystem/network presentation services.
 
 The practical reference stack is:
 
@@ -18,7 +18,7 @@ The practical reference stack is:
 | Safe Linux capture | Qualify the handle APIs in [pathrs-lite](https://github.com/openSUSE/libpathrs/tree/main/contrib/bindings/go/pathrs-lite) for retained-root, component-relative resolution. If MPL-2.0 review or behavior fails, implement a narrow private [`openat2(2)`](https://man7.org/linux/man-pages/man2/openat2.2.html) layer with `golang.org/x/sys/unix`; never use the legacy string-returning `SecureJoin` API as a security boundary. |
 | Change hints | Use [fsnotify v1.10.1](https://github.com/fsnotify/fsnotify/releases/tag/v1.10.1) only as an optional local hint provider. Overflow, reset, non-recursive coverage, NFS, SMB, FUSE, or uncertain continuity forces a complete scan. Borrow recrawl and poison-state concepts from [Watchman](https://github.com/facebook/watchman) without making it the default dependency. |
 | Snapshot capture | Use the installed, version-qualified official ZFS or Btrfs command interfaces behind optional `CaptureDriver` profiles. ZFS uses atomic snapshots plus holds; Btrfs uses explicit read-only snapshots, identity evidence, privilege separation, and pre-consumer revalidation. |
-| Original-path mount | Adopt [hanwen/go-fuse/v2 v2.11.0](https://github.com/hanwen/go-fuse/tree/v2.11.0) as a private Linux adapter dependency after cache, authorization, and read-amplification qualification. |
+| File-shaped egress | Ship export-manifest materialization and bounded `FileAccess`. Operators choose external mount or sharing tools; no mount library is a RestoreWeave dependency. |
 | CLI and AI access | Keep CLI as the mutation surface and use the official [MCP Go SDK](https://github.com/modelcontextprotocol/go-sdk) for the local read-only MCP adapter after pinning one license-stable revision. MCP is not an internal bus. |
 | Selective code borrowing | Use [Perkeep](https://github.com/perkeep/perkeep) as the primary Apache-2.0 source for storage-driver conformance-test patterns and chunk-tree/range-read ideas. Preserve RestoreWeave identity and recovery formats. |
 | Later semantic search | Qualify Tantivy for larger lexical indexes, LanceDB for local semantic indexing, Qdrant for a service profile, and OpenSearch for enterprise external search only when measured need appears. |
@@ -49,13 +49,12 @@ An out-of-process boundary is not automatically a licensing or security safe har
 | Project | RestoreWeave role | Decision and boundary | License evidence |
 | --- | --- | --- | --- |
 | [SQLite FTS5](https://www.sqlite.org/fts5.html) through the existing `modernc.org/sqlite` dependency | Bundled lexical `IndexProvider` and `QueryProvider` for `RW-MVP-1` | **Freeze for the MVP implementation.** Create one physically separate disposable database per immutable generation. The SQLite schema, row IDs, token tables, and query syntax are never durable RestoreWeave ABI. Assert FTS5 availability during startup qualification. | SQLite is [public domain](https://github.com/sqlite/sqlite/blob/da7dc33fb2075dc9a9376679889f6843c33d6cb9/LICENSE.md); separately audit wrappers, generated builds, and extensions. |
-| [hanwen/go-fuse/v2 v2.11.0](https://github.com/hanwen/go-fuse/tree/v2.11.0) | Bundled read-only Linux FUSE projection | **Adopt behind `SnapshotTree` and `FileAccess`.** Pin commit [`423b377`](https://github.com/hanwen/go-fuse/commit/423b377e1452ab7b3522229185a3047f72e3f966). No go-fuse type enters portable records or public contracts. The tagged CI included a rename-exchange failure outside RestoreWeave's read-only surface, so adoption still depends on the project's own read-only suite; later upstream revisions require normal dependency-upgrade qualification. | Permissive [BSD-style license](https://github.com/hanwen/go-fuse/blob/v2.11.0/LICENSE). |
 | [file/libmagic](https://github.com/file/file) | Bounded magic-byte evidence after suffix inspection | **Adopt and bundle.** Pin the compiled magic database digest. Disable compressed inspection, decompressor forking, device access, symlink following, and unnecessary deep parsers. A tiny isolated helper is preferred where native-code containment is practical. | Permissive [BSD-style terms](https://github.com/file/file/blob/711ccc264519cdc5073ccb26651c0a9bafc3b47a/COPYING). |
 | [Protocol Buffers](https://github.com/protocolbuffers/protobuf) and [grpc-go](https://github.com/grpc/grpc-go) | Processor control-plane schemas and local RPC | **Adopt as implementation plumbing**, not yet as a frozen public ABI. Use Unix-domain sockets and keep large payloads outside messages. Exact release pins follow the first cross-version conformance spike. | Permissive upstream licenses; exact release and transitive review remain release work. |
 | [MCP Go SDK](https://github.com/modelcontextprotocol/go-sdk) | Local read-only MCP adapter | **Adopt after pinning one revision whose license transition is complete and reproducible.** MCP exposes northbound inspection operations only; it is not storage, scheduling, or processor transport. | The repository is transitioning between Apache and MIT terms; capture the exact applicable license at the selected revision. |
 | [fsnotify v1.10.1](https://github.com/fsnotify/fsnotify/releases/tag/v1.10.1) | Optional local change-hint provider | **Adopt only as acceleration.** The public API is non-recursive, and upstream documents that NFS, SMB, and FUSE generally do not provide useful notifications. Overflow or continuity loss invalidates the checkpoint and schedules a complete scan; events never directly create authoritative namespace mutations or tombstones. | [BSD-3-Clause](https://github.com/fsnotify/fsnotify/blob/v1.10.1/LICENSE). |
 
-No privileged mount helper should be vendored. The Linux deployment uses the host’s `/dev/fuse` and `fusermount3`, with explicit container privileges when needed.
+No privileged mount helper or mount protocol library is bundled. External tools own their deployment privileges and mount lifecycle.
 
 ### 3.2 Qualification candidates
 
@@ -154,7 +153,7 @@ Every borrowed fragment must record the source repository, exact commit, source 
 - Do not adopt rustic as a production recovery engine while upstream still discourages production use.
 - Do not adopt the legacy string-returning `SecureJoin` API, final-component-only no-follow wrappers, or silent fallback from `openat2` to ambient absolute-path traversal for authoritative capture.
 - Do not make Watchman the default watcher service; use its failure semantics as a design reference.
-- Do not use [bazil/fuse](https://github.com/bazil/fuse) for a new MVP adapter. Keep the actively maintained [jacobsa/fuse](https://github.com/jacobsa/fuse) as a fallback candidate only; go-fuse still leads because of its tagged release, demonstrated Kopia/rclone use, resource and invalidation controls, and fit with the current design. Defer [libfuse](https://github.com/libfuse/libfuse), [cgofuse](https://github.com/winfsp/cgofuse), and [WinFsp](https://github.com/winfsp/winfsp) to later platform profiles.
+- Do not adopt go-fuse, bazil/fuse, jacobsa/fuse, libfuse, cgofuse, or WinFsp. Mounting is outside the RestoreWeave product boundary.
 - Do not copy `btrfs-progs` or OpenZFS implementation code into a permissive core. Integrate their installed, version-qualified command interfaces and retain exact command/output compatibility evidence.
 - Do not copy FSL, GPL, or AGPL implementation text into the core under the label “reference only.” Any such adoption requires an explicit RestoreWeave licensing and distribution decision.
 
@@ -252,30 +251,9 @@ For every new `IndexGenerationRef`:
 
 Every result contains stable `SubjectRef` values. The host reauthorizes those subjects; an FTS row ID is never an external identity. Deleting every FTS database must leave content, namespace, tags, notes, publication, verification, and restore intact.
 
-## 8. FUSE adapter qualification
+## 8. External presentation boundary
 
-The Linux adapter maps one immutable snapshot view through go-fuse. One mount binds exactly one authenticated principal, one export root, and one immutable committed snapshot; `latest` is resolved before the mount becomes visible. The adapter requires `ro,nodev,nosuid,noexec`, disables `allow_other`, and fails rather than silently weakening those settings. Do not copy Kopia's current mount boundary: its adapter does not explicitly request all four protections, and omission of mutation methods is not equivalent to a kernel-enforced read-only mount. Verify both direct-mount flags and every option passed through `fusermount3`.
-
-Use upstream code as bounded pattern sources:
-
-- Kopia for a thin go-fuse adapter structure and the fixed `READDIRPLUS` regression represented by issue #1135.
-- Restic for chunk-offset reads and caching, plus its inode, directory, symlink, and xattr adapters as test-pattern sources, with issue #3828 retained as strong performance counterevidence. Restic's xxhash-derived inode values are an implementation example only; RestoreWeave still owns collision resolution and snapshot-scoped stability.
-- rclone `mount2` and its VFS read/cache code for `ReadAt`, chunk-growth, stream-count, read-ahead, transfer accounting, retries, metrics, mount-option wiring, and `READDIRPLUS` qualification vocabulary. Do not import the writable VFS or global configuration model wholesale.
-
-The adapter must preserve:
-
-- Lookup, listing, attributes, and `readlink` use a pinned `SnapshotView`.
-- Opens and reads use bounded `FileAccess` sessions and random-access reads.
-- Inode identity is stable within the mount, collision-resolved, and follows snapshot-scoped namespace and hard-link identity rather than content hashes alone.
-- Directory handles own independent bounded cursors. Opaque cookies translate to snapshot-and-directory-scoped `PageToken` values without replaying earlier pages, and `READDIRPLUS` must remain linear and bounded.
-- Raw path-component bytes, hard links, symbolic links, and sparse extent semantics survive the adapter boundary.
-- Every write-capable open and mutation opcode returns `EROFS` before any namespace, repository, processor, or annotation change.
-
-The main risk is kernel caching. Attribute, entry, negative, and page caches may serve data without another host authorization decision. Qualification must define bounded TTLs, invalidation or direct-I/O behavior where needed, and unmount-on-authorization-expiry policy. If revocation cannot be enforced acceptably, the product must describe the mount as a local-trust surface rather than an independently authorized request boundary.
-
-Required tests include identical CLI/FUSE/restore SHA-256 bytes; cold and warm first-byte latency; large-directory `readdir` and `READDIRPLUS` scaling; sequential and random reads; repository request and byte amplification; process and kernel-cache memory; concurrent file and directory handles; snapshot pins across repack and garbage collection; non-UTF-8 names; pagination and cookie resume; hard links; sparse files; recorded symlinks; rejection of every write-capable open and mutation opcode; authorization expiry through existing handles, page cache, and mmap; and clean or crash-driven unmount.
-
-The fallback [bazil/fuse](https://github.com/bazil/fuse) project has no decision-changing advantage and showed no substantive current-maintenance evidence beyond 2023 in this bounded audit. The actively maintained [jacobsa/fuse](https://github.com/jacobsa/fuse) remains fallback-only despite useful read-only, permission, adaptive `READDIRPLUS`, direct-I/O, and parallel-directory controls. [libfuse](https://github.com/libfuse/libfuse), [cgofuse](https://github.com/winfsp/cgofuse), [WinFsp](https://github.com/winfsp/winfsp), and macOS adapters remain separate future platform profiles; none changes the portable namespace model. If a future libfuse profile uses io_uring, pin at least v3.18.2 and qualify it explicitly because [GHSA-qxv7-xrc2-qmfx](https://github.com/libfuse/libfuse/security/advisories/GHSA-qxv7-xrc2-qmfx) and [GHSA-x669-v3mq-r358](https://github.com/libfuse/libfuse/security/advisories/GHSA-x669-v3mq-r358) affect earlier 3.18.x releases.
+RestoreWeave qualifies `ExportManifest`, materialized output, and bounded `FileAccess` through exact byte comparison, authorization tests, pagination tests, and clean-install recovery. It does not qualify a kernel mount, mount cache, inode mapping, directory cookies, or unmount behavior. Those belong to whichever external tool the operator selects.
 
 ## 9. License and supply-chain policy
 
@@ -306,7 +284,7 @@ These rules complement the normative [Release Qualification and Traceability](..
 4. Implement the Processor host with protobuf control, Unix-domain gRPC, pre-opened file descriptors, sandboxing, resource budgets, and a deliberately small deterministic test processor.
 5. Add host-owned suffix evidence and bounded libmagic. Then qualify one document, archive, and media processor without letting optional processing delay exact ingest.
 6. Implement the bundled SQLite FTS5 generation and query providers with one disposable database per immutable generation.
-7. Implement the go-fuse v2.11.0 Linux adapter and measure the complete security, directory-scale, memory, cache, and repository-amplification profile before calling it NAS-usable.
+7. Implement and qualify `ExportManifest` materialization and bounded `FileAccess`, including exact-byte, pagination, authorization, and destination-safety tests.
 8. Add optional fsnotify acceleration only after complete rescans remain correct without it; qualify ZFS and Btrfs drivers independently after the generic profile works.
 9. Add license inventory, NOTICE capture, exact build provenance, per-processor SBOMs, and drift quarantine before distributing third-party binaries.
 10. Only after the exact vertical slice passes should the project qualify OCR, embeddings, CLIP, alternate search stores, class-specific transforms, or P2P modules.

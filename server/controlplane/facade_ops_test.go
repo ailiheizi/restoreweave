@@ -47,14 +47,7 @@ func TestProtocolFacadeUsesCommandABI(t *testing.T) {
 		t.Fatalf("write epub: %v", err)
 	}
 
-	ingested := dispatcher.Handle(ctx, mustEnvelope(t, command.OpPlanIngest, map[string]any{"root": root}))
-	if ingested.Status != command.StatusSucceeded {
-		t.Fatalf("ingest = %q: %+v", ingested.Status, ingested.Reasons)
-	}
-	var ingestData command.PlanIngestData
-	if err := json.Unmarshal(ingested.Data, &ingestData); err != nil {
-		t.Fatalf("decode ingest: %v", err)
-	}
+	ingestData := mustAppliedIngest(t, ctx, dispatcher, map[string]any{"root": root})
 
 	facade, err := protocol.New(dispatcher.Handle, protocol.Options{
 		WorkspaceID: ingestData.WorkspaceID,
@@ -242,14 +235,7 @@ func TestExperienceSurfacesOverCommandABI(t *testing.T) {
 		}
 	}
 
-	ingested := dispatcher.Handle(ctx, mustEnvelope(t, command.OpPlanIngest, map[string]any{"root": root}))
-	if ingested.Status != command.StatusSucceeded {
-		t.Fatalf("ingest = %q: %+v", ingested.Status, ingested.Reasons)
-	}
-	var ingestData command.PlanIngestData
-	if err := json.Unmarshal(ingested.Data, &ingestData); err != nil {
-		t.Fatalf("decode ingest: %v", err)
-	}
+	ingestData := mustAppliedIngest(t, ctx, dispatcher, map[string]any{"root": root})
 
 	facade, err := protocol.New(dispatcher.Handle, protocol.Options{
 		WorkspaceID: ingestData.WorkspaceID,
@@ -328,6 +314,34 @@ func TestExperienceSurfacesOverCommandABI(t *testing.T) {
 		t.Fatalf("inbox page status=%d body=%s", inboxPage.StatusCode, html)
 	}
 
+	inboxStatus := getPlainJSON(t, base+"/inbox/api/status?token="+token)
+	if inboxStatus["workspace_id"] != ingestData.WorkspaceID || inboxStatus["catalog_ok"] != true {
+		t.Fatalf("inbox status = %#v", inboxStatus)
+	}
+	if snaps, _ := inboxStatus["snapshots"].(float64); snaps < 1 {
+		t.Fatalf("inbox status missing snapshots: %#v", inboxStatus)
+	}
+	if jobs, _ := inboxStatus["jobs"].(float64); jobs < 1 {
+		t.Fatalf("inbox status missing jobs: %#v", inboxStatus)
+	}
+	inboxPlan := getPlainJSON(t, base+"/inbox/api/plan?token="+token+"&id="+ingestData.PlanID)
+	if inboxPlan["ok"] != true || inboxPlan["kind"] != "INGEST" || inboxPlan["applied"] != true || inboxPlan["executable"] != false {
+		t.Fatalf("inbox plan = %#v", inboxPlan)
+	}
+	inboxJob := getPlainJSON(t, base+"/inbox/api/job?token="+token+"&id="+ingestData.JobID)
+	if inboxJob["ok"] != true || inboxJob["job_state"] != "SUCCEEDED" || inboxJob["terminal"] != true {
+		t.Fatalf("inbox job = %#v", inboxJob)
+	}
+	inboxDoctor := getPlainJSON(t, base+"/inbox/api/doctor?token="+token)
+	if inboxDoctor["ok"] != true {
+		t.Fatalf("inbox doctor = %#v", inboxDoctor)
+	}
+	inboxSnapshots := getPlainJSON(t, base+"/inbox/api/snapshots?token="+token)
+	snaps, _ := inboxSnapshots["snapshots"].([]any)
+	if inboxSnapshots["ok"] != true || len(snaps) < 1 {
+		t.Fatalf("inbox snapshots = %#v", inboxSnapshots)
+	}
+
 	search := getPlainJSON(t, base+"/inbox/api/search?token="+token+"&q=Nightfall")
 	hits, _ := search["hits"].([]any)
 	songID := ""
@@ -345,6 +359,13 @@ func TestExperienceSurfacesOverCommandABI(t *testing.T) {
 	item := getPlainJSON(t, base+"/inbox/api/item?token="+token+"&id="+songID)
 	if item["kind"] != "audio" {
 		t.Fatalf("inbox item = %#v", item)
+	}
+	if item["path"] == "" || item["snapshot_ref"] != ingestData.SnapshotRef {
+		t.Fatalf("inbox item missing provenance: %#v", item)
+	}
+	reps, _ := item["representations"].([]any)
+	if len(reps) == 0 {
+		t.Fatalf("inbox item missing representations: %#v", item)
 	}
 
 	preview, err := http.Get(base + "/inbox/api/preview?token=" + token + "&id=" + songID)
@@ -393,10 +414,60 @@ func TestExperienceSurfacesOverCommandABI(t *testing.T) {
 	if !foundProgress {
 		t.Fatalf("opds/inbox progress missing: %+v", annotations.Annotations)
 	}
+	inboxExport := getPlainJSON(t, base+"/inbox/api/annotations?token="+token+"&id="+songID)
+	if inboxExport["ok"] != true || inboxExport["schema"] != command.AnnotationBundleSchema {
+		t.Fatalf("inbox annotations = %#v", inboxExport)
+	}
+	exported, _ := inboxExport["annotations"].([]any)
+	if len(exported) < 1 {
+		t.Fatalf("inbox annotations empty: %#v", inboxExport)
+	}
+	importStatus, importBody := postJSON(t, base+"/inbox/api/annotations?token="+token, inboxExport)
+	if importStatus != http.StatusOK || !strings.Contains(string(importBody), `"ok":true`) {
+		t.Fatalf("inbox annotation import status=%d body=%s", importStatus, importBody)
+	}
+	resolved := getPlainJSON(t, base+"/inbox/api/resolve?token="+token+"&path=song.mp3")
+	if resolved["ok"] != true || resolved["subject_ref"] != songID {
+		t.Fatalf("inbox resolve = %#v want %s", resolved, songID)
+	}
+	pathSearch := getPlainJSON(t, base+"/inbox/api/search?token="+token+"&q=song.mp3")
+	foundPath := false
+	pathHits, _ := pathSearch["hits"].([]any)
+	for _, hit := range pathHits {
+		row, _ := hit.(map[string]any)
+		if row["subject_ref"] == songID {
+			foundPath = true
+		}
+	}
+	if !foundPath {
+		t.Fatalf("inbox search path miss: %#v", pathSearch)
+	}
 
 	verifyStatus, verifyBody := postJSON(t, base+"/inbox/api/verify?token="+token, map[string]any{})
 	if verifyStatus != http.StatusOK || !strings.Contains(string(verifyBody), `"ok":true`) {
 		t.Fatalf("inbox verify status=%d body=%s", verifyStatus, verifyBody)
+	}
+
+	artifact := filepath.Join(t.TempDir(), "recovery.json")
+	recoveryStatus, recoveryBody := postJSON(t, base+"/inbox/api/recovery?token="+token, map[string]any{
+		"destination": artifact,
+	})
+	if recoveryStatus != http.StatusOK || !strings.Contains(string(recoveryBody), `"independently_stored":true`) {
+		t.Fatalf("inbox recovery status=%d body=%s", recoveryStatus, recoveryBody)
+	}
+	if _, err := os.Stat(artifact); err != nil {
+		t.Fatalf("inbox recovery artifact: %v", err)
+	}
+	againStatus, againBody := postJSON(t, base+"/inbox/api/recovery?token="+token, map[string]any{
+		"destination": artifact,
+	})
+	if againStatus != http.StatusConflict {
+		t.Fatalf("inbox recovery overwrite status=%d body=%s", againStatus, againBody)
+	}
+
+	preflightStatus, preflightBody := postJSON(t, base+"/inbox/api/restore?token="+token, map[string]any{})
+	if preflightStatus != http.StatusOK || !strings.Contains(string(preflightBody), `"wrote":false`) {
+		t.Fatalf("inbox restore preflight status=%d body=%s", preflightStatus, preflightBody)
 	}
 
 	dest := filepath.Join(t.TempDir(), "restored")
@@ -415,6 +486,188 @@ func TestExperienceSurfacesOverCommandABI(t *testing.T) {
 			t.Fatalf("restored %s sha mismatch", name)
 		}
 	}
+
+	secondRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(secondRoot, "extra.txt"), []byte("second"), 0o600); err != nil {
+		t.Fatalf("write extra: %v", err)
+	}
+	secondData := mustAppliedIngest(t, ctx, dispatcher, map[string]any{"root": secondRoot})
+	inboxDiff := getPlainJSON(t, base+"/inbox/api/diff?token="+token+"&from="+ingestData.SnapshotRef+"&to="+secondData.SnapshotRef)
+	if inboxDiff["ok"] != true {
+		t.Fatalf("inbox diff = %#v", inboxDiff)
+	}
+	foundAdded := false
+	changes, _ := inboxDiff["changes"].([]any)
+	for _, raw := range changes {
+		change, _ := raw.(map[string]any)
+		if change["kind"] == command.DiffAdded && change["path"] == "extra.txt" {
+			foundAdded = true
+		}
+	}
+	if !foundAdded {
+		t.Fatalf("inbox diff missing extra.txt: %#v", inboxDiff)
+	}
+}
+
+// TestD5PinnedSupersonicCallSequence records the OpenSubsonic methods this
+// host's installed Supersonic 0.22.1 issues (XML, c=supersonic). It is not a
+// GUI driver and does not claim a live login was clicked.
+func TestD5PinnedSupersonicCallSequence(t *testing.T) {
+	ctx := context.Background()
+	store := testutil.OpenStore(t, filepath.Join(t.TempDir(), "catalog.sqlite"))
+	repo, err := repository.OpenDir(filepath.Join(t.TempDir(), "repository"))
+	if err != nil {
+		t.Fatalf("open repository: %v", err)
+	}
+	dispatcher := NewDispatcher(store, "catalog.sqlite", "/tmp/rw.sock", WithExact(&exact.Service{
+		Store: store,
+		Repo:  repo,
+	}))
+	root := t.TempDir()
+	mp3 := testID3v23(map[string]string{
+		"TIT2": "Nightfall",
+		"TPE1": "Example Artist",
+		"TALB": "Demo Album",
+	})
+	if err := os.WriteFile(filepath.Join(root, "song.mp3"), mp3, 0o644); err != nil {
+		t.Fatalf("write song: %v", err)
+	}
+	ingestData := mustAppliedIngest(t, ctx, dispatcher, map[string]any{"root": root})
+	facade, err := protocol.New(dispatcher.Handle, protocol.Options{
+		WorkspaceID: ingestData.WorkspaceID,
+		SnapshotRef: ingestData.SnapshotRef,
+		Token:       "facade-token",
+		Listen:      "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatalf("new facade: %v", err)
+	}
+	server := httptest.NewServer(facade.Handler())
+	defer server.Close()
+	q := func(method, extra string) string {
+		return server.URL + "/rest/" + method + ".view?f=xml&c=supersonic&v=1.15.0&u=local&p=facade-token" + extra
+	}
+	for _, method := range []string{"ping", "getLicense", "getUser", "getMusicFolders", "getPlayQueue", "getPlaylists"} {
+		body := getRaw(t, q(method, ""))
+		if !strings.Contains(body, `status="ok"`) {
+			t.Fatalf("%s xml = %s", method, body)
+		}
+	}
+	artists := getRaw(t, q("getArtists", ""))
+	if !strings.Contains(artists, `status="ok"`) || !strings.Contains(artists, `name="Example Artist"`) {
+		t.Fatalf("getArtists xml = %s", artists)
+	}
+	albums := getRaw(t, q("getAlbumList2", "&type=alphabeticalByName&offset=0&size=20"))
+	if !strings.Contains(albums, `status="ok"`) || !strings.Contains(albums, `name="Demo Album"`) {
+		t.Fatalf("getAlbumList2 xml = %s", albums)
+	}
+	search := getJSON(t, server.URL+"/rest/search3.view?f=json&c=supersonic&v=1.15.0&p=facade-token&query=Nightfall")
+	if statusOf(search) != "ok" {
+		t.Fatalf("search3 = %#v", search)
+	}
+	songs := mustSlice(t, nested(search, "searchResult3", "song"))
+	if len(songs) == 0 {
+		t.Fatalf("search3 songs = %#v", search)
+	}
+	songID, _ := songs[0].(map[string]any)["id"].(string)
+	if songID == "" {
+		t.Fatalf("search3 song id missing: %#v", songs[0])
+	}
+	song := getRaw(t, q("getSong", "&id="+songID))
+	if !strings.Contains(song, `status="ok"`) || !strings.Contains(song, `title="Nightfall"`) {
+		t.Fatalf("getSong xml = %s", song)
+	}
+	cover, err := http.Get(q("getCoverArt", "&id="+songID))
+	if err != nil {
+		t.Fatalf("cover: %v", err)
+	}
+	coverBody, _ := io.ReadAll(cover.Body)
+	cover.Body.Close()
+	if cover.StatusCode != http.StatusOK || cover.Header.Get("Content-Type") != "image/png" || len(coverBody) < 32 {
+		t.Fatalf("cover status=%d type=%s len=%d", cover.StatusCode, cover.Header.Get("Content-Type"), len(coverBody))
+	}
+	stream, err := http.Get(q("stream", "&id="+songID))
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	got, _ := io.ReadAll(stream.Body)
+	stream.Body.Close()
+	if stream.StatusCode != http.StatusOK || !bytes.Equal(got, mp3) {
+		t.Fatalf("stream status=%d len=%d", stream.StatusCode, len(got))
+	}
+	star := getJSON(t, server.URL+"/rest/star.view?f=json&c=supersonic&p=facade-token&id="+songID)
+	if statusOf(star) != "ok" {
+		t.Fatalf("star = %#v", star)
+	}
+	starred := getRaw(t, q("getStarred2", ""))
+	if !strings.Contains(starred, `status="ok"`) || !strings.Contains(starred, `title="Nightfall"`) {
+		t.Fatalf("getStarred2 xml = %s", starred)
+	}
+	artistStar := getJSON(t, server.URL+"/rest/star.view?f=json&c=supersonic&p=facade-token&artistId="+artistIDFromXML(t, artists))
+	if statusOf(artistStar) != "ok" {
+		t.Fatalf("star artist = %#v", artistStar)
+	}
+	artistsAfter := getRaw(t, q("getArtists", ""))
+	if !strings.Contains(artistsAfter, `starred="`) || !strings.Contains(artistsAfter, `name="Example Artist"`) {
+		t.Fatalf("getArtists after artist star = %s", artistsAfter)
+	}
+	artistPage := getRaw(t, q("getArtist", "&id="+artistIDFromXML(t, artistsAfter)))
+	if !strings.Contains(artistPage, `starred="`) || !strings.Contains(artistPage, `name="Demo Album"`) {
+		t.Fatalf("getArtist after star = %s", artistPage)
+	}
+	starredAfter := getRaw(t, q("getStarred2", ""))
+	if !strings.Contains(starredAfter, `name="Example Artist"`) {
+		t.Fatalf("getStarred2 missing artist = %s", starredAfter)
+	}
+	listed := dispatcher.Handle(ctx, mustEnvelope(t, command.OpAnnotationList, map[string]any{
+		"workspace_id": ingestData.WorkspaceID,
+		"subject_ref":  songID,
+	}))
+	if listed.Status != command.StatusSucceeded {
+		t.Fatalf("annotation.list = %q: %+v", listed.Status, listed.Reasons)
+	}
+	var annotations command.AnnotationListData
+	if err := json.Unmarshal(listed.Data, &annotations); err != nil {
+		t.Fatalf("decode annotations: %v", err)
+	}
+	foundStar := false
+	for _, annotation := range annotations.Annotations {
+		if annotation.Kind == "TAG" && annotation.Body == "starred" {
+			foundStar = true
+		}
+	}
+	if !foundStar {
+		t.Fatalf("star missing from annotation.list: %+v", annotations.Annotations)
+	}
+}
+
+func artistIDFromXML(t *testing.T, body string) string {
+	t.Helper()
+	const prefix = `id="ar_`
+	i := strings.Index(body, prefix)
+	if i < 0 {
+		t.Fatalf("artist id missing: %s", body)
+	}
+	rest := body[i+len(`id="`):]
+	end := strings.Index(rest, `"`)
+	if end < 0 {
+		t.Fatalf("artist id unterminated: %s", body)
+	}
+	return rest[:end]
+}
+
+func getRaw(t *testing.T, url string) string {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read %s: %v", url, err)
+	}
+	return string(body)
 }
 
 func getJSON(t *testing.T, url string) map[string]any {

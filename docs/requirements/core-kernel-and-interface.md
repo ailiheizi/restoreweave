@@ -2,7 +2,7 @@
 
 ## 1. Status and purpose
 
-This document defines the normative product boundary for RestoreWeave as a self-hosted, NAS-first content-aware managed data layer. It specifies which semantics remain authoritative and stable, which algorithms are replaceable, what the reference distribution must deliver, and how stored data remains browsable, verifiable, searchable, and recoverable across implementation changes. `RW-MVP-1` is the first read-only managed-archive and search profile over that broader data layer.
+This document defines the normative product boundary for RestoreWeave as a self-hosted, content-first managed data layer. It specifies which semantics remain authoritative and stable, which algorithms are replaceable, what the reference distribution must deliver, and how stored data remains exportable, verifiable, searchable, and recoverable across implementation changes. `RW-MVP-1` is the first read-only managed-archive and multi-dimensional discovery profile over that broader data layer. The durable store/view/export model is defined by [Content Store, Views, and Export Requirements](content-store-views-and-exports.md).
 
 For questions of ownership, interface stability, plugin authority, exact fallback, publication, and the minimum useful product, this document takes precedence over platform-specific or older recovery-only descriptions. Detailed documents may add constraints, but they MUST NOT make an optional platform driver, AI model, semantic provider, WebUI, or external harness a prerequisite for the core exact-storage path.
 
@@ -20,9 +20,9 @@ The minimum product promise is:
 4. Preserve every readable unknown or unsupported file exactly.
 5. Reduce storage through exact content addressing, deduplication, and lossless compression in the default profile.
 6. Retain authenticated provenance, placement, and verification evidence.
-7. Present stored data through its original directory structure even when physical bytes are chunked, compressed, packed, remote, or shared by many files.
-8. Provide useful path, metadata, type, checksum, duplicate, durable tag/note, processing-state, and extracted-text search by default.
-9. Allow embeddings, CLIP-like encoders, media fingerprints, alternate compressors, transforms, validators, repositories, index builders, and query implementations to be added or replaced through the stable extension seams without changing core identity semantics.
+7. Preserve the original directory structure as provenance and an exact recovery projection while organizing daily use through annotations, saved views, and frozen export manifests.
+8. Provide useful lexical, structured, and local semantic search by default.
+9. Allow embedding models, vector stores, CLIP-like encoders, media fingerprints, alternate compressors, transforms, validators, repositories, index builders, and query implementations to be replaced through stable extension seams without changing core identity semantics.
 10. Browse, read, verify, migrate, and restore a committed exact snapshot without the original operational database, UI, search index, AI service, or plugin registry service.
 
 Storage reduction is not merely a repository implementation detail; it is one of the product's primary outcomes. It remains subordinate to the selected fidelity contract: fewer bytes are not a success when the system cannot prove what the operator can recover.
@@ -98,6 +98,8 @@ The core MUST distinguish at least the following identities:
 | `ContentId` / `ContentRef` | Exact byte identity using the required cryptographic digest profile. `ContentRef` is the catalog vocabulary; `ContentId` remains the kernel identifier field. |
 | `ChunkId` | Exact byte identity under a named chunking profile |
 | `RepresentationId` / `RepresentationRef` | Raw or derived bytes and their decoder/fidelity contract. `RepresentationRef` is the catalog vocabulary; `RepresentationId` remains the identifier field. |
+| `SavedViewId` | One revisioned dynamic query and presentation policy; membership is evaluated, not frozen. |
+| `ExportManifestId` | One immutable subject/representation/output-name set with a canonical digest. |
 | `SnapshotId` | One committed namespace with selected representations and policy state |
 | `PlacementId` | Durable storage of a representation or portable record at one target |
 | `IndexGenerationId` | Rebuildable search projection bound to exact input records, `IndexProvider` capability profile, and model space |
@@ -152,7 +154,7 @@ Every implementation and binding MUST preserve these invariants:
 12. **Failures remain typed.** Unknown external outcomes, partial coverage, unsupported metadata, and failed verification are never flattened into success.
 13. **Search does not own storage truth.** Index rows, ranks, embeddings, and search-store identifiers remain projections over stable subjects.
 14. **Upgrades do not reinterpret history.** New extension capability versions affect new plans or explicit migrations, not previously accepted records.
-15. **The default exact path has no AI dependency.** Disabling learned models and external harnesses cannot disable exact ingest, storage reduction, search over baseline fields, browse, verify, or restore.
+15. **The exact path has no AI dependency.** Disabling learned models and external harnesses cannot disable exact ingest, storage reduction, lexical/structured search, browse, verify, or restore. It does make the required default semantic experience visibly degraded.
 16. **Publication is a reconciled commit.** Uploaded bytes or a successful process exit alone do not make a snapshot committed.
 17. **Human authority remains available.** Fidelity reduction, last-copy deletion, and irreversible dependency removal require explicit durable authority.
 
@@ -183,6 +185,12 @@ RestoreWeave guarantees a deliberately small public surface.
 - A breaking semantic change requires a new major version and an explicit migration or compatibility reader.
 - Readers MUST ignore unknown optional fields and preserve them when records are copied or repackaged.
 - Unknown required fields, unknown critical extensions, or unsupported major versions MUST fail closed with a typed reason.
+- New optional signed-format data MUST be carried in a canonical
+  `optional_extensions` map. Required extension identifiers MUST also appear in
+  the signed `critical_extensions` list. Readers preserve unknown optional map
+  entries byte-for-byte, reject an unknown critical identifier, and reject
+  undeclared top-level fields in a fixed major-version envelope; an undeclared
+  field is not implicitly optional.
 - Experimental interfaces MUST include `alpha` or `experimental` in their version.
 - A reader or decoder required by retained data MUST remain available until the data is migrated and reverified or intentionally retired under explicit policy authority.
 
@@ -211,8 +219,10 @@ RRF MUST represent at least:
 - `SourceRecord` and `SourceViewRecord`.
 - `NamespaceRoot` and `NamespaceEntry`.
 - `FileVersionRecord`, exact `ContentRecord`, and optional `ChunkProfileRecord`.
+- `MetadataBundle` with per-field source, authority, state, fidelity impact, and provenance.
 - `ClassificationEvidence` and accepted `ClassificationDecision`.
-- `RecoveryContract`, `FidelityContract`, and immutable `ProtectionPlan`.
+- `ProtectionRecord`, canonical protection outcome, `RecoveryReference`, `SourceBinding`, and credential-free `ExternalLocator`.
+- `RecoveryContract`, `RecoveryRecipe`, optional signed `RecoveryToken`, `FidelityContract`, and immutable `ProtectionPlan`.
 - `RepresentationRecord` with exactness, transform provenance, and decoder requirements.
 - Capability-profile provenance and role-specific extension invocation records.
 - `PlacementReceipt` and backend reader requirements.
@@ -220,6 +230,7 @@ RRF MUST represent at least:
 - `SnapshotRecord` and signed `PublicationCommitRecord`.
 - `OperationRecord` and durable terminal events.
 - `AnnotationRecord` and accepted corrections.
+- `DescriptionDocument`, immutable `DescriptionRevision`, and ordered `SemanticSegment` records with provenance.
 - Retained derivative metadata and optional `IndexGenerationRecord` descriptions.
 - `RestoreResult` and migration results.
 
@@ -446,14 +457,14 @@ The reference distribution MUST include a complete exact pipeline with no model-
 | Transformation fallback | Raw or exact reversible representation for every readable unsupported file |
 | Extraction | Safe baseline metadata and extracted text for supported common formats |
 | Placement | At least one qualified local, NAS, repository, or object-storage target with readback and reconciliation |
-| Search | Bundled path, metadata, detected-type, checksum, duplicate, durable tag/note, processing-state, and extracted-text search |
+| Search | Bundled path, metadata, detected-type, checksum, duplicate, durable tag/note/description, processing-state, extracted-text, and local semantic search with typed coverage |
 | Verification | Authenticated metadata plus policy-defined sampled or full-byte readback |
-| Access | Browse, stat, read, export, restore, and bundled read-only Linux FUSE through the original namespace |
+| Access | Browse, stat, read, freeze views, materialize export manifests, and restore through the original namespace |
 | Recovery | Portable closure and clean-machine reader path |
 
 The reference product SHOULD select sensible defaults automatically from source, content class, available resources, target capabilities, and operator policy. Advanced users MAY pin or override `Processor`, driver, and provider capability profiles.
 
-Embeddings, CLIP-like encoders, OCR beyond the baseline, ASR, media understanding, perceptual transforms, and neural representations are valuable optional `Processor`, `IndexProvider`, or `QueryProvider` capabilities. They are not required for the first exact pipeline, but the stable subject, derivative, index-generation, and query contracts MUST leave room for them.
+The pinned local text-embedding `Processor` and zvec `IndexProvider`/`QueryProvider` are mandatory for the qualified default discovery experience, but never for the exact ingest/recovery pipeline. Their absence leaves exact operations and lexical/structured degraded search usable while preventing a default-experience qualification claim. CLIP-like encoders, OCR beyond the baseline, ASR, additional embedding spaces, media understanding, perceptual transforms, and neural representations remain optional later capabilities behind the same contracts.
 
 ## 11. Namespace, content, and query interfaces
 
@@ -604,7 +615,7 @@ The minimum distribution MUST provide:
 - At least one qualified placement backend with durable receipts, readback, and reconciliation.
 - Baseline metadata and text extraction and search.
 - Durable tag and note CRUD plus portable annotation export/import.
-- `SnapshotTree` and `FileAccess` browse and restore, plus a bundled read-only Linux FUSE projection.
+- `SnapshotTree` and `FileAccess` browse and restore, plus export-manifest materialization. No mount service is part of the product.
 - Portable commit and recovery-reference export.
 - Component digests, decoder inventory, and license inventory.
 - A `doctor` command that validates only the selected profiles and target capabilities.
@@ -619,7 +630,7 @@ The first conforming product MUST satisfy all of the following:
 
 1. **CKI-AC-01 — NAS-oriented deployment:** The reference service runs self-hosted on a qualified Linux-based NAS or server with native and container deployment evidence.
 2. **CKI-AC-02 — Platform boundary:** Platform-specific capture code is isolated behind `CaptureDriver`, and no optional profile becomes a global acceptance dependency.
-3. **CKI-AC-03 — Useful default pipeline:** With third-party plugins and models disabled, the product can ingest, deduplicate, losslessly compress, place, search baseline fields, mutate durable tags/notes through CLI, mount a read-only Linux view, browse, verify, and restore supported data.
+3. **CKI-AC-03 — Useful default pipeline:** With third-party plugins disabled, the product can ingest, deduplicate, losslessly compress, place, search lexical/structured fields plus the bundled local semantic profile, mutate durable tags/notes through CLI, materialize exports, browse, verify, and restore supported data.
 4. **CKI-AC-04 — Two-step identification:** The default classification path records suffix evidence and magic-byte evidence independently and handles disagreement conservatively before optional `CLASSIFY_LEARNED` and `PARSE` processing.
 5. **CKI-AC-05 — Exact unknown fallback:** An unknown file or an absent, crashed, timed-out, low-confidence, or invalid optional processor preserves readable bytes exactly and emits a typed warning.
 6. **CKI-AC-06 — Immutable source binding:** An applied plan binds a retained source view, exact staged bytes, or a successfully revalidated revision contract; a mutable path string alone cannot satisfy it.
@@ -627,7 +638,7 @@ The first conforming product MUST satisfy all of the following:
 8. **CKI-AC-08 — Stable extension seams:** `CaptureDriver`, `Processor`, `RepositoryDriver`, `IndexProvider`, and `QueryProvider` implementations or test doubles can be exchanged without changing core identity, plan, namespace, or authority semantics; `RetrieverDriver` remains a later seam.
 9. **CKI-AC-09 — Version-pinned execution:** Plans pin interface-family and capability-profile digests, and upgrades do not affect in-flight or historical operations.
 10. **CKI-AC-10 — Provenance completeness:** Every accepted derived representation and retained derivative links inputs, implementation, parameters, coverage, dependencies, validation, and core acceptance.
-11. **CKI-AC-11 — Original path projection:** A user can list, stat, read, mount read-only, and restore files through the recorded directory tree even when storage uses compressed and deduplicated packs or objects.
+11. **CKI-AC-11 — Original path projection:** A user can list, stat, read, materialize, and restore files through the recorded directory tree even when storage uses compressed and deduplicated packs or objects.
 12. **CKI-AC-12 — Search and annotation stability:** Generation-pinned baseline search returns stable logical subjects and paths; rebuilding or replacing the index alters neither stored data identity nor durable tag/note revisions.
 13. **CKI-AC-13 — Similarity boundary:** Perceptual or semantic similarity cannot authorize exact deduplication or exact-path substitution.
 14. **CKI-AC-14 — Reconciled publication:** A snapshot remains undiscoverable as committed until payload, prepared closure, and publication marker placements are reconciled.
@@ -638,8 +649,8 @@ The first conforming product MUST satisfy all of the following:
 19. **CKI-AC-19 — Explicit non-exact policy:** An approximate representation can become selected only through a named fidelity contract, compatible validation, durable authority, and an explicit non-exact selector in access and restore results.
 20. **CKI-AC-20 — Safe lifecycle:** No last required representation, portable record, placement, or decoder becomes collection-eligible while a committed snapshot depends on it.
 21. **CKI-AC-21 — Adapter equivalence:** CLI, initial read-only MCP, and any later REST or WebUI adapter produce equivalent core commands, authority checks, results, and events for every operation they share.
-22. **CKI-AC-22 — Safe Linux mount:** The bundled Linux FUSE profile binds one principal, one export root, and one immutable snapshot; verifies `ro,nodev,nosuid,noexec`; refuses `allow_other` and unrestricted option passthrough; preserves qualified raw-name, hard-link, sparse-file, inode, and directory-cookie semantics; and returns `EROFS` for every write-capable open or mutation opcode. Its cache and revocation limitations, including residual access through open handles, page cache, and `mmap`, are measured and disclosed for the signed compatibility tuple.
+22. **CKI-AC-22 — Reproducible materialization:** A frozen `ExportManifest` binds subjects, selected representations, output names, and a digest; applying it to an explicit destination returns per-item receipts and verification evidence. Optional mount adapters do not own identity or retention.
 
-The later semantic-extension profile additionally requires an external embedding or CLIP-like `Processor` to attach versioned derivatives, an `IndexProvider` to build a new generation, and a `QueryProvider` invoked against that exact `IndexGenerationRef` only after compatibility is validated. None becomes a recovery dependency. That test is not an `RW-MVP-1` release gate.
+The default semantic profile requires the pinned local text-embedding `Processor`, a zvec `IndexProvider` generation, and a `QueryProvider` invoked against that exact `IndexGenerationRef` only after compatibility is validated. None becomes a recovery dependency. Additional CLIP-like and multimodal profiles are later release gates.
 
 These criteria define RestoreWeave as a strong NAS storage and search product with a stable kernel, not an empty plugin framework. Advanced media representations, multimodal search, additional platforms, retrieval, and enterprise coordination extend this base without redefining its durable semantics.

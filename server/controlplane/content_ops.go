@@ -14,7 +14,10 @@ import (
 	"github.com/ailiheizi/restoreweave/server/internal/store/sqlite"
 )
 
-const maxContentRead = 1 << 20
+const (
+	maxContentRead    = 1 << 20
+	contentSessionTTL = 15 * time.Minute
+)
 
 type contentOpenInput struct {
 	WorkspaceID string `json:"workspace_id"`
@@ -37,6 +40,7 @@ type contentSession struct {
 	entryID     string
 	contentID   string
 	logicalSize int64
+	expiresAt   time.Time
 }
 
 type contentSessions struct {
@@ -169,20 +173,65 @@ func (d *Dispatcher) handleContentClose(_ context.Context, env command.Envelope,
 func (s *contentSessions) put(session contentSession) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.sweepLocked(time.Now())
+	if session.expiresAt.IsZero() {
+		session.expiresAt = time.Now().Add(contentSessionTTL)
+	}
 	s.byHandle[session.handle] = session
 }
 
 func (s *contentSessions) get(handle string) (contentSession, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now()
+	s.sweepLocked(now)
 	session, ok := s.byHandle[handle]
-	return session, ok
+	if !ok {
+		return contentSession{}, false
+	}
+	session.expiresAt = now.Add(contentSessionTTL)
+	s.byHandle[handle] = session
+	return session, true
 }
 
 func (s *contentSessions) close(handle string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.byHandle, handle)
+}
+
+func (s *contentSessions) sweep(now time.Time) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sweepLocked(now)
+}
+
+func (s *contentSessions) sweepLocked(now time.Time) int {
+	reaped := 0
+	for handle, session := range s.byHandle {
+		if !session.expiresAt.IsZero() && !now.Before(session.expiresAt) {
+			delete(s.byHandle, handle)
+			reaped++
+		}
+	}
+	return reaped
+}
+
+func (s *contentSessions) len() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.byHandle)
+}
+
+func (s *contentSessions) expireHandle(handle string, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	session, ok := s.byHandle[handle]
+	if !ok {
+		return
+	}
+	session.expiresAt = at
+	s.byHandle[handle] = session
 }
 
 func (s *contentSessions) read(ctx context.Context, session contentSession, offset, length int64) ([]byte, bool, error) {

@@ -224,7 +224,8 @@ The core exposes a versioned, authorized change feed to `IndexProvider` implemen
 - Stable subject and optional segment references.
 - Snapshot or inventory revision.
 - Namespace facts and selected authoritative metadata.
-- Versioned operator annotations.
+- Exact content identity/length, duplicate group, protection outcome, recovery-reference state, and available representations.
+- Versioned operator annotations and durable description revisions/segments.
 - Processor-derived artifacts with producer and lineage references.
 - Deletion, visibility, and authorization-label changes.
 
@@ -242,7 +243,7 @@ Each `IndexProvider` build or update targets one explicitly named index generati
 
 Builds occur beside the active generation. Validation covers feed coverage, fixture queries, authorization labels, missing derivatives, provider-specific health, and rollback. Activation is atomic from the query broker's perspective. A failed build leaves the prior generation active.
 
-The bundled baseline provider indexes paths, filenames, suffixes, selected formats, content classes, sizes, recorded times, source and snapshot identity, representation and verification state, durable tags and notes, and available extracted text. It is a required product implementation and remains useful before any embedding model or vector database is installed.
+The bundled lexical/structured provider indexes the complete baseline field registry below. It is a required product implementation and remains usable when the semantic generation is degraded. The qualified default product additionally builds the pinned local embedding and zvec generation; lexical/structured availability alone is not default-discovery completion.
 
 ### 9.3 Embedding and CLIP projections
 
@@ -254,9 +255,9 @@ Deleting all embedding artifacts and vector indexes degrades multimodal or seman
 
 ## 10. Query runtime
 
-`QueryProvider` accepts a bounded query against exactly one explicitly named `IndexGenerationRef` per invocation. The host query broker resolves any active-generation selector to that immutable reference and validates provider and generation compatibility before invocation. Every continuation token remains bound to the same exact generation. The provider owns retrieval, scoring, ranking, and any fusion across lexical, structured, vector, or media signals present in that generation. There is no separate ranker or embedding-provider ABI and no generic code, SQL, or prompt-execution query.
+`QueryProvider` accepts a bounded query against exactly one explicitly named `IndexGenerationRef` per invocation. The host query broker resolves any active-generation selector to that immutable reference and validates provider and generation compatibility before invocation. Every continuation token remains bound to the same exact generation. The provider owns retrieval, scoring, ranking, and any fusion across signals stored in that one generation; the host broker owns fusion across providers or generations. There is no separate ranker or embedding-provider ABI and no generic code, SQL, or prompt-execution query.
 
-Structured filters use a schema-checked database-like expression tree rather than provider-specific query strings. The baseline field registry includes path, filename, suffix, selected format, content class, logical size, recorded time, source, snapshot, representation state, verification state, processing state, tag, and note text. Predicates use declared typed operators such as equality, membership, ordered comparison, bounded range, prefix, containment, and existence; boolean composition is bounded `all`, `any`, and `not`.
+Structured filters use a schema-checked database-like expression tree rather than provider-specific query strings. The canonical baseline registry includes raw/display path and filename; entry type, suffix, magic/format and content class; logical/allocated size and captured times/ownership/mode facts; source and snapshot; exact checksum and length; duplicate group; protection, recovery-reference, representation and verification state; processing state and coverage; tag and note text; description kind/language/acceptance/provenance; extracted text; and available segment references. Each field declares whether it supports lexical matching, structured operators, semantic segmentation, or only display. Predicates use declared typed operators such as equality, membership, ordered comparison, bounded range, prefix, containment, and existence; boolean composition is bounded `all`, `any`, and `not`. An absent feed or schema field is a typed coverage gap, never an implied empty value.
 
 Results include:
 
@@ -272,7 +273,7 @@ A `QueryProvider` MAY combine lexical, structured, vector, and media-specific si
 
 ## 11. User annotations and external enrichment
 
-The MVP persists durable tags and notes attached to stable subject or typed segment references. The authoritative record stores author, time, revision, visibility, and provenance. Processor suggestions and external metadata remain separate from operator-confirmed annotations. Collections, ratings, corrections, aliases, and relationship graphs are later catalog capabilities and must not be required by the baseline lexical schema.
+The MVP persists durable tags, notes, description revisions, and their ordered semantic segments attached to stable subjects. The authoritative record stores author/producer, kind, time, revision, visibility, acceptance, source spans, and provenance. Processor suggestions and external metadata remain separate from operator-confirmed annotations. Collections, ratings, corrections, aliases, and relationship graphs are later catalog capabilities and must not be required by the baseline lexical schema.
 
 An enrichment processor may query an external service only under a declared egress grant. It stores the queried identifier, source, retrieval time, response digest or retained artifact, license and expiry information where applicable, and confidence. External metadata can improve discovery but cannot authorize omission or replace source bytes.
 
@@ -317,7 +318,7 @@ Status surfaces must say which subjects and capabilities are affected, the last 
 6. `IndexProvider` rebuilds from a replayable feed into a new generation and activates it atomically only after validation.
 7. Each `IndexProvider` build or update binds one named generation. Each `QueryProvider` invocation receives exactly one explicitly named `IndexGenerationRef` after host-side compatibility validation; pagination cannot cross generations.
 8. `QueryProvider` owns retrieval, ranking, and fusion, returns stable subject and authorized access references, and cannot bypass authorization or content-access handles.
-9. A bundled lexical metadata, durable tag and note, and extracted-text query remains usable before embeddings are installed.
+9. The bundled lexical/structured query remains usable while embeddings are unavailable and reports semantic degradation; release qualification still requires the real local semantic profile.
 10. CLIP and embedding generations can be rebuilt or removed without changing recovery records.
 11. The runtime operates on the qualified Linux/NAS reference host without any non-reference operating-system assumption.
 12. CLI and MCP observe identical semantics for operations present in the initial bounded MCP subset; the CLI also exposes authorized mutations that MCP does not initially expose.

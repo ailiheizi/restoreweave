@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -8,9 +9,115 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/ailiheizi/restoreweave/client/command"
 )
+
+func TestInboxRestorePlansOnlyWithoutDestination(t *testing.T) {
+	var operations []string
+	server := newInboxRestoreTestServer(t, func(_ context.Context, env command.Envelope) command.Result {
+		operations = append(operations, env.Operation)
+		if env.Operation != command.OpPlanRestore {
+			t.Fatalf("unexpected operation %q", env.Operation)
+		}
+		return command.NewResult(env, command.StatusSucceeded, time.Now(), time.Now(), command.PlanRestoreData{
+			SnapshotRef: "snapshot-1", Files: 2, Bytes: 12, PlanID: "plan-1", PlanDigest: "digest-1",
+			State: "READY",
+		})
+	})
+	defer server.Close()
+
+	resp := postInboxRestore(t, server.URL, "{}")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	resp.Body.Close()
+	if payload["wrote"] != false || payload["plan_id"] != "plan-1" {
+		t.Fatalf("preflight response = %#v", payload)
+	}
+	if len(operations) != 1 || operations[0] != command.OpPlanRestore {
+		t.Fatalf("operations = %#v, want plan.restore only", operations)
+	}
+}
+
+func TestInboxRestoreAppliesPlanWithDestination(t *testing.T) {
+	var operations []string
+	var applyInput map[string]any
+	server := newInboxRestoreTestServer(t, func(_ context.Context, env command.Envelope) command.Result {
+		operations = append(operations, env.Operation)
+		switch env.Operation {
+		case command.OpPlanRestore:
+			var input map[string]any
+			if err := json.Unmarshal(env.Input, &input); err != nil {
+				t.Fatalf("decode plan.restore input: %v", err)
+			}
+			return command.NewResult(env, command.StatusSucceeded, time.Now(), time.Now(), command.PlanRestoreData{
+				WorkspaceID: "wsp_plan", SnapshotRef: "snapshot-1", Destination: input["destination"].(string), Files: 2, Bytes: 12,
+				PlanID: "plan-1", PlanDigest: "digest-1", State: "READY", Executable: true,
+			})
+		case command.OpPlanApply:
+			if err := json.Unmarshal(env.Input, &applyInput); err != nil {
+				t.Fatalf("decode plan.apply input: %v", err)
+			}
+			return command.NewResult(env, command.StatusSucceeded, time.Now(), time.Now(), command.PlanApplyData{
+				PlanID: "plan-1", PlanDigest: "digest-1", SnapshotRef: "snapshot-1", Destination: "/tmp/out",
+				Files: 2, Bytes: 12,
+			})
+		default:
+			t.Fatalf("unexpected operation %q", env.Operation)
+			return command.Result{}
+		}
+	})
+	defer server.Close()
+
+	resp := postInboxRestore(t, server.URL, `{"destination":"/tmp/out"}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	resp.Body.Close()
+	if payload["wrote"] != true || payload["destination"] != "/tmp/out" {
+		t.Fatalf("restore response = %#v", payload)
+	}
+	if len(operations) != 2 || operations[0] != command.OpPlanRestore || operations[1] != command.OpPlanApply {
+		t.Fatalf("operations = %#v, want plan.restore then plan.apply", operations)
+	}
+	if applyInput["workspace_id"] != "wsp_plan" || applyInput["plan_id"] != "plan-1" || applyInput["plan_digest"] != "digest-1" {
+		t.Fatalf("plan.apply input = %#v", applyInput)
+	}
+}
+
+func newInboxRestoreTestServer(t *testing.T, dispatch DispatchFunc) *httptest.Server {
+	t.Helper()
+	server, err := New(dispatch, Options{
+		WorkspaceID: "ws_test", Token: "inbox-token", SnapshotRef: "snapshot-1", Listen: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	return httptest.NewServer(server.Handler())
+}
+
+func postInboxRestore(t *testing.T, baseURL, body string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/inbox/api/restore?p=inbox-token", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatalf("new restore request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("restore request: %v", err)
+	}
+	return resp
+}
 
 func TestNewRejectsNonLoopbackListen(t *testing.T) {
 	_, err := New(func(ctx context.Context, env command.Envelope) command.Result {

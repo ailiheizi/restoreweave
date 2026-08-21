@@ -3,11 +3,12 @@ module github.com/ailiheizi/restoreweave
 go 1.26.0
 
 require (
-	github.com/hanwen/go-fuse/v2 v2.11.0
+	github.com/klauspost/compress v1.18.7
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/spf13/cobra v1.9.1
 	golang.org/x/sys v0.46.0
 	google.golang.org/grpc v1.76.0
+	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.55.0
 )
 

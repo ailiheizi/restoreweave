@@ -2,7 +2,9 @@
 
 ## 1. Purpose
 
-RestoreWeave exposes one stable automation contract for a self-hosted, NAS-first content-aware managed data layer. People, scripts, NAS integrations, WebUIs, and external AI harnesses use the same typed operations to inspect sources, plan storage, publish snapshots, browse original paths, search derived indexes, read content, verify recovery, and restore data.
+RestoreWeave exposes one stable automation contract for a self-hosted, content-first managed data layer. People, scripts, NAS integrations, WebUIs, and external AI harnesses use the same typed operations to inspect sources, plan storage, publish snapshots, search derived indexes, save dynamic views, freeze and materialize export manifests, read content, verify recovery, and restore data.
+
+The content/view/export defaults in [Content Store, Views, and Export Requirements](content-store-views-and-exports.md) are authoritative. The command ABI has no mount/unmount family; the default user-facing output is an explicit frozen export manifest.
 
 The CLI is the primary human and scripting surface. The initial MCP adapter is local and read-only. A REST service or WebUI may be added as another adapter over the same operations; it does not create a second domain model.
 
@@ -46,7 +48,7 @@ Adapters MUST NOT:
 - Expose unrestricted host paths, repository credentials, signing keys, or backend-private object IDs.
 - Substitute an approximate representation for an exact read.
 
-The product MUST remain useful with no MCP client, LLM, embedding service, vector database, WebUI, or external search provider installed.
+Exact ingest, verification, and restore MUST remain useful with no MCP client, LLM, WebUI, or external search provider installed. The reference discovery experience includes its bundled local embedding worker and zvec generation; their failure is a visible degraded state.
 
 ## 3. Interface principles
 
@@ -277,6 +279,7 @@ Display paths are for people. Machine clients SHOULD pass `path_ref`. A CLI conv
 | `snapshot.diff` | None | Compare two committed namespace generations. |
 | `snapshot.verify` | Verification reads and evidence writes | Verify a declared snapshot scope and append evidence. |
 | `recovery.export` | Bounded artifact creation | Export a portable recovery closure or independently retainable recovery reference. |
+| `recovery.anchor.export` | Bounded artifact creation | Export the public Ed25519 trust anchor required to authenticate signed publication commits; never export private signing material. |
 | `namespace.list` | None | List one directory in a committed snapshot. |
 | `namespace.resolve` | None | Resolve path components and return an opaque path reference. |
 | `namespace.stat` | None | Read recorded entry and file-version metadata. |
@@ -290,6 +293,15 @@ Display paths are for people. Machine clients SHOULD pass `path_ref`. A CLI conv
 | `annotation.delete` | Durable tombstone write | Tombstone one tag or note revision without mutating index state directly. |
 | `annotation.export` | Bounded artifact creation | Export an authenticated portable annotation bundle. |
 | `annotation.import` | Durable annotation write | Import a portable bundle after subject and revision validation. |
+| `description.list` | None | List a bounded page of description revision summaries without returning full bodies. |
+| `description.get` | None | Read one full description revision and its ordered semantic segments. |
+| `description.create` | Durable description write | Create an immutable user, imported, extracted, or model-labeled description revision and its source-aligned segments. |
+| `view.save` | Durable catalog mutation | Create a revisioned dynamic query and presentation policy. |
+| `view.get` | None | Read one saved view revision without evaluating membership. |
+| `view.evaluate` | None | Evaluate one saved view against explicit generation references. |
+| `export.plan` | None | Freeze subjects, representations, names, target profile, and expected effects into an immutable `ExportManifest`. |
+| `export.apply` | Destination mutation | Materialize one exact export-manifest digest to an explicit destination. |
+| `export.verify` | Bounded read | Verify materialized output against its manifest and selected representations. |
 | `capability.list` | None | List configured capture, processor, repository, index, and query capabilities. |
 | `search.query` | None | Query one exact named index generation and return authorized subject candidates. |
 
@@ -344,6 +356,54 @@ Example input:
 ~~~
 
 `source_ref` selects a configured NAS, filesystem, share, or connector source. `inline_root` is an authorized local convenience for supported deployments. Exactly one is supplied. Platform-specific paths remain adapter inputs and do not become portable source identity.
+
+### 6.1 Protection decisions and external locators
+
+Every ingest plan carries a default protection mode and MAY override it per proposed subject:
+
+- `STORE_EXACT`
+- `STORE_EXACT_WITH_EXTERNAL_FALLBACK`
+- `LINK_ONLY`
+- `METADATA_ONLY`
+
+`LINK_ONLY` for readable bytes requires a distinct confirmation in the reviewed plan. Confirmation cannot be inferred from configuration, locator presence, a processor failure, or repository unavailability. A rejected or missing confirmation produces `BLOCKED`; it MUST NOT silently fall back to metadata-only.
+
+Each external binding contains one or more ordered locator inputs:
+
+~~~json
+{
+  "path": "relative/path.ext",
+  "kind": "HTTPS",
+  "locator": "https://example.invalid/path.ext",
+  "display_locator": "example release mirror",
+  "credential_ref": "keychain://restoreweave/example",
+  "rights_evidence_ref": "entitlement:example"
+}
+~~~
+
+`path` scopes a locator to one captured regular file. A target ABI MAY instead use a stable proposed-subject reference after observation. Multiple locator records for the same subject are alternatives in priority order. Credentials are references and MUST NOT be embedded in `locator` or `display_locator`. The applied record adds expected content identity and logical length when source bytes were readable. Locator presence alone remains `UNVALIDATED` and cannot produce `RESTORE_VERIFIED`.
+
+The current development harness accepts a tree default plus explicit per-file overrides:
+
+~~~json
+{
+  "root": "/authorized/local/tree",
+  "protection_mode": "LINK_ONLY",
+  "file_protection": {
+    "keep-local.bin": "STORE_EXACT",
+    "facts-only.txt": "METADATA_ONLY"
+  },
+  "confirm_link_only": true,
+  "external_locators": [
+    {
+      "path": "relative/path.ext",
+      "locator": "https://example.invalid/path.ext"
+    }
+  ]
+}
+~~~
+
+The matching CLI is `rw ingest <root> --protection LINK_ONLY --file-protection 'keep-local.bin=STORE_EXACT' --file-protection 'facts-only.txt=METADATA_ONLY' --confirm-link-only --locator 'relative/path.ext=https://example.invalid/path.ext'`. Repeating `--locator` records alternatives. An unscoped locator is accepted only when the captured tree contains one regular file. The current harness performs read-only capture inspection and records a `READY` immutable plan with estimates, config digest, source basis, and per-file planned outcome/reason/identity; it does not publish repository data. The reviewed plan is executed separately with `rw plan apply <plan-id> --workspace <workspace-id> --digest <plan-digest>` after the plan, protection, configuration, and source checks pass.
 
 Planning MAY retain a qualified capture and invoke explicitly selected read-only processors. It MUST NOT publish repository data, mutate source content, delete a source, or contact a network destination outside the selected targets and granted processor profiles.
 
@@ -431,7 +491,21 @@ An uncertain observation is not reported as a confirmed source deletion.
 }
 ~~~
 
-`plan.revise` never edits the base plan. It creates a successor with a new digest, records decision authority, recomputes consequences, and acquires any required capture hold for its own lineage.
+`plan.revise` never edits the base plan. For the supported ingest protection decisions, it creates a successor with a new digest, records decision authority, re-inspects the source, and recomputes the per-entry protection outcomes, protection digest, and storage estimates that depend on those decisions. Unsupported decision types MUST be rejected rather than represented as if their consequences had been recomputed. The successor acquires any required capture hold for its own lineage.
+
+The current narrow decision-file schema is:
+
+~~~json
+[
+  {
+    "path": "relative/unreadable.bin",
+    "mode": "METADATA_ONLY",
+    "reason": "The operator accepts that only stable namespace metadata will be retained."
+  }
+]
+~~~
+
+For a path retained as `BLOCKED` or `UNAVAILABLE` in the base plan, this decision is an explicit operator-resolution request, not an automatic fallback. A successor becomes executable only if a fresh rooted-FD scan sees a regular file with identical before/after metadata, an included checked boundary, and no lstat, boundary, post-stat, or stability failure. Unstable entries, changed paths or handles, directories, symlinks, special files, path-string captures, cancelled scans, failed scans, and any unapproved entry remain blocked. A successful resolution publishes an `EXPLICITLY_UNPROTECTED` namespace fact with no `ContentID`, file version, representation, or recovery reference; it preserves `INCOMPLETE` scan authority and blocks exact restore.
 
 ### 7.2 Plan abandonment
 
@@ -543,7 +617,7 @@ Clean recovery trusts only a valid signed publication commit verified against in
 
 `namespace.list` input includes snapshot or parent `path_ref`, page token, limit, and optional stable sort mode.
 
-The page token is opaque and authenticated. It binds the interface version, exact snapshot and namespace-root digest, parent `path_ref`, sort and filter shape, principal and authorization revision, and expiry. It cannot be reused for another directory, snapshot, principal, authorization state, sort, or operation, and it is never accepted as a FUSE directory offset. Following one continuation chain returns every authorized child exactly once without duplication or omission. Retrying an identical request with the same token is idempotent; an expired or mismatched token fails with `PAGE_TOKEN_EXPIRED` or `PAGE_TOKEN_SCOPE_MISMATCH` rather than restarting or changing scope silently.
+The page token is opaque and authenticated. It binds the interface version, exact snapshot and namespace-root digest, parent `path_ref`, sort and filter shape, principal and authorization revision, and expiry. It cannot be reused for another directory, snapshot, principal, authorization state, sort, or operation. Following one continuation chain returns every authorized child exactly once without duplication or omission. Retrying an identical request with the same token is idempotent; an expired or mismatched token fails with `PAGE_TOKEN_EXPIRED` or `PAGE_TOKEN_SCOPE_MISMATCH` rather than restarting or changing scope silently.
 
 `namespace.resolve` accepts a snapshot and encoded path components. It returns an opaque `path_ref`. It does not follow symbolic links by default.
 
@@ -603,9 +677,17 @@ An exact open fails with `NO_EXACT_REPRESENTATION` or another typed reason if th
 
 Collections, ratings, relationship graphs, typed segment annotations, recovery-intent services, and machine-suggestion review remain later profiles.
 
+### 9.6 Durable descriptions
+
+Descriptions are separate from short `NOTE` annotations. `description.create` accepts one subject, kind (`USER`, `IMPORTED`, `EXTRACTED`, `AI_SUMMARY`, or `AI_ANALYSIS`), UTF-8 body, language, title, source and producer references, confidence/coverage, visibility, acceptance state, optional predecessor, and provenance metadata. A successor is a new immutable record; it never overwrites its predecessor, and one predecessor cannot silently fork into two successors.
+
+The current reference command accepts at most 16 MiB of UTF-8 text and splits it at UTF-8-safe sentence or whitespace boundaries into ordered segments of at most 1024 source bytes where practical. Every segment retains a digest and `[start_byte,end_byte)` source span. `description.list` defaults to 100 summaries and accepts a limit from 1 to 1000; summaries exclude body and segment text. `description.get` returns one full revision and its segments.
+
+These operations establish the catalog and command shape only. A description is not fully portable until its body, revisions, segments, provenance, config/profile digests, and authenticated bundle or recovery-closure reference survive loss of the operational SQLite catalog. Vector generations remain disposable and never become the only copy of description text.
+
 ## 10. Search and query operations
 
-`search.query` is a stable read-only projection operation using `DiscoveryQuery/v1`. The core remains recoverable when no provider is configured, but the `RW-MVP-1` reference distribution MUST configure bundled lexical metadata/full-text `IndexProvider` and `QueryProvider` implementations, validate their compatibility, and activate one named generation.
+`search.query` is a stable read-only projection operation using `DiscoveryQuery/v1`. The core remains recoverable when no provider is configured, but the `RW-MVP-1` reference distribution MUST configure bundled lexical, structured, and local semantic `IndexProvider` and `QueryProvider` implementations, validate their compatibility, and activate generation-pinned default fusion.
 
 Example input:
 
@@ -700,6 +782,14 @@ A repository-native check, processor result, index lookup, or local cache hit is
 
 The export result reports artifact path or stream handle, digest, length, snapshot, and trust requirements. It never claims an additional failure domain unless the export is actually stored independently.
 
+The operation accepts an optional subject scope and output form. Snapshot scope exports the portable closure bundle. Subject scope may export a deterministic signed `RecoveryToken` set: one token per selected `RecoveryReference`, including exact, reversible, and link-only references and their honest protection claims. A token export for `LINK_ONLY_UNPROTECTED` preserves that warning and MUST NOT imply that bytes are inside the token or currently reacquirable. A metadata-only subject returns its `EXPLICITLY_UNPROTECTED` record and no token.
+
+The reference signed implementation writes a bundle containing the selected `PUBLICATION_COMMIT`, its `PREPARED_CLOSURE`, their authenticated digests, and the required trust-anchor key ID/digest. The bundle does not contain a private key and is not itself the trust root. A non-signed development profile may export the legacy portable snapshot form, but that profile does not satisfy the signed recovery contract.
+
+### 11.3 Recovery trust-anchor export
+
+`recovery.anchor.export` writes a new public trust-anchor artifact and refuses to overwrite an existing destination. The artifact contains the schema, signature domain, publication domain, writer identity, Ed25519 public key, key ID, and public-key digest. It MUST NOT contain a private key, credential, repository secret, or a claim that the anchor was independently retained. Verification and clean recovery require the operator to supply this anchor from a separately retained location.
+
 ## 12. Status, events, and cancellation
 
 `status.get` may inspect:
@@ -711,6 +801,8 @@ The export result reports artifact path or stream handle, digest, length, snapsh
 - Snapshot publication and verification state.
 - Processor, index-feed, and query-provider health.
 - Retention and later GC planning state.
+
+When an exact lane is attached, the current implementation returns the resolved repository path, `repository_profile`, `compression_profile`, health, and committed snapshot count. `doctor.check` repeats the active tuple and separately states that an in-tree candidate is not a selected release engine. Profile visibility is diagnostic evidence, not qualification.
 
 It may perform bounded reconciliation and cleanup of already expired local handles or holds. It cannot publish, restore, retire, or garbage-collect data.
 
@@ -743,8 +835,12 @@ restoreweave browse [<snapshot-ref>[:<path>]]
 restoreweave stat <snapshot-ref>:<path>
 restoreweave representations <snapshot-ref>:<path>
 restoreweave cat <snapshot-ref>:<path> [--representation <representation-ref>] [--to-file <new-file>]
-restoreweave mount <snapshot-ref> <mountpoint> [--foreground]
 restoreweave search <query> [--provider <query-provider-ref>] [--generation <index-generation-ref>] [--snapshot <snapshot-ref>] [--allow-stale]
+restoreweave view save <name> --query <query>
+restoreweave view show <view-ref>
+restoreweave export plan (--view <view-ref> | --subject <subject-ref>...) --target <profile>
+restoreweave export apply <export-manifest-ref> --destination <path-or-uri>
+restoreweave export verify <export-manifest-ref> --destination <path-or-uri>
 restoreweave tag list <subject-ref>
 restoreweave tag add <subject-ref> <tag> [--expected-revision <revision>]
 restoreweave tag remove <subject-ref> <tag> [--expected-revision <revision>]
@@ -753,8 +849,12 @@ restoreweave note set <subject-ref> --from-file <file> [--expected-revision <rev
 restoreweave note remove <subject-ref> [--expected-revision <revision>]
 restoreweave annotations export [--subject <subject-ref>] --to-file <new-file>
 restoreweave annotations import <file> [--conflict fail|keep-local|keep-imported]
+restoreweave description list [<subject-ref>] --workspace <workspace-ref> [--limit <count>]
+restoreweave description get <description-ref> --workspace <workspace-ref>
+restoreweave description create <subject-ref> --workspace <workspace-ref> --kind <kind> (--body <text> | --body-file <path|->) [--predecessor <description-ref>]
 
 restoreweave recovery export <snapshot-ref> --to-file <new-file>
+restoreweave recovery anchor export <new-file>
 restoreweave restore <snapshot-ref>:<path> <destination-path>
 restoreweave restore --from <repository> --recovery-reference <file> --to <destination-path> --credential <credential-ref>
 restoreweave restore --from <repository> --latest --trust <trust-anchor-ref> --to <destination-path>
@@ -762,7 +862,7 @@ restoreweave restore --from <repository> --latest --trust <trust-anchor-ref> --t
 restoreweave mcp serve --stdio
 ~~~
 
-The concise `plan`, `apply`, `profile run`, `browse`, `mount`, `search`, `tag`, `note`, `verify`, and `restore` commands are product porcelain over canonical operations. They do not add hidden semantics. `mount` is a local read-only Linux FUSE adapter over `SnapshotTree` and `FileAccess`; it adds no writable namespace semantics. One invocation binds the authenticated CLI principal, one export root, and one exact immutable snapshot. The adapter verifies `ro,nodev,nosuid,noexec`, does not enable `allow_other`, and accepts no arbitrary mount-option passthrough. Additional mount options require a versioned, allowlisted compatibility-profile field and independent qualification. A saved profile creates a fresh plan against current source and capability state; it never reapplies an old mutable plan.
+The concise `plan`, `apply`, `profile run`, `browse`, `search`, `view`, `export`, `tag`, `note`, `verify`, and `restore` commands are product porcelain over canonical operations. They do not add hidden semantics. Mounting is intentionally outside the command ABI. A saved ingest profile creates a fresh plan against current source and capability state; it never reapplies an old mutable plan.
 
 Interactive `restore` porcelain first creates an immutable `plan.restore` result, displays its exact digest and consequences, and applies it only through `plan.apply` after the required confirmation and authority checks. Noninteractive and machine clients MUST call the two canonical operations explicitly; a convenience command cannot bypass the plan digest.
 
@@ -1091,9 +1191,9 @@ A query with exact generation, typed filters, projection, sort, facets, and stal
 
 Create, revise, tombstone, export, and re-import tags and notes. Optimistic revision conflicts write nothing, index loss loses no annotation, and re-import preserves exact subject bindings and revisions.
 
-### CM-AT-020: Read-only Linux mount
+### CM-AT-020: Export-manifest materialization
 
-The bundled FUSE view binds one principal, one export root, and one immutable snapshot; verifies `ro,nodev,nosuid,noexec`; refuses `allow_other` and unqualified options; and returns the same raw representable names, path metadata, hard links, sparse semantics, symbolic links, and exact bytes as `namespace.*` and `content.*`. Mount-local inode collisions cannot alias unrelated entries, directory cookies cannot cross handles or scopes, and every write-capable open and mutation opcode returns `EROFS` without side effects. Qualification covers concurrent handles, cache behavior, authorization expiry and revocation through existing handles, page cache, and `mmap`, and clean and crash-driven unmount.
+Freeze a saved view into an immutable `ExportManifest`, apply its exact digest to an empty destination, and verify every output against the selected representation. Re-evaluating the saved view may change membership; replaying the frozen manifest may not. Destination collisions, unsupported names or metadata, stale authorization, and unavailable representations fail with typed outcomes and do not silently rename or substitute content.
 
 ### CM-AT-021: MCP annotation boundary
 

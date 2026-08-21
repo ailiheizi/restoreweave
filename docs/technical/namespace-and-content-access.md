@@ -6,7 +6,7 @@ RestoreWeave presents stored data as an authenticated, file-shaped namespace eve
 
 This is the stable data-access promise:
 
-> A caller can browse, read, mount, and restore the original directory form without knowing how the repository physically stores the bytes.
+> A caller can browse, read, materialize an export, and restore the original directory form without knowing how the repository physically stores the bytes. Any mount is performed by an external tool over exported or separately authorized data.
 
 The design targets self-hosted Linux-based NAS and large heterogeneous collections. It is independent of one repository engine or presentation protocol. Platform-specific capture drivers translate source semantics into the common namespace model and declare every fidelity limitation.
 
@@ -15,8 +15,8 @@ The file-shaped interface is the narrow waist shared by:
 - CLI browse, stat, range read, and restore.
 - Local read-only MCP resources and tools.
 - Optional WebUI and REST adapters.
-- Bundled read-only Linux FUSE access.
-- Later SMB, NFS, WebDAV, S3-compatible, media-server, alternate FUSE, and other gateways.
+- Export-manifest materialization and authorized `FileAccess` consumers.
+- External tools that consume a materialized export or authorized read stream.
 - External text, media, vector, and hybrid search systems.
 
 Related contracts are defined in:
@@ -134,7 +134,7 @@ Portable records MUST NOT identify an entry only by a normalized slash-separated
 
 Absolute host paths, `..`, embedded separators, invalid encodings, device aliases, and symbolic links are never concatenated into an unrestricted host path during resolution.
 
-The qualified Linux FUSE profile projects representable raw component bytes directly, including non-UTF-8 names. It MUST NOT normalize, case-fold, transcode, or silently escape a name. NUL, slash, an unresolvable collision, or another component that cannot be represented faithfully on the selected mount profile makes that entry or export explicitly unsupported rather than causing a renamed path to appear.
+An export projects representable raw component bytes directly, including non-UTF-8 names where the destination profile supports them. It MUST NOT normalize, case-fold, transcode, or silently escape a name. NUL, slash, an unresolvable collision, or another component that cannot be represented faithfully on the selected export profile makes that entry explicitly unsupported rather than causing a renamed path to appear.
 
 ### 5.3 NamespaceRoot
 
@@ -482,9 +482,9 @@ The projection is private. It can be deleted and rebuilt from RRF records, porta
 
 No CLI, MCP, REST, gateway, processor, index provider, or query provider may query private tables as its compatibility contract.
 
-## 16. Gateway adapters
+## 16. Export and external presentation boundary
 
-The reference distribution bundles a read-only Linux FUSE adapter over `SnapshotTree` and `FileAccess`. SMB, NFS, WebDAV, S3-compatible, media-server, alternate FUSE, and other NAS presentations are later adapters over the same contracts. Gateways are presentation adapters, not new storage-algorithm extension seams.
+The reference distribution exposes an `ExportManifest` and authenticated `FileAccess` over `SnapshotTree`. It does not implement FUSE, SMB, NFS, WebDAV, S3-compatible, media-server, or other filesystem/network presentation services. Operators may materialize an export into a directory and point an external tool at that directory, or use a bounded `FileAccess` consumer directly.
 
 Each exported view is pinned to:
 
@@ -494,34 +494,9 @@ Each exported view is pinned to:
 - Allowed operations and content budget.
 - Expiry and revocation state.
 
-Gateways do not receive global repository credentials or policy authority. A gateway cache validates snapshot, file-version, representation, range, and verification identity before reuse.
+External consumers do not receive global repository credentials or policy authority. Any consumer cache must bind snapshot, file-version, representation, range, and verification identity before reuse. A materialized export is an ordinary operator-owned directory and has no implicit live-update or authorization semantics; re-export is required for a new snapshot.
 
-The bundled FUSE profile binds exactly one principal, one export root, and one immutable snapshot per mount. A configured `latest` selector is resolved before mount publication and becomes that exact snapshot; it is never a moving view. The adapter verifies the effective mount flags and requires `ro,nodev,nosuid,noexec`; it refuses `allow_other` and arbitrary mount-option passthrough.
-
-The bundled FUSE adapter:
-
-- Resolves `latest` to one exact committed snapshot when the mount opens; it never changes the mounted generation silently.
-- Keeps every open handle pinned to its file version and representation until close.
-- Supports concurrent directory and regular-file handles, random and sequential reads, symbolic-link target reads, and collision-resolved stable inode mapping for the mount lifetime.
-- Returns typed I/O failures for unavailable, corrupt, unauthorized, or non-exact content and never substitutes a similar representation.
-- Reports only the verification state actually known for the bytes read.
-- Rejects every write-capable open and every mutation opcode, including create, write, truncate, allocate, rename, link, symlink, unlink, directory mutation, ownership, mode, timestamp, xattr, ACL, and device-node mutation, with `EROFS` before any side effect.
-
-### 16.1 Inodes, directory cookies, and filesystem fidelity
-
-The adapter owns a mount-local inode table. The table maps the authenticated root and entry identity to a nonzero kernel inode, detects numeric collisions, and resolves them without aliasing unrelated entries. Members of one recorded hard-link group map to the same inode and link count; entries outside that group MUST NOT share an inode merely because a hash collides. Identity remains stable for the mount lifetime but is not a portable record or a promise across mounts.
-
-FUSE directory offsets are opaque handle-local cookies, not child ordinals, byte offsets, database row IDs, or durable `PageToken` values. The adapter translates each cookie through the exact `SnapshotTree` continuation state for that directory handle. A cookie cannot be replayed across handles, directories, principals, snapshots, or mounts. Restarting from offset zero produces the same immutable ordering, and continuing from a returned cookie neither duplicates nor omits an entry. `READDIRPLUS` is enabled only for a Linux compatibility tuple whose large-directory scaling, lookup amplification, memory use, inode stability, and cache behavior have been qualified; otherwise the adapter uses ordinary `readdir`.
-
-Sparse-file reads return zero bytes for recorded holes without materializing the entire logical file. Logical size always matches `FileVersion`. Reported block allocation and any `SEEK_DATA` or `SEEK_HOLE` support derive from the recorded sparse-layout profile, never from repository pack allocation or deduplication; unsupported seek semantics fail explicitly rather than inventing extents. Raw name bytes, symbolic-link target bytes, hard-link membership, and declared metadata follow the same authenticated records used by `SnapshotTree`.
-
-### 16.2 Caches, authorization, and teardown
-
-Attribute, entry, negative-entry, and data-cache behavior is part of the qualified mount profile. Cache keys bind the immutable snapshot, namespace root, entry or file version, representation, and verification identity. TTLs and memory bounds are explicit, and an authorization or integrity transition invalidates userspace caches and initiates unmount or revocation handling.
-
-Kernel page cache, already-open file descriptors, pending requests, and `mmap` can outlive a userspace authorization check. Qualification therefore measures residual access after principal or mount authorization expires or is revoked, including access through existing handles, cached pages, new page faults, and mappings. If the implementation cannot enforce the declared revocation bound, documentation and status MUST label the mount a local-trust surface rather than claiming strong multi-user revocation. Clean unmount and daemon-crash teardown must not leave a writable, silently repointed, or falsely healthy view.
-
-A future writable namespace requires a separate transaction, conflict, durability, and capture design and is not implied by this read contract.
+`ExportManifest` records the selected immutable snapshot, root, subjects, exact representation policy, byte and entry budgets, destination policy, and verification evidence. Materialization is idempotent, refuses unsafe destination reuse, and reports unsupported metadata explicitly. `FileAccess` keeps handles principal-bound, representation-bound, range-limited, and expiring. External tools are responsible for their own mount, sharing, cache, and revocation behavior.
 
 ## 17. Security and failure behavior
 
@@ -594,17 +569,17 @@ A GC plan cannot select placements reachable from retained snapshots, portable c
 
 For the same principal and content handle budget, CLI JSON and read-only MCP expose the same path metadata, content identity, representation identity, bytes, and typed errors.
 
-### NA-AT-015: Bundled Linux FUSE equivalence
+### NA-AT-015: Export materialization equivalence
 
-Mount one committed snapshot for one principal and export root with verified `ro,nodev,nosuid,noexec` flags and no `allow_other`. Compare directory listings, raw names, attributes, symbolic links, hard links, sparse extents, random ranges, streamed files, and failure cases with `SnapshotTree` and `FileAccess`. Open handles remain generation-pinned; unrelated entries never alias after inode collisions; directory cookies cannot cross handles or scopes; cache reuse validates identity; and every write-capable open and mutation opcode returns `EROFS` without side effects. Exercise authorization expiry and revocation through new opens, existing handles, page cache, and `mmap`, and report any residual access beyond the declared bound as a local-trust limitation.
+Materialize one committed snapshot for one principal and export root. Compare the manifest, directory entries, raw names, metadata, symbolic links, hard links, sparse extents, random ranges, streamed files, and failure cases with `SnapshotTree` and `FileAccess`. Repeated materialization is idempotent, exact bytes match restore SHA-256, and unsupported metadata or content is explicit.
 
-### NA-AT-016: Pagination and directory-cookie continuity
+### NA-AT-016: Pagination continuity
 
-Traverse large immutable directories through CLI, MCP, `SnapshotTree`, and FUSE using varied page sizes, retries, concurrent directory handles, and seek-back-to-zero behavior. Each scoped continuation chain returns every authorized entry exactly once. Tokens and cookies fail when replayed across a principal, directory, snapshot, sort, authorization revision, handle, or mount, and a retried identical page never changes its contents.
+Traverse large immutable directories through CLI, MCP, `SnapshotTree`, and an export consumer using varied page sizes, retries, and concurrent handles. Each scoped continuation chain returns every authorized entry exactly once. Tokens fail when replayed across a principal, directory, snapshot, sort, authorization revision, or query shape, and a retried identical page never changes its contents.
 
-### NA-AT-017: Linux FUSE performance qualification
+### NA-AT-017: External presentation boundary
 
-For the declared repository, kernel, adapter, cache, and mount-policy tuple, publish cold and warm first-byte latency; large-directory `readdir` and qualified `READDIRPLUS` scaling; sequential and random-read throughput; repository request and byte amplification; process and kernel-cache memory; concurrent file and directory handle limits; attribute, entry, negative-entry, and data-cache behavior; revocation residual access; and clean and crash-driven unmount behavior. A regression outside the declared envelope cannot be hidden by increasing cache lifetime, weakening authorization checks, changing exact-byte selection, or silently disabling integrity verification.
+Verify that an external mount or sharing tool can consume a materialized export or bounded `FileAccess` without repository-private credentials or a second catalog. RestoreWeave qualifies the bytes and authorization at its boundary; the external tool's kernel, cache, and unmount behavior are outside the RestoreWeave release gate.
 
 ## 19. Implementation decision
 

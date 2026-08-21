@@ -19,8 +19,8 @@
 - **URL:** https://github.com/kopia/kopia
 - **License:** Apache-2.0
 - **Version or pin:** v0.23.1
-- **Role in five seams:** `RepositoryDriver` (leading candidate; also a FUSE read-path pattern source)
-- **What to borrow:** The whole repository engine as a planned direct dependency — object model, storage abstractions, verification mechanisms, and maintenance/repair behavior. From the FUSE side, borrow only the thin go-fuse adapter structure and the `READDIRPLUS` regression case ([issue #1135](https://github.com/kopia/kopia/issues/1135)); do not inherit Kopia's repository or namespace model as RestoreWeave ABI ([open-source-adoption-and-code-borrowing.md:137](open-source-adoption-and-code-borrowing.md#36-design-and-competitor-reference-only)).
+- **Role in five seams:** `RepositoryDriver` (leading candidate)
+- **What to borrow:** The whole repository engine as a planned direct dependency — object model, storage abstractions, verification mechanisms, and maintenance/repair behavior. Do not inherit Kopia's repository or namespace model as RestoreWeave ABI.
 - **How to integrate:** Direct dependency (library) inside a narrow reference adapter, after the qualification spike. Disable unneeded server and external-SSH surfaces; keep Kopia types private.
 - **Status:** Qualification pending
 - **Notes:** The spike must prove all nine items — root/GC safety, crash reconciliation, bounded reads, independent SHA-256 readback, catalog-independent recovery, corruption behavior, maintenance compatibility, deployment performance, and reader closure ([open-source-adoption-and-code-borrowing.md:163-173](open-source-adoption-and-code-borrowing.md#4-kopia-qualification-spike)). Pin at least v0.23.1; [GHSA-2q4c-3mrw-63c3](https://github.com/kopia/kopia/security/advisories/GHSA-2q4c-3mrw-63c3) affects versions through v0.22.3.
@@ -31,7 +31,7 @@
 - **URL:** https://github.com/restic/restic
 - **License:** BSD-2-Clause
 - **Version or pin:** v0.19.1
-- **Role in five seams:** `RepositoryDriver` (control benchmark and possible subprocess driver); FUSE read-path pattern source
+- **Role in five seams:** `RepositoryDriver` (control benchmark and possible subprocess driver)
 - **What to borrow:** Benchmark data (exact footprint, ingest, range reads, mount behavior, verification, restore, operating burden) and, if selected, the driver itself through a process boundary. Borrow chunk-offset lookup, blob caching, and concurrent offset-read patterns from the FUSE read path; retain [issue #3828](https://github.com/restic/restic/issues/3828) (mounted access 8x-25x slower than restore) as performance counterevidence ([open-source-adoption-and-code-borrowing.md:138](open-source-adoption-and-code-borrowing.md#36-design-and-competitor-reference-only)).
 - **How to integrate:** Subprocess (CLI control) or direct dependency only after the spike; upstream explicitly treats Restic as a CLI, not a supported library.
 - **Status:** Qualification pending
@@ -61,17 +61,13 @@
 - **Status:** New
 - **Notes:** New entry added 2026-08-12. Because it is in the same language as RestoreWeave, it offers a lower-boundary alternative to a subprocess-driven engine; its claims (verifiability, Web browsing) must be proven against the same spike corpus, not taken from the README.
 
-### 5. go-fuse — read-only Linux FUSE projection
+### 5. go-fuse — rejected product dependency
 
 - **Project:** go-fuse (Go)
 - **URL:** https://github.com/hanwen/go-fuse
-- **License:** MIT
-- **Version or pin:** v2.11.0, pinned commit [`423b377`](https://github.com/hanwen/go-fuse/commit/423b377e1452ab7b3522229185a3047f72e3f966)
-- **Role in five seams:** Bundled read-only Linux FUSE projection behind `SnapshotTree` and `FileAccess`
-- **What to borrow:** The FUSE protocol stack as a private adapter dependency. No go-fuse type enters portable records or public contracts.
-- **How to integrate:** Direct dependency (library).
-- **Status:** Frozen
-- **Notes:** Adoption depends on the project's own read-only suite because the tagged CI included a rename-exchange failure outside RestoreWeave's read-only surface; later upstream revisions require normal dependency-upgrade qualification ([open-source-adoption-and-code-borrowing.md:50](open-source-adoption-and-code-borrowing.md#31-planned-direct-dependencies-and-bundled-implementation-choices)). No privileged mount helper is vendored; the deployment uses the host's `/dev/fuse` and `fusermount3` ([open-source-adoption-and-code-borrowing.md:56](open-source-adoption-and-code-borrowing.md#31-planned-direct-dependencies-and-bundled-implementation-choices)).
+- **Role:** Historical research reference only
+- **Decision:** Do not adopt. RestoreWeave exposes export manifests and bounded file reads; operators choose external mount or sharing tools.
+- **Status:** Rejected 2026-08-17
 
 ### 6. modernc.org/sqlite — bundled SQLite driver and FTS5 provider basis
 

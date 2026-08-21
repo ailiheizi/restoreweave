@@ -10,7 +10,7 @@ RestoreWeave is one content and recovery data plane with many bounded ways to us
 RestoreWeave Core
   -> Universal Catalog and Inbox
   -> Music, Books, Video, Photos, Documents, Games, and other experience packs
-  -> CLI, MCP, universal UI, FUSE, and third-party clients
+  -> CLI, MCP, universal UI, export consumers, and third-party clients
 ```
 
 The core keeps exact identity, the file-shaped namespace, representations, provenance, verification, authorization, and restore semantics. Experience packs interpret content and provide focused views such as a music library, a novel reader, a video browser, a photo workspace, or an application/game inventory. A pack or client can be removed without making exact content unsearchable or unrestorable.

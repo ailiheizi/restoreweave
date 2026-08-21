@@ -41,6 +41,10 @@ type searchQueryInput struct {
 	Query        json.RawMessage `json:"query"`
 	WorkspaceID  string          `json:"workspace_id,omitempty"`
 	GenerationID string          `json:"index_generation_ref,omitempty"`
+	Dimension    string          `json:"dimension,omitempty"`
+	Axes         []string        `json:"construct_axes,omitempty"`
+	Fuse         []string        `json:"fuse,omitempty"`
+	Filters      search.Filters  `json:"filters,omitempty"`
 }
 
 func (d *Dispatcher) handleAnnotationList(ctx context.Context, env command.Envelope, started time.Time) command.Result {
@@ -177,6 +181,10 @@ func (d *Dispatcher) handleAnnotationImport(ctx context.Context, env command.Env
 	if bundle.Schema != "" && bundle.Schema != command.AnnotationBundleSchema {
 		return invalidInputResult(env, started, errString("unsupported annotation bundle schema"))
 	}
+	policy, err := normalizeAnnotationConflict(bundle.Conflict)
+	if err != nil {
+		return invalidInputResult(env, started, err)
+	}
 	imported := make([]command.AnnotationData, 0, len(bundle.Annotations))
 	workspaces := map[string]struct{}{}
 	for _, item := range bundle.Annotations {
@@ -191,11 +199,32 @@ func (d *Dispatcher) handleAnnotationImport(ctx context.Context, env command.Env
 		}
 		existing, err := d.store.GetAnnotation(ctx, item.WorkspaceID, item.ID)
 		if err == nil {
-			if existing.Revision != item.Revision || existing.Body != item.Body || existing.Tombstoned != item.Tombstoned {
+			same := existing.Revision == item.Revision && existing.Body == item.Body && existing.Tombstoned == item.Tombstoned
+			if same {
+				imported = append(imported, projectAnnotation(existing))
+				continue
+			}
+			switch policy {
+			case command.AnnotationConflictKeepLocal:
+				imported = append(imported, projectAnnotation(existing))
+				continue
+			case command.AnnotationConflictKeepImported:
+				if existing.Tombstoned {
+					return conflictResult(env, started, "annotation "+item.ID+" is tombstoned locally; keep-imported will not rewrite history")
+				}
+				if err := d.store.ReviseAnnotation(ctx, item.WorkspaceID, item.ID, existing.Revision, item.Body, item.Tombstoned, time.Time{}); err != nil {
+					return annotationWriteResult(env, started, err)
+				}
+				updated, getErr := d.store.GetAnnotation(ctx, item.WorkspaceID, item.ID)
+				if getErr != nil {
+					return catalogErrorResult(env, started, getErr)
+				}
+				imported = append(imported, projectAnnotation(updated))
+				workspaces[item.WorkspaceID] = struct{}{}
+				continue
+			default:
 				return conflictResult(env, started, "annotation "+item.ID+" already exists with a different revision")
 			}
-			imported = append(imported, projectAnnotation(existing))
-			continue
 		}
 		if !containsNotFound(err) {
 			return catalogErrorResult(env, started, err)
@@ -230,7 +259,19 @@ func (d *Dispatcher) handleAnnotationImport(ctx context.Context, env command.Env
 	return succeeded(env, started, command.AnnotationExportData{
 		Schema:      command.AnnotationBundleSchema,
 		Annotations: imported,
+		Conflict:    policy,
 	})
+}
+
+func normalizeAnnotationConflict(policy string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(policy)) {
+	case "", command.AnnotationConflictFail:
+		return command.AnnotationConflictFail, nil
+	case command.AnnotationConflictKeepLocal, command.AnnotationConflictKeepImported:
+		return strings.ToLower(strings.TrimSpace(policy)), nil
+	default:
+		return "", errString("conflict must be fail, keep-local, or keep-imported")
+	}
 }
 
 func (d *Dispatcher) handleSearchQuery(ctx context.Context, env command.Envelope, started time.Time) command.Result {
@@ -241,12 +282,40 @@ func (d *Dispatcher) handleSearchQuery(ctx context.Context, env command.Envelope
 	if err := decodeInput(env.Input, &input); err != nil {
 		return invalidInputResult(env, started, err)
 	}
-	queryText := parseQueryText(input.Query)
-	if queryText == "" {
-		return invalidInputResult(env, started, errString("query is required"))
+	queryText, dimensionID, requestedAxes, fuseIDs, filters := parseSearchRequest(input)
+	if queryText == "" && !filters.Has() {
+		return invalidInputResult(env, started, errString("query or filters are required"))
+	}
+	filters, err := search.NormalizeFilters(filters)
+	if err != nil {
+		return invalidInputResult(env, started, err)
 	}
 	if input.WorkspaceID != "" {
 		if err := requireStableID("workspace_id", input.WorkspaceID); err != nil {
+			return invalidInputResult(env, started, err)
+		}
+	}
+	if len(fuseIDs) > 0 {
+		if strings.TrimSpace(dimensionID) != "" {
+			return invalidInputResult(env, started, errString("fuse and dimension cannot be set together"))
+		}
+		if input.GenerationID != "" {
+			return invalidInputResult(env, started, errString("fuse cannot pin one index_generation_ref"))
+		}
+		return d.handleFusedSearch(ctx, env, started, input.WorkspaceID, queryText, requestedAxes, fuseIDs, filters)
+	}
+	dimension, ok := search.LookupDimension(dimensionID, search.IndexerReadiness(d.search))
+	if !ok {
+		return invalidInputResult(env, started, errString("dimension is not a declared index dimension"))
+	}
+	if dimension.ID != search.DimensionLexical && len(requestedAxes) > 0 {
+		return invalidInputResult(env, started, errString("construct_axes are lexical only"))
+	}
+	var axes []string
+	if dimension.ID == search.DimensionLexical {
+		var err error
+		axes, err = search.NormalizeConstructAxes(requestedAxes)
+		if err != nil {
 			return invalidInputResult(env, started, err)
 		}
 	}
@@ -255,20 +324,109 @@ func (d *Dispatcher) handleSearchQuery(ctx context.Context, env command.Envelope
 			return invalidInputResult(env, started, err)
 		}
 	}
-	generation, hits, err := d.search.Query(ctx, input.WorkspaceID, input.GenerationID, queryText)
+	empty := command.SearchQueryData{
+		Dimension:      dimension.ID,
+		Provider:       dimension.Provider,
+		ScoreSemantics: dimension.ScoreSemantics,
+		ConstructAxes:  axes,
+		Hits:           []command.SearchHitData{},
+	}
+	if dimension.State != command.CapabilityAvailable {
+		empty.ConstructAxes = nil
+		return degradedResult(env, started, empty,
+			dimension.ID+" is unavailable in this build; lexical search, namespace, annotations, and restore are unaffected")
+	}
+	generation, hits, err := d.search.Query(ctx, search.QueryRequest{
+		WorkspaceID:  input.WorkspaceID,
+		GenerationID: input.GenerationID,
+		Dimension:    dimension.ID,
+		Text:         queryText,
+		Axes:         axes,
+		Filters:      filters,
+	})
 	if err != nil {
+		if errors.Is(err, search.ErrInvalidQuery) {
+			return invalidInputResult(env, started, err)
+		}
 		if errors.Is(err, search.ErrUnavailable) {
-			return degradedResult(env, started, command.SearchQueryData{
-				GenerationID: generation.ID,
-				Hits:         []command.SearchHitData{},
-			}, "search index is unavailable; namespace, annotations, and restore are unaffected")
+			empty.GenerationID = generation.ID
+			return degradedResult(env, started, empty, "search index is unavailable; namespace, annotations, and restore are unaffected")
 		}
 		return catalogErrorResult(env, started, err)
 	}
+	return succeeded(env, started, command.SearchQueryData{
+		GenerationID:   generation.ID,
+		Dimension:      dimension.ID,
+		Provider:       dimension.Provider,
+		ScoreSemantics: dimension.ScoreSemantics,
+		ConstructAxes:  axes,
+		Hits:           d.authorizeHits(ctx, input.WorkspaceID, generation.WorkspaceID, hits, nil),
+	})
+}
+
+func (d *Dispatcher) handleFusedSearch(ctx context.Context, env command.Envelope, started time.Time, workspaceID, queryText string, requestedAxes, fuseIDs []string, filters search.Filters) command.Result {
+	dims, err := search.NormalizeFuse(fuseIDs)
+	if err != nil {
+		return invalidInputResult(env, started, err)
+	}
+	var axes []string
+	for _, id := range dims {
+		if id == search.DimensionLexical {
+			axes, err = search.NormalizeConstructAxes(requestedAxes)
+			if err != nil {
+				return invalidInputResult(env, started, err)
+			}
+			break
+		}
+	}
+	if axes == nil && len(requestedAxes) > 0 {
+		return invalidInputResult(env, started, errString("construct_axes are lexical only"))
+	}
+	fused, err := d.search.Fuse(ctx, search.QueryRequest{
+		WorkspaceID: workspaceID,
+		Text:        queryText,
+		Axes:        axes,
+		Fuse:        dims,
+		Filters:     filters,
+	})
+	if err != nil {
+		return catalogErrorResult(env, started, err)
+	}
+	components := make([]command.SearchComponentData, 0, len(fused.Components))
+	for _, component := range fused.Components {
+		components = append(components, command.SearchComponentData{
+			Dimension:      component.Dimension,
+			Provider:       component.Provider,
+			GenerationID:   component.GenerationID,
+			ScoreSemantics: component.ScoreSemantics,
+			Status:         component.Status,
+			Hits:           component.Hits,
+		})
+	}
+	hits := make([]search.Hit, 0, len(fused.Hits))
+	dimBySubject := map[string][]string{}
+	for _, hit := range fused.Hits {
+		hits = append(hits, hit.Hit)
+		dimBySubject[hit.SubjectID] = hit.Dimensions
+	}
+	data := command.SearchQueryData{
+		Provider:        search.ProviderBrokerFuse,
+		ScoreSemantics:  search.ScoreComponentUnion,
+		FusedDimensions: dims,
+		ConstructAxes:   axes,
+		Components:      components,
+		Hits:            d.authorizeHits(ctx, workspaceID, "", hits, dimBySubject),
+	}
+	if !search.FuseSucceeded(fused) {
+		return degradedResult(env, started, data, "all fused dimensions were unavailable; namespace, annotations, and restore are unaffected")
+	}
+	return succeeded(env, started, data)
+}
+
+func (d *Dispatcher) authorizeHits(ctx context.Context, workspaceID, fallbackWorkspace string, hits []search.Hit, dimensions map[string][]string) []command.SearchHitData {
 	authorized := make([]command.SearchHitData, 0, len(hits))
-	workspaceID := input.WorkspaceID
 	if workspaceID == "" {
-		workspaceID = generation.WorkspaceID
+		workspaceID = fallbackWorkspace
 	}
 	for _, hit := range hits {
 		entry, err := d.store.GetNamespaceEntry(ctx, workspaceID, hit.SubjectID)
@@ -276,17 +434,16 @@ func (d *Dispatcher) handleSearchQuery(ctx context.Context, env command.Envelope
 			continue
 		}
 		authorized = append(authorized, command.SearchHitData{
-			SubjectRef: entry.ID,
-			Path:       hit.Path,
-			Name:       entry.DisplayName,
-			EntryType:  string(entry.EntryType),
-			ContentID:  entry.ContentID,
+			SubjectRef:    entry.ID,
+			Path:          hit.Path,
+			Name:          entry.DisplayName,
+			EntryType:     string(entry.EntryType),
+			ContentID:     entry.ContentID,
+			ConstructAxes: hit.ConstructAxes,
+			Dimensions:    dimensions[hit.SubjectID],
 		})
 	}
-	return succeeded(env, started, command.SearchQueryData{
-		GenerationID: generation.ID,
-		Hits:         authorized,
-	})
+	return authorized
 }
 
 func (d *Dispatcher) upsertTag(ctx context.Context, input annotationUpsertInput) (sqlite.Annotation, error) {
@@ -439,18 +596,57 @@ func projectAnnotation(record sqlite.Annotation) command.AnnotationData {
 }
 
 func parseQueryText(raw json.RawMessage) string {
-	if len(raw) == 0 {
-		return ""
+	text, _, _, _, _ := parseSearchQueryObject(raw)
+	return text
+}
+
+func parseSearchRequest(input searchQueryInput) (text, dimension string, axes, fuse []string, filters search.Filters) {
+	text, nestedDimension, nestedAxes, nestedFuse, nestedFilters := parseSearchQueryObject(input.Query)
+	dimension = strings.TrimSpace(input.Dimension)
+	if dimension == "" {
+		dimension = nestedDimension
 	}
-	var text string
+	axes = append([]string(nil), input.Axes...)
+	if len(axes) == 0 {
+		axes = nestedAxes
+	}
+	fuse = append([]string(nil), input.Fuse...)
+	if len(fuse) == 0 {
+		fuse = nestedFuse
+	}
+	filters = input.Filters
+	if !filters.Has() {
+		filters = nestedFilters
+	}
+	return text, dimension, axes, fuse, filters
+}
+
+func parseSearchQueryObject(raw json.RawMessage) (text, dimension string, axes, fuse []string, filters search.Filters) {
+	if len(raw) == 0 {
+		return "", "", nil, nil, search.Filters{}
+	}
 	if err := json.Unmarshal(raw, &text); err == nil {
-		return strings.TrimSpace(text)
+		return strings.TrimSpace(text), "", nil, nil, search.Filters{}
 	}
 	var nested struct {
-		Text string `json:"text"`
+		Text        string         `json:"text"`
+		Fingerprint string         `json:"fingerprint"`
+		Relation    string         `json:"relation"`
+		Value       string         `json:"value"`
+		Dimension   string         `json:"dimension"`
+		Axes        []string       `json:"construct_axes"`
+		Fuse        []string       `json:"fuse"`
+		Filters     search.Filters `json:"filters"`
 	}
 	if err := json.Unmarshal(raw, &nested); err == nil {
-		return strings.TrimSpace(nested.Text)
+		text := strings.TrimSpace(nested.Text)
+		if text == "" {
+			text = strings.TrimSpace(nested.Fingerprint)
+		}
+		if text == "" && strings.TrimSpace(nested.Relation) != "" {
+			text = strings.TrimSpace(nested.Relation) + ":" + strings.TrimSpace(nested.Value)
+		}
+		return text, strings.TrimSpace(nested.Dimension), nested.Axes, nested.Fuse, nested.Filters
 	}
-	return ""
+	return "", "", nil, nil, search.Filters{}
 }

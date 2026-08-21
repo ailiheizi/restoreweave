@@ -7,7 +7,7 @@ This document records the concrete build-stack and package-structure decisions f
 Scope:
 
 - Confirm the kernel/userland split and the five active extension seams plus the reserved `RetrieverDriver` (system-architecture.md:56-63).
-- Freeze or explicitly defer every component choice that the plan milestones need (repository engine, FTS5 search, FUSE adapter, Processor control plane, MCP, file identification, CLI framework).
+- Freeze or explicitly defer every component choice that the plan milestones need (repository engine, FTS5/zvec search, Processor control plane, MCP, file identification, CLI framework).
 - Propose the Go package layout that implements the seams without exporting a public ABI.
 - Define the concurrency, lifecycle, and storage-topology model the controller will use.
 - Record the key decisions in ADR style so they can be revisited with their rationale.
@@ -27,9 +27,9 @@ RestoreWeave is built as a small authoritative kernel plus replaceable, versione
 - `QueryProvider`
 - a later reserved `RetrieverDriver`
 
-Conceptual `Processor` roles (`CLASSIFY_LEARNED`, `PARSE`, `EXTRACT`, `ENRICH`, `FINGERPRINT`, `TRANSFORM`, `VALIDATE`, `INDEX_PREPARE`) are capability roles inside one interface, not separate public wire ABIs (system-architecture.md:219-232). Presentation gateways (FUSE, CLI, MCP, later REST/WebUI) are northbound adapters, not storage-algorithm seams (system-architecture.md:69-72).
+Conceptual `Processor` roles (`CLASSIFY_LEARNED`, `PARSE`, `EXTRACT`, `ENRICH`, `FINGERPRINT`, `TRANSFORM`, `VALIDATE`, `INDEX_PREPARE`) are capability roles inside one interface, not separate public wire ABIs (system-architecture.md:219-232). Presentation bindings (CLI, MCP, and later REST/WebUI) are northbound adapters, not storage-algorithm seams. RestoreWeave does not implement filesystem mounts (system-architecture.md:69-72).
 
-The kernel is not an empty framework: the reference distribution must ship a complete default pipeline that ingests, deduplicates, compresses, places, verifies, searches, browses, and restores without any optional plugin, model, or WebUI (system-architecture.md:76-78; core-kernel-and-interface.md:81-83).
+The kernel is not an empty framework: the reference distribution must ship a complete default pipeline that ingests, deduplicates, compresses, places, verifies, searches, browses, and restores without any optional plugin or WebUI (system-architecture.md:76-78; core-kernel-and-interface.md:81-83).
 
 ### 2.2 Authoritative versus replaceable
 
@@ -58,7 +58,6 @@ Legend for the status column:
 | Language and toolchain | Go 1.26.0, single module (`go.mod:1-5`); `go vet` clean; `-race` enabled in the default test invocation; only `modernc.org/sqlite` as a direct dependency today | Go is the language of the existing tree (`internal/scanner`, `internal/readsvc`, `internal/store/sqlite`) and of the leading repository candidate (Kopia) and the added Go-native control (Plakar). One module keeps `internal/` private, which is the compatibility contract (core-kernel-and-interface.md:173). Race-detector tests are mandatory because the controller is concurrent (see section 5) | **Frozen** |
 | SQLite and FTS5 | `modernc.org/sqlite v1.55.0` (already the sole direct dependency, `go.mod:5`) as the bundled `IndexProvider` and `QueryProvider`; one physically separate disposable database per immutable `IndexGenerationRef`; schema, row IDs, tokenizer tables, and query syntax are private (adoption doc §7, lines 238-251) | Pure-Go, CGO-free, STRICT-table SQLite is already proven in the operational catalog (`internal/store/sqlite/migrations.go`, 16 `STRICT` tables plus `schema_migrations`). FTS5 gives useful lexical search with zero new runtime. Generation-per-database gives atomic activation, bounded rollback, and cheap deletion (nas-vertical-slice-implementation-plan.md:186-191) | **Frozen** |
 | Repository engine | **Kopia v0.23.1** as the leading `RepositoryDriver` candidate via library integration; **Restic v0.19.1** as the control benchmark and possible subprocess driver; **Borg 1.4.5** as a bounded local/SSH auxiliary; **Plakar** (Go, ISC) added as a second Go-native control and in-process library candidate. No engine is adopted until the qualification spike passes (adoption doc lines 62-64, 159-175; nas-vertical-slice-implementation-plan.md:164) | Kopia leads because its Go repository APIs, object reads, storage abstractions, and verification fit `RepositoryDriver` better than a CLI-only engine. Restic is a documented CLI, not a supported library. Borg is the least natural adapter but a useful compression/maintenance calibration. Plakar is the new Go-native contrast: its Kloset chunker and verify-oriented design give an in-process, permissive-license (ISC) control against Kopia. Selection is by observed correctness and operating cost, not stars or nominal ratios | **Qualification spike pending** |
-| Read-only FUSE | `github.com/hanwen/go-fuse/v2` v2.11.0, pin commit `423b377`, kept private behind `SnapshotTree`/`FileAccess` (adoption doc line 50; nas-vertical-slice-implementation-plan.md:197-201) | Tagged release, demonstrated Kopia/rclone use, resource and invalidation controls, BSD-style license. Kernel-enforced `ro,nodev,nosuid,noexec`, `allow_other` disabled, every mutation opcode returns `EROFS` (adoption doc lines 253-276) | **Frozen** (pin); adapter behavior still subject to the qualification gates in the adoption audit |
 | Processor control plane | Protobuf schemas + gRPC over a Unix-domain socket; large bytes travel through pre-opened file descriptors, never inline in messages; bubblewrap, namespaces, seccomp, `no_new_privs`, rlimits, cgroup v2, allowlisted environment, no network by default (adoption doc §6, lines 211-236; nas-vertical-slice-implementation-plan.md:175-176) | This is reference plumbing, not a public wire ABI: the semantic contract stays typed operations, handles, result envelopes, and artifact state. Out-of-process isolation is required for untrusted parsers (system-architecture.md:354-365) | **Frozen** as private plumbing; the wire contract remains experimental until cross-version conformance |
 | MCP | Local, read-only MCP adapter over the same typed command dispatcher, using the official MCP Go SDK after pinning one license-stable revision (adoption doc line 53; core-kernel-and-interface.md:167-168) | MCP is a northbound presentation adapter, never an internal bus, scheduler, or data plane (adoption doc line 149). It binds the bounded read-only subset (status, search, namespace, content) | **Frozen** as the adapter approach; the exact SDK revision is **open until the license-stable pin** |
 | File identification | Host-owned suffix rules, then bounded `file`/libmagic magic-byte evidence; magic database digest pinned; compressed-inspection and decompressor forking disabled; optional Siegfried for ambiguity/preservation depth (adoption doc lines 14, 51, 65) | Two-step evidence is a normative requirement: suffix and magic evidence must remain independently visible and auditable (system-architecture.md:232-246; core-kernel-and-interface.md:373-386) | **Frozen** (adopt and bundle); the magic database digest pin is release work |
@@ -118,7 +117,6 @@ internal/indexfeed/          replayable authorized feed and IndexProvider coordi
 internal/search/             bundled FTS5 IndexProvider + QueryProvider (one disposable DB per generation)
 internal/query/              host query broker, generation pinning, result reauthorization
 internal/annotations/        durable tag/note CRUD + portable export/import
-internal/gateway/fuse/       bundled read-only Linux FUSE adapter (go-fuse v2.11.0, pin 423b377)
 internal/mcp/                local read-only MCP adapter (stdio) over the command dispatcher
 internal/store/sqlite/       operational catalog (existing; leases, idempotency, annotations tables grow here)
 internal/plugin/             LEGACY — frozen; retired at Milestone 0 (section 4.3)
@@ -136,7 +134,6 @@ testdata/conformance/        cross-binding and clean-recovery fixtures
 | `internal/identify/` | (new host-owned baseline stage) | **Ports** the suffix/magic logic out of `internal/plugin/builtin_detector.go`; suffix+magic are host-owned, so they must not live in a retiring plugin package |
 | `internal/repository/` | `internal/repository` (Driver host) | New; the seam types plus the Kopia adapter and the read-adapter wiring into `internal/readsvc/ports.go:66-70` |
 | `internal/search/` | `internal/indexfeed` + `internal/query` provider impls | New; FTS5 generation builder + query executor (adoption doc §7, lines 238-251) |
-| `internal/gateway/fuse/` | `internal/binding/fuse` | New; thin go-fuse adapter over `SnapshotTree`/`FileAccess` (readsvc/service.go:13-45) |
 | `internal/mcp/` | `internal/binding/mcp` | New; stdio read-only adapter |
 | `internal/annotations/` | (new) | New; durable whole-subject tag/note records with revision and tombstone provenance (core-kernel-and-interface.md:498-504) |
 | `internal/scanner/` | `internal/capture` (eventually) | Kept as-is; remains non-authoritative evidence until retained-root capture is qualified (nas-vertical-slice-implementation-plan.md:18-21, 161-163) |
@@ -187,7 +184,6 @@ Consequences for the concurrency model:
 | Processor supervisor | controller process | long-lived | spawns/recycles sandboxed children |
 | Processor child | sandboxed process | one invocation (recycled after crash) | the single `RUN_STAGE`/`DECODE_REPRESENTATION` operation |
 | Index builder | controller process | generation-scoped | replay feed -> disposable FTS5 DB |
-| FUSE gateway | controller process or sidecar | mount-scoped | one pinned snapshot view (readsvc/service.go:13-45) |
 
 ## 6. Storage and layout
 
@@ -209,13 +205,11 @@ This table maps every meaningful upstream into the seam it serves and the exact 
 
 | Upstream | Seam / package | Borrow point and role | License / status |
 | --- | --- | --- | --- |
-| **Kopia v0.23.1** | `internal/repository` (RepositoryDriver) | **Direct-dependency candidate**: Go repository APIs, object reads, storage abstractions, verification. Gate: the §4 qualification spike — root/GC safety, crash reconciliation, bounded/random reads, independent SHA-256 readback, catalog-independent recovery, corruption behavior, maintenance compatibility, NAS performance (adoption doc lines 159-175). Kopia's own FUSE adapter is a thin go-fuse structure reference and the `READDIRPLUS` regression (issue #1135) is a retained test case (adoption doc line 137) | Apache-2.0; **qualification spike pending**; GHSA-2q4c-3mrw-63c3 affects versions through v0.22.3, hence the v0.23.1 floor |
+| **Kopia v0.23.1** | `internal/repository` (RepositoryDriver) | **Direct-dependency candidate**: Go repository APIs, object reads, storage abstractions, verification. Gate: the §4 qualification spike — root/GC safety, crash reconciliation, bounded/random reads, independent SHA-256 readback, catalog-independent recovery, corruption behavior, maintenance compatibility, NAS performance (adoption doc lines 159-175) | Apache-2.0; **qualification spike pending**; GHSA-2q4c-3mrw-63c3 affects versions through v0.22.3, hence the v0.23.1 floor |
 | **Plakar** (`PlakarKorp/plakar`, Kloset + ptar) | `internal/repository` (RepositoryDriver) | **New Go-native control** added alongside Restic/Borg: Kloset chunking/verification design for dedup-profile comparison; verify-oriented recovery semantics as counterevidence; in-process library candidate against Kopia's library integration. ISC license permits in-process use after review, but it ships only if the same spike gates pass (identity-safe GC, crash reconciliation, bounded reads, catalog-independent recovery) | ISC; **qualification spike pending**; exact release pin + full dependency review are spike prerequisites |
 | **Perkeep** | `internal/repository` test suite; `FileAccess` read path | **Selective code borrowing** (Apache-2.0): `pkg/blobserver` for small storage interfaces and adapter conformance-test patterns; `pkg/schema/filewriter.go` for chunk-tree construction; `pkg/schema/filereader.go` for range reads and reconstruction (adoption doc lines 114-126). Do not inherit SHA-224 defaults, object identity, or publication model | Apache-2.0; every borrowed fragment records source, commit, license, and independent tests (adoption doc line 126) |
-| **go-fuse v2.11.0** (`423b377`) | `internal/gateway/fuse` | **Planned direct dependency**: read-only adapter over `SnapshotTree`/`FileAccess`. Requirements: one mount = one principal + one export root + one immutable snapshot; `ro,nodev,nosuid,noexec`; `allow_other` disabled; `EROFS` for every write-capable open and mutation opcode; cookie-to-`PageToken` translation without replay (adoption doc lines 253-276; nas-vertical-slice-implementation-plan.md:197-201) | BSD-style; **frozen pin**, behavior qualification pending |
 | Restic v0.19.1 | `internal/repository` (control) | Control benchmark and possible subprocess driver; chunk-offset lookup, blob caching, concurrent offset reads as read-path patterns; issue #3828 as performance counterevidence (adoption doc lines 63, 138) | BSD-2-Clause; subprocess boundary |
 | Borg 1.4.5 | `internal/repository` (auxiliary control) | Bounded local/SSH compression, maintenance, and mounted-read calibration; not the leading adapter (adoption doc line 64) | BSD-3-Clause; subprocess boundary |
-| rclone v1.75.0 (`mount2`, `vfs`) | `internal/gateway/fuse` qualification | ReadAt handle style, chunk-growth, read-ahead, transfer accounting, retries, metrics, `READDIRPLUS` vocabulary (adoption doc line 139) | MIT; design reference only |
 | Watchman / zrepl | `internal/capture`, `internal/lifecycle` | Recrawl/overflow/poison-state concepts for lossy observation; ZFS snapshot lifecycle and holds as test patterns (adoption doc lines 140-141) | MIT; design reference only |
 
 ## 8. Decision records (ADR style)
@@ -227,19 +221,19 @@ This table maps every meaningful upstream into the seam it serves and the exact 
 - **Decision:** Prefer **in-process library integration (Kopia)** so receipts, bounded reads, and reconciliation are typed Go calls under the host's control. Keep Restic as the subprocess control and Plakar as a second Go-native library control. **No engine enters the release binary until the spike passes** (adoption doc lines 159-175): root/GC safety for RestoreWeave's portable objects is the first and most decision-changing gate.
 - **Consequences:** If Kopia's snapshot-centric GC cannot root RestoreWeave objects safely, Plakar becomes the in-process alternative and Restic the subprocess fallback. Library integration means `internal/repository` must pin the exact engine version and hide all engine types behind the seam; no Kopia/Plakar type may reach portable records.
 
-### ADR-002: SQLite FTS5 first; semantic search deferred
+### ADR-002: SQLite FTS5 plus bundled local zvec semantic search
 
-- **Status:** Accepted (frozen by adoption audit and milestone 3).
-- **Context:** Baseline discovery must cover path, filename, type, metadata, checksum, duplicates, tags/notes, processing state, and extracted text (driver-and-processor-interfaces.md:506). Vector/semantic search is a later profile.
-- **Decision:** SQLite FTS5 is the bundled `RW-MVP-1` `IndexProvider`/`QueryProvider`, one disposable physical database per immutable `IndexGenerationRef`, schema kept private (adoption doc lines 16, 49, 238-251). No Tantivy/LanceDB/Qdrant/OpenSearch/Meilisearch/FAISS before the FTS5 ceiling is measured (adoption doc line 151).
+- **Status:** Superseded and re-accepted by the 2026-08-19 core product contract. The earlier “semantic deferred” wording is no longer active.
+- **Context:** Default discovery must cover path, filename, type, metadata, checksum, duplicates, tags/notes/descriptions, processing state, extracted text, and the bundled local semantic space. Exact ingest and recovery remain independent of every index, but a release without the real local semantic generation is degraded and does not satisfy the default experience.
+- **Decision:** SQLite FTS5 remains the bundled lexical/structured `IndexProvider`/`QueryProvider`; the reference local semantic generation is in-process zvec v0.6.x through `zvec-go`, one disposable collection directory per immutable `IndexGenerationRef`, with schemas kept private. Qdrant/Milvus remain service profiles; alternate stores require measured conformance.
 - **Consequences:** Deleting every index degrades search only; namespace access, tags/notes, exact reads, verification, and restore stay intact, and a new generation rebuilds from durable records (nas-vertical-slice-implementation-plan.md:191).
 
-### ADR-003: Bundled FUSE is strictly read-only; writes are refused at the kernel boundary
+### ADR-003: Mounting is outside RestoreWeave
 
-- **Status:** Accepted (frozen).
-- **Context:** The reference distribution bundles a read-only Linux FUSE view over the original-path namespace (system-architecture.md:319). Writable gateways are later adapters and never receive repository-private access.
-- **Decision:** go-fuse v2.11.0 pinned at `423b377`, one mount bound to one principal, one export root, one immutable snapshot; require `ro,nodev,nosuid,noexec`, disable `allow_other`, fail the mount if the policy cannot be confirmed, and return `EROFS` for every write-capable open and mutation opcode before any effect (adoption doc lines 253-276). Kernel-enforced read-only, not omission of mutation methods (adoption doc line 255).
-- **Consequences:** If kernel caching makes authorization revocation unenforceable within the declared bound, the mount is documented as a local-trust surface (adoption doc line 272). The FUSE adapter remains replaceable presentation without touching `SnapshotTree`/`FileAccess` (driver-and-processor-interfaces.md:528).
+- **Status:** Accepted (closed).
+- **Context:** Kernel filesystems add platform, cache, revocation, privilege, and lifecycle obligations unrelated to the content/annotation/recovery plane.
+- **Decision:** RestoreWeave exposes `ExportManifest`, `SnapshotTree`, `FileAccess`, and restore operations only. It has no mount command, mount ABI, or kernel-filesystem dependency.
+- **Consequences:** Operators may use external tools against a restored directory, materialized export, or separately authorized byte stream. Those tools do not become recovery authority.
 
 ### ADR-004: Retire the legacy `internal/plugin` prototype
 
@@ -277,7 +271,6 @@ This table maps every meaningful upstream into the seam it serves and the exact 
 | MCP Go SDK revision with completed, reproducible license state | the MCP adapter pin | license/supply-chain review (adoption doc §9) |
 | CLI framework review (cobra recommendation) | freezing the CLI binding | this document, section 3.1 |
 | libmagic database digest pin | the bundled magic stage | release inventory (adoption doc §9) |
-| FUSE behavior qualification (caches, revocation, `EROFS`, read amplification) | calling the adapter NAS-usable | `internal/gateway/fuse` qualification |
 | Processor sandbox + first deterministic processor conformance | milestone 2 exit | `internal/process` |
 | Capture hardening (retained-root, `openat2`/equivalent) | scanner output becoming authoritative | `internal/capture` / `internal/scanner` |
 

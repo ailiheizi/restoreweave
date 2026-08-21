@@ -2,6 +2,8 @@
 
 > **Review status:** This review was reframed on 2026-08-12 around the corrected self-hosted NAS product. It distinguishes implemented foundations, documented design, inferred product value, and unverified market claims. A large requirements archive is not treated as a complete product.
 
+> **Historical decision note (superseded 2026-08-19):** Bundled-FUSE and embedding-optional gates below are retained only to explain the earlier completeness assessment. The current MVP contract instead requires explicit export materialization, no RestoreWeave mount API, and a bundled local ONNX/BGE plus in-process zvec semantic profile; see [Content Store, Views, and Export Requirements](../requirements/content-store-views-and-exports.md).
+
 ## 1. Conclusion
 
 RestoreWeave is not currently a complete storage, catalog, backup, or NAS product. It is a substantial design archive plus early Go foundations for filesystem observation, extension capability modeling, namespace access, representation records, and a rebuildable SQLite projection.

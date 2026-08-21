@@ -23,7 +23,7 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** ar
 
 The core MUST own:
 
-- Stable content, file-version, namespace-entry, collection, representation, and segment identities.
+- Stable content, file-version, namespace-entry, collection, representation, protection-reference, description-document, and segment identities.
 - The evidence ledger and the selected classification result.
 - Typed routing, fallback order, resource policy, and privacy policy.
 - Immutable operation plans and human-authorized policy decisions.
@@ -31,7 +31,7 @@ The core MUST own:
 - Original-directory browsing and exact-byte recovery semantics.
 - Representation selection and the distinction between authoritative, rebuildable, perceptual, and discovery-only data.
 - Provenance, dependency closure, operation history, and audit events.
-- Durable user tag and note records, revisions, tombstones, and portable export/import.
+- Durable user tag, note, and description records, revisions, tombstones, provenance, and portable export/import.
 - Query-time authorization of every returned subject.
 
 Extensions MAY:
@@ -51,17 +51,17 @@ An extension MUST NOT:
 - Receive ambient filesystem, network, secret, repository-administration, or database authority.
 - Require an embedded LLM harness, prompt loop, agent memory, A2A runtime, or general workflow engine.
 
-The reference product MUST remain useful when optional AI processors and vector providers are absent. It MUST still ingest data, preserve a recoverable filesystem view, reduce storage with qualified deterministic defaults, provide durable tag/note CRUD, and search path, name, type, metadata, checksum, duplicate, tag, note, processing-state, and available extracted-text fields.
+The reference product MUST ship a local semantic processor and vector provider by default, while exact ingest, storage, verification, and restore remain independent of their derived state. Description generation is a typed `Processor` capability, not a second authority or an embedded agent. If the semantic branch is absent or fails, the host MUST expose an explicit degraded status and continue lexical/structured search over path, name, type, metadata, checksum, duplicate, protection state, recovery references, descriptions, tag, note, processing-state, and available extracted-text fields.
 
 ## 3. Platform-neutral interface inventory
 
 | Interface | Responsibility | Required behavior |
 | --- | --- | --- |
 | **CaptureDriver** | Present a bounded and consistently described source view. | Required for each supported source profile. |
-| **Processor** | Execute one declared stateless or bounded-state content capability. | Required extension seam; individual processors are optional. |
+| **Processor** | Execute one declared stateless or bounded-state content capability. | Required extension seam; capabilities are optional unless the active product profile, such as the default local embedding profile, explicitly mandates one. |
 | **RepositoryDriver** | Place and retrieve admitted representations in local, NAS, object, or engine-managed storage. | At least one qualified implementation is required. |
-| **IndexProvider** | Build and update immutable or versioned search generations. | A baseline lexical implementation is required for the reference product; vector and multimodal implementations are optional. |
-| **QueryProvider** | Query exactly one explicitly named `IndexGenerationRef` per invocation and return subject-bound candidates; compatibility is validated before invocation. | A baseline lexical implementation is required for the reference product; semantic and multimodal implementations are optional. |
+| **IndexProvider** | Build and update immutable or versioned search generations. | Hybrid lexical/structured plus local semantic generations are required for the reference product; other vector and multimodal implementations are optional. |
+| **QueryProvider** | Query exactly one explicitly named `IndexGenerationRef` per invocation and return subject-bound candidates; compatibility is validated before invocation. | The default broker fuses lexical, structured, and local semantic candidates; other semantic and multimodal providers are optional. |
 
 A single executable MAY implement several interfaces. In particular, one plugin may implement both IndexProvider and QueryProvider, but each capability remains separately negotiated and authorized.
 
@@ -260,6 +260,20 @@ The core MAY add stage roles only through a versioned schema update. It MUST NOT
 
 A transform profile declares supported encode and decode directions separately. A transform that claims exact recovery MUST provide a pinned decoder closure, decoded length and digest expectations, streaming and seek or range behavior, and pass independent host-controlled round-trip verification. A decoder retained for historical reads MAY reject new encoding while it remains obligated to decode every pinned dependent representation. A lossy, perceptual, or generative transform MUST use the corresponding explicit recovery relation and can never silently replace exact fallback.
 
+### 6.1 Core capability mappings
+
+The following names are capability IDs within the existing `Processor` protocol, not new privileged interface families:
+
+| Capability | Stage | Required input | Admissible output | Forbidden authority |
+| --- | --- | --- | --- | --- |
+| `EMBED_TEXT` | `INDEX_PREPARE` | Immutable `SemanticSegment` refs and bounded text handles, language, semantic-profile/config digests, preprocessing and budgets | Segment-bound vectors plus semantic-space, model, tokenizer, runtime, dimension, normalization, coverage and determinism facts | Writing an index generation, fusing results, changing durable text, or claiming identity |
+| `DESCRIBE_SUBJECT` | `ENRICH` | Subject/artifact handles, requested description schema/kind, allowed fields, language, egress policy and budgets | Candidate UTF-8 description, source spans/citations, coverage, confidence and producer provenance | Overwriting or accepting user facts, changing annotations, or publishing recovery truth |
+| `TRANSFORM_EXACT_CANDIDATE` | `TRANSFORM` | Exact representation handle, content identity, codec profile and budgets | Encoded staged artifact plus complete `RecoveryRecipe` candidate | Retiring exact fallback or self-approving reversibility |
+
+An `EMBED_TEXT` result has exactly one terminal result per requested segment: accepted vector, typed inapplicability, or typed failure. The host rejects missing/extra segment IDs, NaN or infinite elements, incompatible dimensions or element types, undeclared truncation, and a semantic-space digest that does not match the selected profile. The processor writes only host-controlled staging or a bounded response and never receives zvec credentials or a collection path.
+
+A `DESCRIBE_SUBJECT` result remains candidate evidence until the host validates encoding, length, schema, source bindings, egress receipt, authorization, and provenance and creates a new immutable `DescriptionRevision`. A model cannot mark its own revision user-accepted. Local and online implementations obey the same request/result contract.
+
 ## 7. Typed routing and fallback
 
 The core builds an **IdentificationRouteRef** from subject revision, suffix, magic-byte, path-context evidence, and policy. It may contain only `CLASSIFY_LEARNED` and classification-refining `PARSE` nodes. After final classification, the core builds a **ProcessingRouteRef** from:
@@ -281,7 +295,7 @@ The default fallback rules are:
 1. Unknown or conflicting content is preserved as raw exact data.
 2. An inapplicable or unavailable optional processor advances to the next compatible route candidate.
 3. Transform, compression, or validation failure falls back to a qualified exact representation, normally raw or the default deterministic repository path.
-4. Extraction, enrichment, embedding, or indexing failure marks discovery as pending or degraded; it does not block durable ingest.
+4. Extraction, enrichment, embedding, or indexing failure marks the affected discovery generation pending or degraded; it does not block durable ingest.
 5. A profile-specific processor requirement MAY block only that processing branch, derived representation, or stronger profile claim. It MUST NOT block capture, inventory, host-owned exact hashing, exact placement eligibility, required exact-lane verification, or exact publication of readable bytes.
 6. No fallback may reduce protected scope or change a recovery relation without a new human-authorized plan.
 
@@ -334,11 +348,59 @@ A RepositoryDriver stores only host-admitted representations and must support:
 - Declared integrity verification.
 - Capacity, health, and dependency reporting.
 
+The language-neutral operation set is:
+
+| Operation | Required semantics |
+| --- | --- |
+| `DescribeCapabilities` | Return driver, repository-format, supported operation, consistency, reader, encryption, compression, chunking, and limit profiles |
+| `ValidateTarget` | Read-only inspection of location, identity, format, credentials, capacity, compatibility, and existing state |
+| `InitializeOrAdopt` | Explicit, idempotent creation or adoption under a plan-bound repository identity; never implicit format reinterpretation |
+| `EstimatePlacement` | Return logical bytes, probable new physical bytes, uncertainty, temporary space, and unsupported estimates without claiming a receipt |
+| `PlaceRepresentation` | Idempotently place one admitted immutable stream and return a complete receipt |
+| `OpenRepresentation` / `ReadRange` | Return the admitted logical byte stream or a declared bounded range without leaking backend-private object identity |
+| `VerifyRepresentation` | Perform the requested metadata, sampled, or full logical readback and return typed evidence |
+| `ReconcilePlacement` | Resolve retries and `UNKNOWN_EXTERNAL_OUTCOME` without creating a second logical placement |
+| `DescribeHealthAndCapacity` | Report availability, key/reader readiness, capacity, corruption/repair state, and last verified boundary |
+| `ListReachabilityRoots` | Report backend objects reachable from host-authorized portable roots; never decide retention itself |
+| `ExecuteGC` / `Repair` | Optional separately authorized operations with dry-run, fencing, receipts, and rollback/recovery limits; disabled for `RW-MVP-1` until qualified |
+
+Every mutating request binds operation/request IDs, idempotency key, plan/config/profile digests, repository identity, admitted representation identity and length, lease/fence, deadline, and authorization. Every result uses a typed terminal status including `UNKNOWN_EXTERNAL_OUTCOME`, reports retry/reconciliation behavior, and returns a receipt whose portable fields are distinguished from backend telemetry. A timeout or process exit is not proof that placement failed or succeeded.
+
 The driver MAY delegate chunking, deduplication, compression, encryption, packing, erasure coding, and transport to a mature repository engine. Alternatively, it MAY store already transformed representations without interpreting them.
 
 Every placement receipt MUST bind repository identity, driver and format versions, representation identities, plan and operation digests, stored-byte measurements, required reader dependencies, and verification evidence.
 
 Source deletion, last-copy removal, retention pruning, and repository garbage collection require separate host policy and MUST NOT be granted merely because a driver supports deletion.
+
+### 9.1 Current narrow Go surface
+
+The current checkout implements only the subset required for exact placement and signed publication:
+
+~~~text
+Driver:
+  Place(reader) -> Receipt
+  PlaceExact(content_id, reader) -> Receipt
+  Open(content_id) -> logical byte stream
+  Verify(content_id)
+  Root() -> resolved local root
+
+RecordDriver:
+  RepositoryIdentity()
+  PlaceRecord(role, reader) -> RecordReceipt
+  OpenRecord(role, digest)
+  VerifyRecord(receipt)
+  ListRecordDigests(role)
+
+Receipt:
+  ContentID
+  Bytes        # decoded logical length
+  StoredBytes  # physical object length; diagnostic, not signed identity
+  Existed
+~~~
+
+`OpenProfileWithCompression` admits only `directory-cas-dev-v1 + identity-v1` and `local-zstd-v1 + zstd-v1`. Both implement payload and portable-record interfaces; the zstd driver transparently decodes payloads before callers hash or read them, while signed prepared/commit JSON remains uncompressed. `DescribeProfile` supplies status-only tuple metadata without making it a new storage requirement for third-party drivers. The repository root has a fail-closed profile marker so the two physical formats cannot be reinterpreted in place.
+
+This is not full conformance with section 9. It does not yet expose placement estimation, capacity, GC/reachability, repair, encryption/key state, backend placement references, dependency closure, or a complete placement receipt. The signed payload aggregate separately binds repository identity, logical content IDs, and logical lengths. `StoredBytes` remains unsigned telemetry so backend recompression or relocation cannot change portable content identity.
 
 ## 10. IndexProvider and QueryProvider contracts
 
@@ -364,11 +426,19 @@ An index generation binds:
 
 Activation MUST be atomic from the host query broker's perspective. The previous generation remains available for rollback until retention policy permits retirement.
 
+Every generation operation binds request and idempotency IDs, provider/profile/config and input-high-water digests, exact generation ID, lease/fence, deadline, authorization projection, and resource limits. `ApplyBatch` returns a batch digest, accepted/rejected counts, per-record typed failures, indexed-through revision, and retry token. `FinalizeGeneration` makes the generation immutable; `ValidateGeneration` checks schemas, counts, coverage, authorization labels, known-query fixtures, and provider health; only the host may call `ActivateGeneration`. `UNKNOWN_EXTERNAL_OUTCOME` requires inspection or reconciliation before retry.
+
 QueryProvider queries exactly one explicitly named `IndexGenerationRef` per invocation. Compatibility is validated before invocation. It MUST support capability description, typed query validation, bounded query execution, stable generation-bound continuation, cancellation, and health inspection. Its profile declares accepted index schemas and generations, query modes, filter and projection schemas, score schemas, within-generation ranking behavior, resource limits, and degradation behavior. A host-owned broker performs any cross-provider or cross-generation fusion over separately generation-pinned results.
 
 Query results MUST contain immutable SubjectRef values, optional segment selectors, score components, exact IndexProvider generation, QueryProvider profile, indexed-through revision, coverage state, and provenance. Continuation binds the exact generation, query digest, authorization scope, sort, and expiry. The core query broker MUST derive the effective principal and workspace and reauthorize every subject before any presentation adapter receives metadata or may open content. A query result is not proof that a subject still exists or that a representation is valid.
 
+The minimum query operations are `DescribeCapabilities`, `ValidateQuery`, `Query`, `Continue`, `Cancel`, and `InspectHealth`. A request binds one immutable generation, query/filter/projection schema digests, normalized query digest, principal/workspace, result and resource bounds, deadline, and continuation when present. A response binds that same generation and includes per-candidate field/segment provenance, provider score components, coverage/high-water state, and a stable continuation. Providers never compare incompatible generations or perform final cross-provider fusion; the host broker owns those actions and records their policy.
+
 Loss of an index MUST degrade discovery, not namespace browsing, exact reads, verification, or restoration.
+
+### 10.1 Later RetrieverDriver contract
+
+`RetrieverDriver` remains outside the MVP dependency set, but its reserved narrow operations are `DescribeCapabilities`, `ProbeReference`, `AcquireToQuarantine`, `InspectOutcome`, and `Release`. A request binds one `RecoveryReference`, expected identity/length, immutable revision or version evidence, credential reference, egress/rights policy, quarantine handle, budgets, idempotency, and fencing. It never receives publication, catalog-write, or repository-administration authority. Candidate bytes become usable only after the host independently hashes and admits them as a new exact representation.
 
 ## 11. Upgrade, reclassification, reprocessing, and reindexing
 
@@ -377,6 +447,18 @@ Loss of an index MUST degrade discovery, not namespace browsing, exact reads, ve
 Installing a new extension version registers a new CapabilityProfile digest. It MUST NOT silently replace the identity of an earlier profile or rewrite existing results.
 
 Activation policy MAY route new data to the new profile immediately, use a canary scope, or run shadow comparison. Accepted plans continue to bind their original profiles unless explicitly revised.
+
+The reference distribution owns a host-managed profile registry. It discovers only bundled manifests and explicitly installed packages from configured registry roots; it never scans the current directory, ambient `PATH`, arbitrary shared-library locations, or repository contents for executable providers. A package manifest binds:
+
+- package, publisher/signature, license/SBOM, platform and architecture;
+- every supplied interface and `CapabilityProfile` digest;
+- executable, native-library, model, tokenizer, dictionary, schema, and migration digests;
+- entrypoint and sandbox profile, network/credential declarations, resource bounds, and health probe;
+- install layout, data-format compatibility, rollback, retirement, and removal rules.
+
+The host-owned lifecycle is `inspect -> stage -> verify signature/digests/licenses/platform -> negotiate capabilities in isolation -> run conformance/health checks -> register -> optionally activate`. Its semantic operations are list, inspect, install, verify, activate, retire, and remove; they accept package/profile references, never raw shell commands. `RW-MVP-1` does not add a public `profile.*` Core Command family: bundled defaults arrive through the signed native package, additional packages use the host package/installation mechanism, `capability.list` reports what is registered, and the main config selects an immutable profile ID. A later public lifecycle command requires an explicit Core Command ABI revision. First-run onboarding still asks only for data location, repository profile, and embedding profile.
+
+Activation affects only new plans, processor attempts, or index generations. It cannot reinterpret an accepted plan or mutate an active generation in place. Replacing an embedding profile builds and validates a new generation beside the old one before atomic activation. Retiring a rebuildable processor or index provider stops new routing but preserves its provenance until retention permits removal. A repository driver, decoder, model, tokenizer, or dictionary cannot be removed while any retained representation or recovery recipe depends on it; removal first requires a qualified migration or an independently retained reader closure. Online providers use the same profile registry but bind endpoint identity, TLS/auth policy, model revision, egress scope, and credential reference instead of a local executable.
 
 ### 11.2 Staleness
 
@@ -503,8 +585,8 @@ The reference self-hosted distribution MUST ship strong defaults instead of an e
 - One proven deduplicating and compressing repository path.
 - Common text and metadata extraction where deterministic and safe.
 - Durable whole-subject tag and note CRUD with portable export/import.
-- Baseline lexical IndexProvider and QueryProvider implementations for path, filename, type, metadata, checksum, duplicates, tags, notes, processing state, and extracted text.
-- A bundled read-only Linux FUSE presentation over `SnapshotTree` and `FileAccess`; it is not another extension seam.
+- Hybrid lexical/structured IndexProvider and QueryProvider implementations for path, filename, type, metadata, checksum, duplicates, tags, notes, processing state, extracted text, and the default local semantic space.
+- Export-manifest materialization over `SnapshotTree` and `FileAccess`; any filesystem presentation is an external consumer, not another RestoreWeave extension seam.
 - CLI access to the complete authorized ingest, inspect, search, browse, read, verify, reprocess, reindex, and restore operation set.
 - Initial MCP access to the bounded read-only inspection, status, search, namespace, and content subset. A mutation-capable MCP profile is separately qualified later.
 
@@ -525,4 +607,4 @@ Optional packs MAY add media parsing, OCR, ASR, acoustic fingerprints, CLIP-comp
 11. Every operation shared by CLI and the initial MCP subset produces the same route, policy, authorization, result, and audit semantics.
 12. The reference distribution remains useful with all learned and generative processors disabled.
 13. Deleting and rebuilding every index loses no durable tag or note revision.
-14. The bundled Linux FUSE adapter can be replaced as presentation without changing `SnapshotTree`, `FileAccess`, namespace identity, or repository layout.
+14. External presentation tools can consume export manifests and `FileAccess` without changing `SnapshotTree`, namespace identity, or repository layout. RestoreWeave does not define or ship a mount adapter.

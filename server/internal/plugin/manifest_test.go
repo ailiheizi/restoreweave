@@ -96,7 +96,7 @@ func newPinnedTestCatalog(t *testing.T, manifest Manifest) *Catalog {
 	}
 	catalog, err := NewMVPPluginCatalog(BuiltinBinding{
 		ManifestDigest: digest,
-		PackageID: manifest.Package.ID,
+		PackageID:      manifest.Package.ID,
 		ArtifactDigest: manifest.Package.ArtifactDigest,
 	})
 	if err != nil {

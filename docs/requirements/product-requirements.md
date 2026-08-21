@@ -2,9 +2,9 @@
 
 ## 1. Product decision
 
-RestoreWeave is a self-hosted, NAS-first content-aware managed data layer for large heterogeneous collections. `RW-MVP-1` is its first read-only managed archive and search profile; later profiles may broaden NAS and enterprise operation only after their additional consistency and recovery semantics are qualified.
+RestoreWeave is a self-hosted, content-first managed data layer for large heterogeneous collections. `RW-MVP-1` is its first read-only managed archive and multi-dimensional discovery profile; later profiles may broaden NAS and enterprise operation only after their additional consistency and recovery semantics are qualified.
 
-For the operator, it performs one complete job: attach an ordinary file tree, measure and reduce its managed footprint, understand and search mixed content, keep the original directory structure usable, and restore exact files with independent evidence. The system remains useful with every optional learned model disabled.
+For the operator, it performs one complete job: attach an ordinary file tree, measure and reduce its managed footprint, understand and search mixed content with lexical, structured, and local semantic dimensions, materialize requested sets, and restore exact files with independent evidence. The exact storage and recovery path remains usable if the semantic index is temporarily unavailable, but the reference distribution MUST ship the semantic profile enabled by default.
 
 Internally, RestoreWeave coordinates filesystem-shaped data, replaceable processing algorithms, storage engines, and discovery clients. It preserves a stable subject, namespace, representation, and recovery model so those implementations can change without stranding data or changing what a stored file means.
 
@@ -76,7 +76,7 @@ RestoreWeave helps an operator:
 2. Understand file identity, type, duplicates, extraction coverage, storage cost, and recovery risk.
 3. Select safe storage strategies with strong automatic defaults and human control over weaker outcomes.
 4. Reduce physical storage through exact deduplication, compression, and later class-specific representations.
-5. Search paths, metadata, durable tags and notes, extracted content, and later semantic or multimodal signals through one subject model.
+5. Search paths, metadata, durable tags and notes, extracted content, and local semantic embeddings through one subject model.
 6. Browse and read data through its original directory structure regardless of physical layout.
 7. Update processors or indexes without invalidating stored content or losing historical meaning.
 8. Verify storage through independent readback and restore on a fresh installation.
@@ -87,7 +87,7 @@ RestoreWeave promises six outcomes.
 
 1. **Conservative storage savings.** The default profile removes physical duplication and applies mature lossless compression without weakening recoverability. More aggressive strategies are explicit, versioned, and independently validated.
 2. **A durable filesystem view.** Original paths and declared metadata remain browsable and restorable even when bytes are deduplicated, packed, transformed, placed in multiple backends, or indexed separately.
-3. **Useful discovery.** The baseline provides lexical search across path, metadata, type, checksum, duplicate, durable tags and notes, and extracted text. Semantic and multimodal discovery extend the same subjects and results later.
+3. **Useful discovery.** The default query combines lexical text, structured fields, durable tags and notes, extracted text, and a local semantic embedding generation. Additional semantic and multimodal providers extend the same subjects and results later.
 4. **Replaceable algorithms.** Processing implementations can be upgraded or replaced while durable inputs, outputs, provenance, and dependency closure remain understandable.
 5. **Safe automation.** The system is highly automatic, but only a human or an already-published policy can accept omission, lossiness, deletion, or another weaker recovery outcome.
 6. **Truthful recovery.** A write is not called recoverable until the required placement, publication, and verification evidence exists.
@@ -104,9 +104,9 @@ RestoreWeave distinguishes three modes:
 | **Managed archive** | RestoreWeave repository is an exact managed copy with a read-only file-shaped view | Verified storage reduction, discovery, browse, and restore | Repository footprint is measured; whole-system savings require retiring another copy |
 | **Primary writable NAS** | RestoreWeave would accept authoritative writes through gateways | Unified live storage and discovery | Future profile only |
 
-`RW-MVP-1` qualifies managed archive mode. It does not silently count a source copy that still exists as saved capacity. A source may become eligible for retirement only after a separately reviewed migration proves exact recoverability, required placement, decoder availability, and rollback conditions. Automatic source deletion is disabled by default. Writable SMB, NFS, WebDAV, S3, or FUSE behavior is not implied by the read-only snapshot namespace.
+`RW-MVP-1` qualifies managed archive mode. It does not silently count a source copy that still exists as saved capacity. A source may become eligible for retirement only after a separately reviewed migration proves exact recoverability, required placement, decoder availability, and rollback conditions. Automatic source deletion is disabled by default. RestoreWeave does not provide SMB, NFS, WebDAV, S3, or filesystem mount behavior.
 
-Managed archive mode still provides ordinary file-shaped access: the first distribution includes a bundled read-only Linux FUSE projection over the authenticated snapshot namespace. It supports browse and read workflows but rejects create, write, rename, unlink, and metadata mutation. It is a presentation adapter over `SnapshotTree` and `FileAccess`, not a writable primary filesystem or another extension family.
+Managed archive mode provides file-shaped access by materializing an explicit export manifest to a destination. RestoreWeave does not supply a mount adapter; external tools may consume the resulting directory or authorized byte stream.
 
 ### 4.2 Product layers
 
@@ -115,7 +115,7 @@ RestoreWeave is evaluated as three nested layers. A lower layer is not a substit
 | Layer | Required outcome |
 | --- | --- |
 | Operator product | An operator can attach a heterogeneous tree, understand it, store selected data efficiently, search it, access it through original paths, verify it, and restore it. |
-| Reference distribution | The supported build ships a controller, qualified capture, a mandatory exact repository lane, default classification and processing, durable tag/note records, generation-pinned baseline lexical search, a read-only Linux FUSE projection, verification, recovery export, and CLI/JSON/MCP bindings. |
+| Reference distribution | The supported build ships a controller, qualified capture, a mandatory exact repository lane, default classification and processing, durable tag/note records, generation-pinned lexical/structured/semantic search, export-manifest materialization, verification, recovery export, and CLI/JSON/MCP bindings. |
 | Replaceable implementation seams | `CaptureDriver`, `Processor`, `RepositoryDriver`, `IndexProvider`, `QueryProvider`, and later `RetrieverDriver` allow selected implementations to evolve without changing durable meaning. |
 
 The product is not conforming when it supplies only the third layer. Optional implementations extend a complete reference distribution; they do not create the basic storage, search, or recovery experience on the operator's behalf.
@@ -129,7 +129,7 @@ The product is not conforming when it supplies only the third layer. Optional im
 5. Replace algorithms at stable data contracts, not every internal function.
 6. Ship strong defaults before asking users to assemble a pipeline.
 7. Derived indexes are rebuildable; user data and accepted recovery records are durable.
-8. AI is an optional processor or external client, never the recovery authority.
+8. The bundled local text embedding is required for the default discovery experience but remains a rebuildable `Processor` derivative; description generation, remote AI, OCR/ASR/CLIP, and external agent clients are optional and none receives recovery authority.
 9. Incremental operation, deletion semantics, and upgrades are first-class lifecycle concerns.
 10. Verification is based on actual evidence, not process exit codes or model confidence.
 11. Platform-specific optimizations are profiles, not global architecture.
@@ -185,9 +185,9 @@ The first distribution includes:
 - A mature exact repository integration providing compression, deduplication, encryption, and readback.
 - Qualified default metadata and text extraction for common formats.
 - Durable, versioned tag and note CRUD with portable export independent of index storage.
-- An operational catalog and bundled lexical metadata/content/annotation index.
-- A read-only snapshot namespace with browse, bounded read, and restore.
-- A bundled read-only Linux FUSE adapter over that namespace for NAS-usable file access.
+- An operational catalog, bundled lexical/structured index, and bundled local semantic generation.
+- A read-only snapshot namespace with browse, bounded read, export-manifest materialization, and restore.
+- Export-manifest and `FileAccess` contracts that external presentation tools may consume; no filesystem or network-mount adapter ships in `RW-MVP-1`.
 - Human-readable CLI plus stable JSON/JSONL.
 - A local read-only MCP adapter for external automation and AI harnesses.
 - Portable recovery records and a clean-install restore path independent of the operational catalog.
@@ -293,13 +293,13 @@ The exact lane is mandatory and independent. Classification and processing impro
 ### 8.2 Discover and access
 
 ```text
-query path, metadata, type, checksum, duplicate, tag, note, or extracted text
+query path, metadata, type, checksum, duplicate, tag, note, description, extracted text, or semantic meaning
 -> resolve result to durable SubjectRef
 -> inspect provenance and available representations
--> browse namespace, open bounded content, or mount the read-only Linux FUSE view
+-> browse namespace, open bounded content, or materialize an export
 ```
 
-Later semantic providers add embeddings, CLIP, multimodal ranking, and external enrichment to the first step without changing subject resolution or file access.
+The bundled local text-embedding generation participates in this first step by default. Later semantic providers add alternate embedding spaces, CLIP, multimodal ranking, and external enrichment without changing subject resolution or file access.
 
 ### 8.3 Update and reprocess
 
@@ -400,7 +400,7 @@ Every published snapshot must expose one authenticated file-shaped view independ
 - Explicit representation selection without treating similarity as identity.
 - Explicit reporting of unsupported filesystem metadata.
 
-`RW-MVP-1` must bundle a read-only Linux FUSE projection over `SnapshotTree` and `FileAccess`. One mount binds one authenticated principal, one authorized export root, and one immutable snapshot. It supports lookup, directory enumeration, attributes, symbolic-link reads, bounded or streaming regular-file reads, raw-name-safe mapping, stable inode and hard-link identity within the mount, sparse-file semantics, scoped directory continuation, and stable snapshot pinning. It uses a fixed safe mount profile including read-only, `nodev`, `nosuid`, and `noexec`, does not enable `allow_other` in the MVP, and rejects every write-capable open and mutation operation with `EROFS`. Cache, page-cache, open-handle, mmap, authorization-expiry, unmount, and repository-amplification behavior must pass qualification; if revocation cannot meet its declared bound, the mount is labeled a local-trust surface. It cannot present a live writable-NAS claim. SMB, NFS, WebDAV, S3, media-server, and alternate FUSE projections may be later presentation adapters, but none may create a second namespace truth.
+`RW-MVP-1` MUST provide explicit export-manifest materialization and exact `FileAccess` reads. RestoreWeave does not implement FUSE, SMB, NFS, WebDAV, S3, media-server, or other filesystem/network presentation services. External tools may consume the exported directory or authorized read handles.
 
 ### FR-07: Discovery and semantic direction
 
@@ -414,11 +414,11 @@ The baseline search experience must cover:
 - Extracted text and common media metadata where a qualified default extractor succeeded.
 - Processing status, warnings, provenance, and available representations.
 
-The reference distribution ships one bundled lexical `IndexProvider` and `QueryProvider` implementation. Search results must resolve to stable subjects and the original namespace. Indexes are derived and rebuildable; loss of an index cannot remove recovery information or user-authored annotations.
+The reference distribution ships a bundled hybrid `IndexProvider` and `QueryProvider` implementation. The default broker fuses lexical, structured, and local semantic generations and returns stable subjects with per-dimension provenance. Indexes are derived and rebuildable; loss of an index cannot remove recovery information or user-authored annotations.
 
-The public discovery model must permit later alternate lexical, vector, hybrid, graph, CLIP, acoustic, multimodal, and external-knowledge providers. Those providers may return scores and evidence but cannot change recovery contracts. Embeddings and CLIP are later or external implementations, not requirements for the exact MVP and not excluded from the product direction.
+The public discovery model must permit later alternate lexical, vector, hybrid, graph, CLIP, acoustic, multimodal, and external-knowledge providers. Those providers may return scores and evidence but cannot change recovery contracts. The default local embedding provider uses the profile in [Content Store, Views, and Export Requirements](content-store-views-and-exports.md); replacing it creates a new generation and never changes exact identity.
 
-Basic user-authored tags and notes are Phase 1 durable product data, not an external-catalog dependency. The core stores them as versioned records bound to stable `SubjectRef` values with author, time, revision, visibility, provenance, and tombstone state. The CLI provides create, read/list, update, delete, and portable export operations with optimistic revision checks. Annotation changes feed the lexical index without re-ingesting content, survive index deletion, and can be exported and re-imported without losing subject bindings.
+Basic user-authored tags and notes are Product Milestone 1 durable data, not an external-catalog dependency. The core stores them as versioned records bound to stable `SubjectRef` values with author, time, revision, visibility, provenance, and tombstone state. The CLI provides create, read/list, update, delete, and portable export operations with optimistic revision checks. Annotation changes feed the lexical index without re-ingesting content, survive index deletion, and can be exported and re-imported without losing subject bindings.
 
 Collections, ratings, accepted relationship graphs, recovery-intent services, and machine-suggested annotation workflows are later capabilities. They must remain distinguishable from operator-authored tags and notes.
 
@@ -487,7 +487,7 @@ Upload completion, processor success, index availability, and repository process
 
 ### FR-12: CLI and MCP interfaces
 
-The canonical human and scripting interface is the CLI. Every non-content command supports human, JSON, or JSONL output over the same typed command, result, reason, and event model. The first profile includes read-only namespace mount/unmount commands and basic tag/note create, list, update, delete, and export commands; annotation mutation uses explicit subject references and expected revisions.
+The canonical human and scripting interface is the CLI. Every non-content command supports human, JSON, or JSONL output over the same typed command, result, reason, and event model. The first profile includes read-only namespace browse, resolve, stat, readlink, and exact-read operations, plus explicit export-manifest materialization and basic tag/note create, list, update, delete, and export commands; annotation mutation uses explicit subject references and expected revisions. It does not include a mount or unmount command; mounting or sharing a materialized result belongs to external tools.
 
 The first MCP profile uses local stdio and is read-only. It exposes bounded inspection, status, search, namespace, annotation-read, verification, processing, and existing-plan information to external harnesses without embedding a harness in RestoreWeave. It cannot create, revise, approve, abandon, or apply an ingest or restore plan; mutate a repository, restore destination, policy, annotation, or job; or request an arbitrary processor invocation.
 
@@ -548,10 +548,11 @@ Status must separate:
 | Default processing | Safe metadata and text extraction for qualified common formats; generic exact route for everything else |
 | Storage | One mature exact repository integration with compression and deduplication |
 | Recovery fidelity | Exact bytes and declared filesystem metadata fidelity |
-| Search | Bundled lexical path, metadata, type, checksum, duplicate, tag, note, and extracted-text baseline |
-| Embeddings and CLIP | External or later processors and index providers |
+| Search | Bundled lexical + structured + local semantic query broker |
+| Embeddings | Isolated ONNX Runtime worker with pinned `BAAI/bge-small-zh-v1.5` profile |
+| Vector store | In-process zvec v0.6.x through `zvec-go`; Qdrant and Milvus are not MVP dependencies |
 | Annotations | Durable versioned tag and note CRUD plus portable export |
-| Namespace | Read-only authenticated `SnapshotTree` and `FileAccess`, with bundled Linux FUSE projection |
+| Namespace | Read-only authenticated `SnapshotTree` and `FileAccess`, with export-manifest materialization; no built-in mount service |
 | Human interface | CLI |
 | Automation interface | Stable JSON/JSONL and local read-only MCP |
 | Embedded AI harness | None |
@@ -572,9 +573,10 @@ The first profile proves the complete NAS data-layer loop:
 - Class-based routing through qualified default processors.
 - Exact hashing, duplicate grouping, compression, deduplication, and placement.
 - Immutable original-path namespace publication.
-- Bundled read-only Linux FUSE access to the published namespace.
+- Default local zvec-backed semantic search plus lexical and structured search.
+- Export-manifest materialization to an explicit destination.
 - Durable tag and note CRUD with portable export.
-- Baseline lexical metadata, content, checksum, duplicate, tag, and note search.
+- Default hybrid lexical, structured, semantic, checksum, duplicate, tag, and note search.
 - Incremental reruns and processor-generation tracking.
 - Verification and clean-install exact restore.
 - CLI and read-only MCP access.
@@ -587,7 +589,7 @@ This profile also proves practical replaceability through at least one independe
 
 ### 11.3 Semantic and multimodal expansion
 
-The next discovery stage adds external OCR, ASR, captions, embeddings, CLIP, acoustic fingerprints, vector or hybrid indexes, richer query ranking, external metadata enrichment, collections, ratings, and relationship graphs.
+The next discovery stage adds external OCR, ASR, captions, alternate embedding spaces, CLIP, acoustic fingerprints, additional vector/graph/multimodal indexes, richer query ranking, external metadata enrichment, collections, ratings, and relationship graphs. The bundled local text embedding and its default hybrid lexical/structured/semantic broker are already `RW-MVP-1` requirements.
 
 These are product capabilities delivered through replaceable processors and index providers. They remain outside exact recovery dependencies and can be upgraded or rebuilt independently.
 
@@ -599,7 +601,7 @@ Every profile must define validator thresholds, provenance, dependency closure, 
 
 ### 11.5 NAS and enterprise expansion
 
-Later profiles may add SMB, NFS, WebDAV, S3, media-server, alternate FUSE, or writable gateways, multiple repositories, tiering, replication, HA, multitenancy, RBAC, audit integration, remote REST, and enterprise lifecycle policy. These extensions use the same durable namespace and recovery contracts. Read-only Linux FUSE is already part of `RW-MVP-1`; writable gateways remain separate.
+Later external integrations may consume SMB, NFS, WebDAV, S3, media-server, or filesystem tools around exported data. RestoreWeave itself does not add those servers; multiple repositories, tiering, replication, HA, multitenancy, RBAC, audit integration, remote REST, and enterprise lifecycle policy remain separate profiles.
 
 ## 12. MVP non-goals
 
@@ -607,7 +609,7 @@ The first qualified profile does not require:
 
 - A particular NAS brand, operating-system vendor, Linux distribution, filesystem, or snapshot API.
 - An embedded LLM, general AI harness, model router, or agent runtime.
-- Embeddings, CLIP, vector search, or multimodal ranking to complete exact storage and recovery.
+- Milvus, distributed vector search, or multimodal ranking beyond the default local semantic profile.
 - Lossy or generative source substitution.
 - Automatic source deletion or destructive garbage collection.
 - Authoritative external reacquisition, magnet, BitTorrent, or swarm storage.
@@ -620,43 +622,47 @@ The first qualified profile does not require:
 
 These exclusions constrain the first release, not the long-term data-layer architecture.
 
-## 13. Delivery roadmap
+## 13. Product delivery milestones
 
-### Phase 0: Product and contract validation
+These are product-level milestones, not the numbered engineering phases. The dependency-ordered [Core MVP Execution Plan](../technical/core-mvp-execution-plan.md) is the only implementation sequence. Its Phases 0-7 collectively deliver Product Milestone 1 below; later product milestones cannot be used to reorder or bypass those core gates.
+
+### Product Milestone 0: Product and contract validation
 
 - Validate the NAS-first workflow on representative local and mounted collections.
 - Measure inventory cost, unknown formats, duplicate savings, compression estimates, search usefulness, and operator trust.
 - Freeze core identities, exact fallback, processor artifacts, namespace, and publication semantics.
-- Prove one generic live capture profile and at least one optional snapshot-capable profile without making either platform universal.
+- Prove one generic live capture profile. Snapshot-capable drivers qualify independently and are not a Product Milestone 1 gate.
 
-### Phase 1: Exact intelligent data-layer MVP
+### Product Milestone 1: Exact intelligent data-layer MVP
 
 - Self-hosted controller, CLI, local catalog, and read-only MCP.
 - Generic capture, deterministic identification, processor routing, exact repository placement, and portable namespace.
 - Default common metadata and text extraction.
-- Durable tag and note CRUD, portable annotation export, and lexical annotation indexing.
-- Bundled read-only Linux FUSE access over the authenticated namespace.
+- Durable tag, note, and description revisions with portable export and complete lexical/structured feed coverage.
+- The real bundled local ONNX/BGE embedding worker, in-process zvec generation, and default fused lexical/structured/semantic query with honest degradation.
+- Dynamic saved views that freeze into immutable export manifests.
+- Export-manifest materialization and authenticated `FileAccess` reads over the namespace; mounting and network filesystem presentation are external-tool responsibilities.
 - Baseline search, incremental operation, verification, recovery export, and clean-install restore.
 - Strong defaults and installation diagnostics.
 
-### Phase 2: Managed adoption, capacity release, and replaceability
+### Product Milestone 2: Managed adoption, capacity release, and replaceability
 
 - Independently implemented processor and repository integrations.
 - Processor upgrade, invalidation, and reindex workflows.
 - Reviewed migration and source-retirement workflow with exact recovery, placement sufficiency, grace-period, rollback, and post-retirement restore gates.
 - Representation and repository migration with decoder-retention enforcement.
 
-### Phase 3: Semantic discovery and advanced storage profiles
+### Product Milestone 3: Additional semantic discovery and advanced storage profiles
 
-- External embedding, CLIP, OCR, ASR, caption, vector, and hybrid search providers.
+- Alternate or external embedding, CLIP, OCR, ASR, caption, vector, and hybrid search providers beyond the bundled local text profile.
 - Subject-bound collections, ratings, relationship graphs, machine suggestions, and external enrichment.
-- Optional SMB, NFS, WebDAV, S3, media-server, or alternate FUSE gateways and companion UI.
+- Optional external SMB, NFS, WebDAV, S3, media-server, or other presentation integrations. RestoreWeave does not ship those gateways.
 - Lossless class-specific transforms and tier placement.
 - Multiple failure-independent repositories.
 - Perceptual media, learned compression, VAE or RWKV-style experiments, reacquisition, and rebuild profiles.
 - Explicit migration, validator, dependency, and fallback qualification.
 
-### Phase 4: Broader NAS and enterprise operation
+### Product Milestone 4: Broader NAS and enterprise operation
 
 - Remote control adapters, managed multi-node operation, policy administration, auditing, and enterprise deployment profiles.
 - Writable gateways only after conflict, transaction, and recovery semantics are separately designed.
@@ -670,7 +676,7 @@ These exclusions constrain the first release, not the long-term data-layer archi
 - Median exact physical storage reduction is measured separately for duplicate elimination, repository compression, backend reuse, and total repository overhead.
 - Any later non-exact policy reduction is reported as a separate weaker-fidelity metric and is never added to exact savings.
 - At least 70 percent of evaluators successfully find a known item using metadata or content terms without knowing its path.
-- At least 80 percent can create, revise, export, re-import, and find a tag or note without installing a semantic provider.
+- At least 80 percent can create, revise, export, re-import, and find a tag or note while the installed semantic provider is deliberately disabled and the product clearly reports degraded discovery.
 - At least 50 percent run a second incremental ingest, reprocessing, search, or verification operation within 30 days.
 
 ### 14.2 Recovery quality
@@ -708,7 +714,7 @@ These exclusions constrain the first release, not the long-term data-layer archi
 | The product becomes an empty plugin framework | Ship a complete default pipeline and delay ABI stability until independent implementations validate the seams |
 | Plugin count creates operational chaos | Use capability discovery, constrained stage semantics, curated defaults, provenance, health checks, and generation-aware upgrades |
 | Classification creates false confidence | Preserve independent evidence, surface conflicts, and keep exact fallback |
-| Semantic indexes are expensive or stale | Make them optional, budgeted, generation-bound, observable, and rebuildable |
+| Semantic indexes are expensive or stale | Keep the bundled default generation budgeted, generation-bound, observable, disposable, and rebuildable; exact storage and recovery remain usable with a visible degraded state |
 | Lossy savings are mistaken for exact recovery | Use explicit recovery classes, validators, policy gates, and representation labels |
 | Repository or index layouts become lock-in | Preserve portable namespace and recovery records above backend-private layouts |
 | NAS live paths change during capture | Declare consistency honestly, detect mutation, retry narrowly, and block affected claims |
@@ -716,7 +722,7 @@ These exclusions constrain the first release, not the long-term data-layer archi
 | Watcher delivery is incomplete or unsupported on the source filesystem | Treat watcher events as hints, expose coverage, invalidate uncertain checkpoints, and require a complete baseline before deletion evidence |
 | AI receives excessive authority | Restrict AI to bounded processors or external clients and keep decisions in the core policy boundary |
 | Source deletion destroys the safety story | Keep deletion disabled by default and require separately reviewed migration and retention policies |
-| Search scope overwhelms the MVP | Ship metadata and extracted-text discovery first while preserving the semantic provider contract |
+| Search scope overwhelms the MVP | Keep the required local semantic profile bounded and generation-aware, with metadata and extracted-text dimensions as the explicit fallback when semantic indexing is unavailable |
 | User annotations become disposable index state | Store tag and note revisions durably, export them portably, and rebuild lexical projections from authoritative records |
 
 ## 16. Research basis

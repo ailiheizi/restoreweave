@@ -44,7 +44,7 @@ func ReadAll(ctx context.Context, files readsvc.FileAccess, view readsvc.Snapsho
 
 // CollectFiles walks the snapshot view without following symlinks and returns
 // display-path → entry maps for regular files. This is the gateway-facing
-// traversal used by FUSE and tests; it never talks to the repository engine
+// traversal used by namespace consumers and tests; it never talks to the repository engine
 // private layout.
 func CollectFiles(ctx context.Context, view readsvc.SnapshotView) (map[string]readsvc.NamespaceEntry, error) {
 	root, err := view.Root(ctx)

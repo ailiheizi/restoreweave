@@ -243,69 +243,6 @@ type PackIndexEvidenceRecord struct {
 	Execution   ExecutionMetadata    `json:"execution"`
 }
 
-type GatewayProtocol string
-
-const (
-	GatewayWebDAV GatewayProtocol = "WEBDAV"
-	GatewayFUSE   GatewayProtocol = "FUSE"
-	GatewaySMB    GatewayProtocol = "SMB"
-	GatewayNFS    GatewayProtocol = "NFS"
-	GatewayS3     GatewayProtocol = "S3"
-)
-
-// NamespaceGatewayInvocation carries two matching, export-bound core handles.
-// It never carries a global SnapshotTree selector or direct repository access.
-type NamespaceGatewayInvocation struct {
-	RequestID     string                 `json:"request_id"`
-	ExportID      string                 `json:"export_id"`
-	Protocol      GatewayProtocol        `json:"protocol"`
-	SnapshotTree  SnapshotTreeWireHandle `json:"snapshot_tree"`
-	FileAccess    FileAccessWireHandle   `json:"file_access"`
-	ListenerScope string                 `json:"listener_scope_id"`
-	ReadOnly      bool                   `json:"read_only"`
-}
-
-func (r NamespaceGatewayInvocation) Validate(now time.Time) error {
-	if err := validateOpaqueID(r.RequestID); err != nil {
-		return fmt.Errorf("request_id: %w", err)
-	}
-	if err := validateOpaqueID(r.ExportID); err != nil {
-		return fmt.Errorf("export_id: %w", err)
-	}
-	if err := r.SnapshotTree.Validate(); err != nil {
-		return fmt.Errorf("snapshot_tree: %w", err)
-	}
-	if err := r.FileAccess.Validate(now); err != nil {
-		return fmt.Errorf("file_access: %w", err)
-	}
-	if r.ExportID != r.SnapshotTree.ExportID || r.ExportID != r.FileAccess.ExportID {
-		return errors.New("gateway handles are not bound to the requested export")
-	}
-	if err := validateOpaqueID(r.ListenerScope); err != nil {
-		return fmt.Errorf("listener_scope_id: %w", err)
-	}
-	switch r.Protocol {
-	case GatewayWebDAV, GatewayFUSE, GatewaySMB, GatewayNFS, GatewayS3:
-	default:
-		return fmt.Errorf("unknown gateway protocol %q", r.Protocol)
-	}
-	if !r.ReadOnly {
-		return errors.New("initial namespace gateways are read-only")
-	}
-	return nil
-}
-
-type GatewaySessionReceiptRecord struct {
-	RequestID          string          `json:"request_id"`
-	SessionID          string          `json:"session_id"`
-	Protocol           GatewayProtocol `json:"protocol"`
-	Endpoint           string          `json:"endpoint"`
-	SnapshotTreeDigest Digest          `json:"snapshot_tree_digest"`
-	StartedAt          time.Time       `json:"started_at"`
-	Lease              SessionLease    `json:"lease"`
-	State              SessionState    `json:"state"`
-}
-
 type NamespaceMutationBatch struct {
 	GenerationID        string   `json:"generation_id"`
 	NamespaceRootDigest Digest   `json:"namespace_root_digest"`

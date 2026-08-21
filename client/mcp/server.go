@@ -22,15 +22,31 @@ const (
 )
 
 // New builds the MCP server with the harness tool set, all wired to one
-// daemon connection. Tool names use lowercase dotted names (status.get,
-// capability.list, namespace.list, namespace.resolve, representation.list, search.query, annotation.list, audio.list, books.list).
+// daemon connection. Tool names use lowercase dotted names matching the
+// command ABI. The initial set is read-only inspect: status, doctor,
+// capabilities, plans, jobs, snapshots, namespace, representations, search,
+// annotations, catalog slices, and bounded content handles. It does not
+// expose ingest, restore, verify, cancel, or annotation mutation. Content
+// tool results carry a range digest and a tiny untrusted preview, not
+// unbounded base64.
 func New(conn *transport.Conn) *mcpsdk.Server {
 	server := mcpsdk.NewServer(&mcpsdk.Implementation{Name: serverName, Version: serverVersion}, nil)
 	addStatusGet(server, conn)
+	addDoctorCheck(server, conn)
 	addCapabilityList(server, conn)
+	addPlanGet(server, conn)
+	addJobEvents(server, conn)
+	addSnapshotList(server, conn)
+	addSnapshotDiff(server, conn)
 	addNamespaceList(server, conn)
 	addNamespaceResolve(server, conn)
+	addNamespaceStat(server, conn)
+	addNamespaceReadlink(server, conn)
 	addRepresentationList(server, conn)
+	budget := newContentBudget()
+	addContentOpen(server, conn)
+	addContentRead(server, conn, budget)
+	addContentClose(server, conn)
 	addSearchQuery(server, conn)
 	addAnnotationList(server, conn)
 	addAudioList(server, conn)
@@ -71,6 +87,38 @@ func addStatusGet(server *mcpsdk.Server, conn *transport.Conn) {
 	})
 }
 
+type doctorCheckArgs struct {
+	Source     string `json:"source,omitempty"`
+	Repository string `json:"repository,omitempty"`
+}
+
+func addDoctorCheck(server *mcpsdk.Server, conn *transport.Conn) {
+	mcpsdk.AddTool(server, &mcpsdk.Tool{
+		Name:        command.OpDoctorCheck,
+		Description: "Read-only readiness report for catalog, repository, identify, processors, and optional source path. Does not select a release engine.",
+	}, func(ctx context.Context, req *mcpsdk.CallToolRequest, args doctorCheckArgs) (*mcpsdk.CallToolResult, command.DoctorData, error) {
+		input := map[string]any{}
+		if args.Source != "" {
+			input["source"] = args.Source
+		}
+		if args.Repository != "" {
+			input["repository"] = args.Repository
+		}
+		result, err := call(ctx, conn, command.OpDoctorCheck, input)
+		if err != nil {
+			return nil, command.DoctorData{}, err
+		}
+		if result.Status != command.StatusSucceeded && result.Status != command.StatusDegraded {
+			return failure(result), command.DoctorData{}, nil
+		}
+		var data command.DoctorData
+		if err := decodeData(result, &data); err != nil {
+			return nil, command.DoctorData{}, err
+		}
+		return &mcpsdk.CallToolResult{Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: doctorText(data)}}}, data, nil
+	})
+}
+
 type capabilityListInput struct{}
 
 func addCapabilityList(server *mcpsdk.Server, conn *transport.Conn) {
@@ -93,12 +141,111 @@ func addCapabilityList(server *mcpsdk.Server, conn *transport.Conn) {
 	})
 }
 
+type planGetArgs struct {
+	WorkspaceID string `json:"workspace_id"`
+	PlanID      string `json:"plan_id"`
+}
+
+func addPlanGet(server *mcpsdk.Server, conn *transport.Conn) {
+	mcpsdk.AddTool(server, &mcpsdk.Tool{
+		Name:        command.OpPlanGet,
+		Description: "Read one immutable ingest or restore plan. This tool is read-only and does not apply plans.",
+	}, func(ctx context.Context, req *mcpsdk.CallToolRequest, args planGetArgs) (*mcpsdk.CallToolResult, command.PlanGetData, error) {
+		result, err := call(ctx, conn, command.OpPlanGet, args)
+		if err != nil {
+			return nil, command.PlanGetData{}, err
+		}
+		if result.Status != command.StatusSucceeded {
+			return failure(result), command.PlanGetData{}, nil
+		}
+		var data command.PlanGetData
+		if err := decodeData(result, &data); err != nil {
+			return nil, command.PlanGetData{}, err
+		}
+		return &mcpsdk.CallToolResult{Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: planGetText(data)}}}, data, nil
+	})
+}
+
+type jobEventsArgs struct {
+	WorkspaceID   string `json:"workspace_id"`
+	JobID         string `json:"job_id"`
+	AfterSequence int64  `json:"after_sequence,omitempty"`
+	Limit         int    `json:"limit,omitempty"`
+}
+
+func addJobEvents(server *mcpsdk.Server, conn *transport.Conn) {
+	mcpsdk.AddTool(server, &mcpsdk.Tool{
+		Name:        command.OpJobEvents,
+		Description: "Read a bounded ordered page of durable job events. Read-only; does not cancel work or roll back snapshots.",
+	}, func(ctx context.Context, req *mcpsdk.CallToolRequest, args jobEventsArgs) (*mcpsdk.CallToolResult, command.JobEventsData, error) {
+		result, err := call(ctx, conn, command.OpJobEvents, args)
+		if err != nil {
+			return nil, command.JobEventsData{}, err
+		}
+		if result.Status != command.StatusSucceeded {
+			return failure(result), command.JobEventsData{}, nil
+		}
+		var data command.JobEventsData
+		if err := decodeData(result, &data); err != nil {
+			return nil, command.JobEventsData{}, err
+		}
+		return &mcpsdk.CallToolResult{Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: jobEventsText(data)}}}, data, nil
+	})
+}
+
 // namespaceListArgs mirrors the daemon namespace.list input: catalog stable
 // IDs, not filesystem paths.
 type namespaceListArgs struct {
 	WorkspaceID string `json:"workspace_id"`
 	RootID      string `json:"root_id"`
 	ParentID    string `json:"parent_id,omitempty"`
+}
+
+type snapshotListArgs struct{}
+
+func addSnapshotList(server *mcpsdk.Server, conn *transport.Conn) {
+	mcpsdk.AddTool(server, &mcpsdk.Tool{
+		Name:        command.OpSnapshotList,
+		Description: "List portable snapshots in the repository. Read-only; does not verify or restore.",
+	}, func(ctx context.Context, req *mcpsdk.CallToolRequest, _ snapshotListArgs) (*mcpsdk.CallToolResult, command.SnapshotListData, error) {
+		result, err := call(ctx, conn, command.OpSnapshotList, map[string]any{})
+		if err != nil {
+			return nil, command.SnapshotListData{}, err
+		}
+		if result.Status != command.StatusSucceeded {
+			return failure(result), command.SnapshotListData{}, nil
+		}
+		var data command.SnapshotListData
+		if err := decodeData(result, &data); err != nil {
+			return nil, command.SnapshotListData{}, err
+		}
+		return &mcpsdk.CallToolResult{Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: snapshotListText(data)}}}, data, nil
+	})
+}
+
+type snapshotDiffArgs struct {
+	FromSnapshotRef string `json:"from_snapshot_ref"`
+	ToSnapshotRef   string `json:"to_snapshot_ref"`
+}
+
+func addSnapshotDiff(server *mcpsdk.Server, conn *transport.Conn) {
+	mcpsdk.AddTool(server, &mcpsdk.Tool{
+		Name:        command.OpSnapshotDiff,
+		Description: "Compare two committed snapshots by original path. Read-only and catalog-free.",
+	}, func(ctx context.Context, req *mcpsdk.CallToolRequest, args snapshotDiffArgs) (*mcpsdk.CallToolResult, command.SnapshotDiffData, error) {
+		result, err := call(ctx, conn, command.OpSnapshotDiff, args)
+		if err != nil {
+			return nil, command.SnapshotDiffData{}, err
+		}
+		if result.Status != command.StatusSucceeded {
+			return failure(result), command.SnapshotDiffData{}, nil
+		}
+		var data command.SnapshotDiffData
+		if err := decodeData(result, &data); err != nil {
+			return nil, command.SnapshotDiffData{}, err
+		}
+		return &mcpsdk.CallToolResult{Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: snapshotDiffText(data)}}}, data, nil
+	})
 }
 
 func addNamespaceList(server *mcpsdk.Server, conn *transport.Conn) {
@@ -155,6 +302,57 @@ type representationListArgs struct {
 	FileVersionID string `json:"file_version_id,omitempty"`
 }
 
+type namespaceEntryArgs struct {
+	WorkspaceID string `json:"workspace_id"`
+	EntryID     string `json:"entry_id"`
+}
+
+func addNamespaceStat(server *mcpsdk.Server, conn *transport.Conn) {
+	mcpsdk.AddTool(server, &mcpsdk.Tool{
+		Name:        command.OpNamespaceStat,
+		Description: "Read one catalog namespace entry by stable id. Read-only; does not follow symbolic links.",
+	}, func(ctx context.Context, req *mcpsdk.CallToolRequest, args namespaceEntryArgs) (*mcpsdk.CallToolResult, command.NamespaceStatData, error) {
+		result, err := call(ctx, conn, command.OpNamespaceStat, args)
+		if err != nil {
+			return nil, command.NamespaceStatData{}, err
+		}
+		if result.Status != command.StatusSucceeded {
+			return failure(result), command.NamespaceStatData{}, nil
+		}
+		var data command.NamespaceStatData
+		if err := decodeData(result, &data); err != nil {
+			return nil, command.NamespaceStatData{}, err
+		}
+		return &mcpsdk.CallToolResult{Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: namespaceStatText(data)}}}, data, nil
+	})
+}
+
+type namespaceReadlinkMCPData struct {
+	EntryID       string `json:"entry_id"`
+	TargetDisplay string `json:"target_display"`
+}
+
+func addNamespaceReadlink(server *mcpsdk.Server, conn *transport.Conn) {
+	mcpsdk.AddTool(server, &mcpsdk.Tool{
+		Name:        command.OpNamespaceReadlink,
+		Description: "Read the captured symlink target for one catalog entry. Does not follow the link or open a filesystem path.",
+	}, func(ctx context.Context, req *mcpsdk.CallToolRequest, args namespaceEntryArgs) (*mcpsdk.CallToolResult, namespaceReadlinkMCPData, error) {
+		result, err := call(ctx, conn, command.OpNamespaceReadlink, args)
+		if err != nil {
+			return nil, namespaceReadlinkMCPData{}, err
+		}
+		if result.Status != command.StatusSucceeded {
+			return failure(result), namespaceReadlinkMCPData{}, nil
+		}
+		var data command.NamespaceReadlinkData
+		if err := decodeData(result, &data); err != nil {
+			return nil, namespaceReadlinkMCPData{}, err
+		}
+		projected := namespaceReadlinkMCPData{EntryID: data.EntryID, TargetDisplay: data.TargetDisplay}
+		return &mcpsdk.CallToolResult{Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: namespaceReadlinkText(data)}}}, projected, nil
+	})
+}
+
 func addRepresentationList(server *mcpsdk.Server, conn *transport.Conn) {
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        command.OpRepresentationList,
@@ -176,15 +374,18 @@ func addRepresentationList(server *mcpsdk.Server, conn *transport.Conn) {
 }
 
 type searchQueryArgs struct {
-	Query        string `json:"query"`
-	WorkspaceID  string `json:"workspace_id,omitempty"`
-	GenerationID string `json:"index_generation_ref,omitempty"`
+	Query        string   `json:"query"`
+	WorkspaceID  string   `json:"workspace_id,omitempty"`
+	GenerationID string   `json:"index_generation_ref,omitempty"`
+	Dimension    string   `json:"dimension,omitempty"`
+	Axes         []string `json:"construct_axes,omitempty"`
+	Fuse         []string `json:"fuse,omitempty"`
 }
 
 func addSearchQuery(server *mcpsdk.Server, conn *transport.Conn) {
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        command.OpSearchQuery,
-		Description: "Query the bundled lexical index. The daemon returns an unimplemented or degraded outcome when no index generation is available.",
+		Description: "Query one named index dimension, or fuse several. Default is the bundled lexical FTS5 generation. Fixture acoustic/semantic/multimodal dimensions degrade when no generation exists.",
 	}, func(ctx context.Context, req *mcpsdk.CallToolRequest, args searchQueryArgs) (*mcpsdk.CallToolResult, any, error) {
 		input := map[string]any{"query": args.Query}
 		if args.WorkspaceID != "" {
@@ -192,6 +393,15 @@ func addSearchQuery(server *mcpsdk.Server, conn *transport.Conn) {
 		}
 		if args.GenerationID != "" {
 			input["index_generation_ref"] = args.GenerationID
+		}
+		if args.Dimension != "" {
+			input["dimension"] = args.Dimension
+		}
+		if len(args.Axes) > 0 {
+			input["construct_axes"] = args.Axes
+		}
+		if len(args.Fuse) > 0 {
+			input["fuse"] = args.Fuse
 		}
 		result, err := call(ctx, conn, command.OpSearchQuery, input)
 		if err != nil {
@@ -318,7 +528,42 @@ func statusText(data command.StatusData) string {
 	if data.Listen != "" {
 		fmt.Fprintf(&builder, "listen: %s\n", data.Listen)
 	}
+	if data.Repository != nil {
+		fmt.Fprintf(&builder, "repository: %s\n", data.Repository.Path)
+		fmt.Fprintf(&builder, "repository ok: %t\n", data.Repository.OK)
+		fmt.Fprintf(&builder, "snapshots: %d\n", data.Repository.Snapshots)
+	}
+	fmt.Fprintf(&builder, "publications: %d\n", data.Publications)
+	fmt.Fprintf(&builder, "plans: %d\n", data.Plans)
+	for _, plan := range data.RecentPlans {
+		fmt.Fprintf(&builder, "plan: %s %s %s\n", plan.PlanID, plan.Kind, plan.State)
+	}
+	fmt.Fprintf(&builder, "jobs: %d\n", data.Jobs)
+	if data.OpenHandles > 0 || data.ReapedHandles > 0 {
+		fmt.Fprintf(&builder, "open handles: %d\n", data.OpenHandles)
+		fmt.Fprintf(&builder, "reaped handles: %d\n", data.ReapedHandles)
+	}
+	for _, job := range data.RecentJobs {
+		fmt.Fprintf(&builder, "job: %s %s %s\n", job.JobID, job.Kind, job.State)
+	}
 	fmt.Fprintf(&builder, "unimplemented: %s\n", strings.Join(data.Unimplemented, ", "))
+	return builder.String()
+}
+
+func doctorText(data command.DoctorData) string {
+	var builder strings.Builder
+	if data.OK {
+		builder.WriteString("doctor ok\n")
+	} else {
+		builder.WriteString("doctor degraded\n")
+	}
+	for _, check := range data.Checks {
+		state := "ok"
+		if !check.OK {
+			state = "fail"
+		}
+		fmt.Fprintf(&builder, "%s %s %s\n", check.ID, state, check.Message)
+	}
 	return builder.String()
 }
 
@@ -337,6 +582,14 @@ func capabilitiesText(data command.CapabilityListData) string {
 	return builder.String()
 }
 
+func planGetText(data command.PlanGetData) string {
+	return fmt.Sprintf("%s %s %s applied=%t executable=%t\n", data.Kind, data.PlanID, data.PlanDigest, data.Applied, data.Executable)
+}
+
+func jobEventsText(data command.JobEventsData) string {
+	return fmt.Sprintf("%s %s events=%d next=%d terminal=%t\n", data.JobID, data.JobState, len(data.Events), data.NextSequence, data.Terminal)
+}
+
 func namespaceText(data command.NamespaceListData) string {
 	var builder strings.Builder
 	for _, entry := range data.Entries {
@@ -347,6 +600,38 @@ func namespaceText(data command.NamespaceListData) string {
 
 func namespaceResolveText(data command.NamespaceResolveData) string {
 	return fmt.Sprintf("%s %s %s %s\n", data.Entry.EntryType, data.PathRef, data.Path, data.Entry.DisplayName)
+}
+
+func namespaceStatText(data command.NamespaceStatData) string {
+	return fmt.Sprintf("%s %s %s\n", data.Entry.EntryType, data.Entry.ID, data.Entry.DisplayName)
+}
+
+func namespaceReadlinkText(data command.NamespaceReadlinkData) string {
+	return fmt.Sprintf("%s %s\n", data.EntryID, data.TargetDisplay)
+}
+
+func snapshotListText(data command.SnapshotListData) string {
+	if len(data.Snapshots) == 0 {
+		return "no snapshots\n"
+	}
+	var builder strings.Builder
+	for _, snapshot := range data.Snapshots {
+		fmt.Fprintf(&builder, "%s %s %s\n", snapshot.SnapshotRef, snapshot.CreatedAt, snapshot.ManifestDigest)
+	}
+	return builder.String()
+}
+
+func snapshotDiffText(data command.SnapshotDiffData) string {
+	var builder strings.Builder
+	fmt.Fprintf(&builder, "%s -> %s changes=%d\n", data.FromSnapshotRef, data.ToSnapshotRef, len(data.Changes))
+	for _, change := range data.Changes {
+		path := change.Path
+		if path == "" {
+			path = change.ToPath
+		}
+		fmt.Fprintf(&builder, "%s %s\n", change.Kind, path)
+	}
+	return builder.String()
 }
 
 func representationText(data command.RepresentationListData) string {

@@ -11,14 +11,14 @@ The slice must prove four product outcomes together:
 3. Expose one authenticated original-path namespace with useful baseline search.
 4. Verify and restore exact data without the live catalog, index, AI service, or processor registry.
 
-The reference deployment is a single Linux-based NAS or server. A platform-specific snapshot driver is optional. Embeddings, CLIP, neural codecs, P2P, writable NAS gateways, HA, and multitenancy are not required for this slice. Component choices and qualification gates are tracked in [Open-Source Adoption and Code Borrowing](../references/open-source-adoption-and-code-borrowing.md).
+The reference deployment is a single Linux-based NAS or server. A platform-specific snapshot driver is optional. The exact-storage and recovery slice remains independently testable without embeddings, but a conforming `RW-MVP-1` reference distribution must bundle the local ONNX/BGE embedding profile and in-process zvec generation for its default discovery experience. CLIP, neural codecs, P2P, writable NAS gateways, HA, and multitenancy are not required for this slice. Component choices and qualification gates are tracked in [Open-Source Adoption and Code Borrowing](../references/open-source-adoption-and-code-borrowing.md).
 
 ## 2. Current implementation reality
 
 The repository currently contains:
 
 - A deterministic scanner with streaming SHA-256, source-change evidence, final-component no-follow opens, and descriptor-rooted capture (`ROOTED_FD`).
-- A local-tree `CaptureDriver`, fake CAS `RepositoryDriver`, capture-qualified catalog adoption, portable snapshot publication, and catalog-free restore.
+- A local-tree `CaptureDriver`, raw development and local-zstd candidate `RepositoryDriver` profiles, capture-qualified catalog adoption, signed portable snapshot publication, and catalog-free restore.
 - SQLite records for namespace, representation, capture bindings, and publications.
 - `SnapshotTree`, `FileAccess`, bounded repository reads, storage-range reads, and representation-decoder interfaces.
 - A Unix-socket control plane (`restoreweaved` / `rw`) and a legacy `internal/plugin` prototype.
@@ -48,7 +48,7 @@ The core owns:
 - Plans, authority, lifecycle, rollback, and garbage-collection eligibility.
 - `SnapshotTree`, `FileAccess`, query brokering, and result reauthorization.
 
-Suffix and magic-byte detection are host-owned. FUSE, CLI, MCP, REST, WebUI, SMB, and NFS are northbound adapters rather than algorithm plugins.
+Suffix and magic-byte detection are host-owned. CLI, MCP, REST, WebUI, and external export consumers are northbound clients rather than algorithm plugins.
 
 ## 4. Canonical data flow
 
@@ -199,19 +199,15 @@ Status (2026-08-13): durable whole-subject tags and notes live in the operationa
 
 Exit condition: deleting the complete index degrades search only; namespace access, tags and notes, exact reads, verification, and restore remain intact, and a new generation rebuilds from durable records.
 
-### Milestone 4: original-path NAS access
+### Milestone 4: original-path recovery access
 
-Status (2026-08-13): repository-backed `SnapshotTree` and `FileAccess` are implemented in `server/internal/access`. Exact reads go through host-owned `DECODE_REPRESENTATION` (`server/internal/decode.IdentityDecoder` for `identity/sha256-v1`); the host independently SHA-256s decoded bytes. File-shaped egress is `plan.restore` and `FileAccess`. `gateway.mount` is `unimplemented` and tells the operator to restore, then use a foreign mount tool. The leftover go-fuse adapter is not a product gate. Byte equality is covered by `TestFileAccessMatchesRestoreBytes` and restore SHA-256.
+Status (2026-08-17): repository-backed `SnapshotTree` and `FileAccess` are implemented in `server/internal/access`. Exact reads go through host-owned `DECODE_REPRESENTATION` (`server/internal/decode.IdentityDecoder` for `identity/sha256-v1`); the host independently SHA-256s decoded bytes. File-shaped egress is `plan.restore`, export materialization, and `FileAccess`. The mount ABI and go-fuse implementation were removed. Byte equality is covered by `TestFileAccessMatchesRestoreBytes` and restore SHA-256.
 
 - Complete repository-backed `FileAccess` reads.
 - Implement `DECODE_REPRESENTATION` through the existing bounded decoder path.
-- Ship the read-only Linux FUSE adapter through `github.com/hanwen/go-fuse/v2` v2.11.0, kept private behind `SnapshotTree` and `FileAccess`.
-- Bind each mount to one principal, one export root, and one immutable snapshot; require `ro,nodev,nosuid,noexec`, disable `allow_other`, and fail the mount if the required policy cannot be confirmed.
-- Implement collision-resolved stable mount-local inode allocation, authorized-view hard-link mapping, raw byte-name handling, sparse-extent semantics, and independent bounded directory cursors that translate FUSE cookies to scoped non-replaying `PageToken` values.
-- Define and measure cold and warm first-byte latency, large-directory `readdir` and `READDIRPLUS` scaling, sequential and random reads, repository request and byte amplification, process and kernel-cache memory, and concurrent file and directory handles.
-- Qualify attribute, entry, negative-entry, and data-cache behavior; authorization expiry through existing handles, page cache, and mmap; snapshot pins across maintenance; and exact `EROFS` responses for every write-capable open and mutation opcode. If revocation cannot be enforced within the declared bound, document the mount as a local-trust surface.
+- Implement frozen `ExportManifest` materialization with explicit destination, collision, metadata-degradation, restart, and verification behavior.
 
-Exit condition: CLI, restore, and FUSE return the same exact bytes and snapshot-pinned namespace metadata; all mutation attempts fail.
+Exit condition: CLI, restore, export materialization, and `FileAccess` return the same exact bytes and snapshot-pinned namespace metadata; destination conflicts never cause silent substitution.
 
 ### Milestone 5: portable recovery and upgrade proof
 
@@ -240,7 +236,6 @@ The first distribution should be opinionated:
 - Host-owned suffix and magic detection.
 - A small deterministic metadata and text processor pack.
 - One bundled lexical index and query implementation.
-- One read-only Linux FUSE adapter.
 - CLI and local read-only MCP.
 
 Replaceability is proven by side-by-side generations and migration, not by shipping an empty marketplace. WebUI configuration should use profiles, checkboxes, and expert overrides; a node-graph editor is unnecessary.
@@ -253,8 +248,6 @@ Measure on representative low-power and mid-range NAS hardware:
 - Repository growth versus raw input and direct engine use.
 - Processor CPU, RAM, scratch, and amplification.
 - Index size, build time, incremental lag, and rebuild time.
-- FUSE first-byte latency, directory enumeration, sequential read, and random-range read.
-- FUSE cold/warm cache behavior, `READDIRPLUS` scaling, repository request and byte amplification, process and kernel-cache memory, concurrent handles, and authorization-revocation residual access.
 - Restore throughput and clean-recovery time.
 - Exact-path service behavior while optional processors are saturated, crashing, or quarantined.
 
@@ -269,8 +262,8 @@ Remaining host-split work is recorded in [Implementation Completion Plan](implem
 3. Adapt only capture-qualified observations into stable content, file-version, and namespace records.
 4. Build a fake in-memory `RepositoryDriver` and fake Processor to prove state machines and fault handling before binding a mature engine.
 5. Add the Kopia-led repository qualification harness and retain Restic as the control before selecting the first release engine.
-6. Implement the first exact end-to-end CLI path before search, FUSE, or optional AI work.
+6. Implement the first exact end-to-end CLI path before semantic search work.
 7. Add the isolated Processor runtime and deterministic identification/extraction pack.
-8. Add SQLite FTS5 generations, then the go-fuse adapter, using the gates in the open-source adoption guide.
+8. Add SQLite FTS5 generations, then the local zvec semantic generation, using the provider qualification gates.
 
 Do not extend the legacy category manifest, implement embeddings, add a visual pipeline editor, or begin P2P work before this sequence is complete.

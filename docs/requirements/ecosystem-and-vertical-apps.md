@@ -2,7 +2,7 @@
 
 > **Authority:** This is the normative product requirement for the RestoreWeave ecosystem and vertical-application profile. It governs the shared catalog, Inbox, experience-pack boundary, client strategy, and staged domain experiences. The companion [Universal Catalog and Experience Pack Overview](universal-catalog-and-experience-packs.md) is non-normative and summarizes this document for orientation. The technical contracts refine these requirements but must not weaken their recovery and authority rules.
 
-> **Profile status:** This document defines the product shape above `RW-MVP-1`. It does not promote media players, readers, game retrieval, or semantic processing into the first exact-storage release. It explains how those experiences can share one RestoreWeave data plane without turning the authoritative core into a media server, launcher, workflow engine, or download manager.
+> **Profile status:** This document defines the product shape above `RW-MVP-1`. The bundled local text-semantic profile is already an `RW-MVP-1` requirement; this document does not promote additional semantic or multimodal processing, media players, readers, or game retrieval into the core release. It explains how later experiences can share one RestoreWeave data plane without turning the authoritative core into a media server, launcher, workflow engine, or download manager.
 
 ## 1. Product decision
 
@@ -14,7 +14,7 @@ The product must therefore be **one data plane, several bounded experiences**:
 RestoreWeave Core
   -> Universal Catalog and Inbox
   -> Domain Packs (audio, video, books, images, documents, games, ...)
-  -> Clients (CLI, local MCP, read-only FUSE, later WebUI and focused applications)
+  -> Clients (CLI, local MCP, export consumers, later WebUI and focused applications)
 ```
 
 The public product hierarchy is intentionally layered rather than a set of separate storage silos:
@@ -24,7 +24,7 @@ RestoreWeave Core        identity, namespace, storage, recovery, authorization
 RestoreWeave Catalog     heterogeneous metadata, annotations, collections, baseline search
 RestoreWeave Experiences Music, Books, Video, Photos, Documents, Games, and other views
 RestoreWeave Retrieval   explicitly qualified external acquisition connectors (later profile)
-RestoreWeave Clients     universal UI, CLI, MCP, FUSE, and third-party applications
+RestoreWeave Clients     universal UI, CLI, MCP, export consumers, and third-party applications
 ```
 
 The shared catalog has four durability layers:
@@ -101,8 +101,8 @@ These capabilities should be implemented once and reused by every vertical:
 - Generic metadata, type evidence, processing state, and failure reasons.
 - Versioned tags, notes, ratings, progress markers, and user corrections.
 - Virtual collections and saved queries that do not require physical file moves.
-- Baseline lexical and structured search.
-- Optional semantic and multimodal artifacts bound to stable subjects or segments.
+- Baseline lexical, structured, and bundled local text-semantic search.
+- Optional additional semantic and multimodal artifacts bound to stable subjects or segments.
 - Capability discovery, processor provenance, authorization, and resource limits.
 - CLI and local read-only MCP operations; later REST and WebUI adapters after the core command and access contracts are qualified.
 
@@ -221,7 +221,7 @@ The controller should expose processing as explicit tiers so operators can trade
 | --- | --- | --- | --- |
 | **Protect** | Make the item safe and addressable | Source settle/snapshot, exact hashing, duplicate identity, namespace record, baseline type evidence | Synchronous or highest priority; cannot depend on AI or optional processors |
 | **Understand** | Build useful generic and typed metadata | Magic-byte/structural parsing, common metadata, safe text extraction, archive/member listing | Bounded and asynchronous; failure leaves exact browse/read/restore intact |
-| **Discover** | Improve retrieval and cross-modal navigation | OCR, ASR, fingerprints, embeddings, CLIP-compatible features, external enrichment | Optional, attributed, privacy/egress governed, rebuildable and generation-pinned |
+| **Discover** | Improve retrieval and cross-modal navigation | Bundled local text embeddings for the default profile; OCR, ASR, fingerprints, CLIP-compatible features, and external enrichment as extensions | The local text profile is required for the default experience; extensions are attributed, privacy/egress governed, rebuildable, and generation-pinned |
 | **Transform** | Produce a qualified access or storage representation | Lossless/reversible packing, thumbnails, normalized text, bounded transcodes, approved perceptual representations | Requires an explicit fidelity/retention profile and independent validation; never silently replaces exact content |
 
 Tier completion is reported independently. An item can be Protect-complete while Understand or Discover is pending, stale, or failed. Resource reservations must protect the Protect and interactive-read lanes from optional enrichment backpressure.
@@ -336,9 +336,9 @@ The universal catalog should provide one search entry point with typed, namespac
 
 ```text
 search(query)
-  -> lexical and structured baseline
+  -> fused lexical, structured, and bundled local text-semantic baseline
   -> optional domain facets
-  -> optional semantic or multimodal ranking
+  -> optional additional semantic or multimodal ranking
   -> authoritative SubjectRef and SegmentRef results
 ```
 
@@ -391,16 +391,16 @@ It cannot silently organize, delete, retrieve, or publish. A future mutation-cap
 | Stage | User-visible outcome | Required shared capabilities | Priority |
 | --- | --- | --- | --- |
 | `RW-CORE-1` | Exact archive, verify, restore, original-path browse | Core identity, repository, publication, `SnapshotTree`, `FileAccess` | Must ship first |
-| `RW-CATALOG-1` | Drop anything into an Inbox and find it | Generic extraction, lexical index, annotations, virtual collections, universal item page | First product wedge |
+| `RW-CATALOG-1` | Drop anything into an Inbox and find it | Generic extraction, the qualified fused default search, durable descriptions/annotations, virtual collections, universal item page | First post-core product wedge |
 | `RW-AUDIO-1` | Browse and stream a personal music library | Audio parser, track/album segments, stream handles, playlists, progress | Early vertical |
 | `RW-BOOK-1` | Search and read books/comics with progress and notes | EPUB/PDF/CBZ processors, chapter/page segments, reader client | Early vertical |
 | `RW-VIDEO-1` | Browse and play a video library | FFprobe/FFmpeg profile, thumbnails, subtitles, time segments, transcode policy | After core streaming qualification |
 | `RW-IMAGE-1` | Search and review photos/images | EXIF/XMP, thumbnails, duplicate candidates, optional vision processors | Parallel or integration profile |
 | `RW-COLLECTION-1` | Explain installed apps/games and their components | Platform profiles, collection resolver, dependency graph, save/mod handling | Later |
 | `RW-RETRIEVE-1` | Approved external acquisition/reacquisition | `RetrieverDriver`, source bindings, quarantine, rights, cold tests | Later and opt-in |
-| `RW-SEMANTIC-1` | Natural-language, visual, and cross-modal discovery | Embedding/CLIP/ASR/OCR processors, vector/hybrid index generations | Optional after lexical value |
+| `RW-SEMANTIC-1` | Visual, cross-modal, and other semantic discovery beyond the bundled local text profile | CLIP/ASR/OCR processors, additional embedding spaces, vector/hybrid index generations | Optional after the bundled local text profile |
 
-The first end-to-end demonstration should be `RW-CATALOG-1` over mixed files, followed by a small `RW-AUDIO-1` slice. This demonstrates that one exact data plane can produce a compelling daily experience without waiting for every domain.
+This vertical sequence begins only after the dependency-ordered [Core MVP Execution Plan](../technical/core-mvp-execution-plan.md) passes. The first post-core demonstration should be `RW-CATALOG-1` over mixed files, followed by a small `RW-AUDIO-1` slice. Neither Inbox work nor a domain client may substitute for recovery closure, the real local semantic default, qualified storage, saved views/exports, or release acceptance.
 
 The sequence distinguishes the narrow import/catalog path from later writable-NAS behavior: `RW-CORE-1` and `RW-CATALOG-1` may observe local or mounted trees and publish a managed exact archive, but they do not expose a general writable network filesystem. SMB/NFS/WebDAV write-through, source-side organization, in-place edits, application-consistent capture, and multi-writer conflict resolution require separately named NAS profiles.
 
@@ -432,7 +432,7 @@ If operators still maintain separate catalogs or custom glue for ordinary tasks,
 | Image/photo pack | High | High | Medium | Competition and privacy-sensitive AI | Integrate selectively |
 | Game/app locator | Medium, distinctive | Medium-high | High | Platform profiles, secrets, DRM, changing installs | Start read-only resolver |
 | Game downloader/retriever | Niche but exciting | Medium | Very high | Rights, credentials, source drift, malware, legal exposure | Defer; separate opt-in profile |
-| Embedding/CLIP semantic search | Medium-high | Medium | Medium-high | Model/storage cost, relevance, privacy, rebuild burden | Optional after lexical baseline |
+| Additional embedding spaces / CLIP semantic search | Medium-high | Medium | Medium-high | Model/storage cost, relevance, privacy, rebuild burden | Optional after the bundled local text profile |
 | Magnet/P2P retrieval | Unproven for recovery | Low-medium | Very high | Persistence, trust, abuse, legal and operational risk | Defer |
 
 ## 12. Anti-monolith rules

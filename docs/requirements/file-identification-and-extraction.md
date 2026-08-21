@@ -260,7 +260,7 @@ Machine-derived output never overwrites user-authored tags, notes, corrections, 
 
 ## 13. Fingerprints and embeddings
 
-Fingerprints and embeddings are optional Processor outputs used for discovery, grouping, duplicate candidates, and qualified perceptual validation.
+Fingerprints and embeddings are Processor outputs used for discovery, grouping, duplicate candidates, and qualified perceptual validation. The reference distribution enables its pinned local text-embedding profile by default; other spaces remain optional.
 
 A **FingerprintRecord** binds:
 
@@ -390,7 +390,7 @@ The initial self-hosted reference profile MUST provide:
 - Generic path, name, type, metadata, tag, and available extracted-text indexing.
 - Background queues for deeper optional processing.
 
-The reference profile SHOULD provide curated processor packs for common archives, documents, images, audio, video, source code, applications, games, and model containers. Learned classification, OCR, ASR, fingerprints, embeddings, CLIP, external enrichment, neural codecs, and perceptual substitution remain optional capabilities that can be installed without changing the core.
+The reference profile SHOULD provide curated processor packs for common archives, documents, images, audio, video, source code, applications, games, and model containers. The pinned local text embedding pack is part of the reference discovery default. Learned classification, OCR, ASR, fingerprints, other embedding spaces, CLIP, external enrichment, neural codecs, and perceptual substitution remain optional capabilities that can be installed without changing the core.
 
 ## 20. Acceptance criteria
 

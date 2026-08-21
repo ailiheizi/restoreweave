@@ -11,7 +11,7 @@
     header { border-bottom: 1px solid color-mix(in srgb, currentColor 16%, transparent); }
     h1 { font-size: 1.25rem; margin: 0 0 8px; }
     .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-    input, button, textarea { font: inherit; padding: 6px 8px; }
+    input, button, textarea, select { font: inherit; padding: 6px 8px; }
     input[type=search], input[type=text] { flex: 1; min-width: 12rem; }
     button { cursor: pointer; }
     .muted { opacity: 0.7; font-size: 0.9rem; }
@@ -31,6 +31,9 @@
       <input id="q" type="search" placeholder="Search titles, tags, paths">
       <button id="searchBtn" type="button">Search</button>
       <button id="verifyBtn" type="button">Verify snapshot</button>
+      <button id="doctorBtn" type="button">Doctor</button>
+      <button id="snapshotsBtn" type="button">Snapshots</button>
+      <button id="plansBtn" type="button">Plans</button>
     </div>
     <p id="status" class="muted"></p>
   </header>
@@ -42,7 +45,18 @@
       <div id="preview"></div>
       <div class="row">
         <input id="dest" type="text" placeholder="Restore destination directory">
+        <input id="recoveryDest" type="text" placeholder="New recovery JSON path">
+        <button id="recoveryBtn" type="button">Export recovery</button>
+        <button id="preflightBtn" type="button">Preflight restore</button>
         <button id="restoreBtn" type="button">Restore snapshot</button>
+        <button id="exportBtn" type="button">Export annotations</button>
+        <input id="importFile" type="file" accept="application/json">
+        <select id="conflictPolicy">
+          <option value="fail">conflict: fail</option>
+          <option value="keep-local">conflict: keep-local</option>
+          <option value="keep-imported">conflict: keep-imported</option>
+        </select>
+        <button id="importBtn" type="button">Import annotations</button>
       </div>
       <p id="itemMsg" class="muted"></p>
     </section>
@@ -63,9 +77,23 @@
     async function loadStatus() {
       const res = await api("/inbox/api/status");
       const data = await res.json();
-      status.textContent = data.workspace_id
-        ? `workspace ${data.workspace_id}  snapshot ${data.snapshot_ref || "(latest)"}`
-        : (data.error || "unavailable");
+      if (data.error && !data.workspace_id) {
+        status.textContent = data.error;
+        return;
+      }
+      const bits = [
+        data.workspace_id && `workspace ${data.workspace_id}`,
+        `snapshot ${data.snapshot_ref || "(latest)"}`,
+        data.catalog_ok === false ? "catalog down" : (data.catalog_ok ? "catalog ok" : ""),
+        data.repository_ok === false ? "repository down" : "",
+        typeof data.snapshots === "number" ? `${data.snapshots} snapshots` : "",
+        typeof data.publications === "number" ? `${data.publications} publications` : "",
+        typeof data.plans === "number" ? `${data.plans} plans` : "",
+        typeof data.jobs === "number" ? `${data.jobs} jobs` : "",
+        data.recent_plans && data.recent_plans[0] ? `${data.recent_plans[0].kind} ${data.recent_plans[0].state}` : "",
+        data.recent_jobs && data.recent_jobs[0] ? `${data.recent_jobs[0].kind} ${data.recent_jobs[0].state}` : ""
+      ].filter(Boolean);
+      status.textContent = bits.join(" · ");
     }
     async function runSearch() {
       const q = $("q").value.trim();
@@ -87,8 +115,10 @@
       current = data;
       item.hidden = false;
       $("itemTitle").textContent = data.title || data.name || id;
+      const rep = (data.representations && data.representations[0]) || {};
       $("itemMeta").textContent = [
-        data.kind, data.subject_ref, data.content_id
+        data.kind, data.path, data.subject_ref, data.content_id,
+        data.snapshot_ref, rep.class, rep.placement
       ].filter(Boolean).join(" · ");
       const preview = $("preview");
       preview.innerHTML = "";
@@ -117,6 +147,13 @@
         pre.textContent = data.preview_text || "(no extracted text)";
         preview.appendChild(pre);
       }
+      if ((data.annotations || []).length) {
+        const notes = document.createElement("pre");
+        notes.textContent = data.annotations.map((a) =>
+          [a.kind, a.body].filter(Boolean).join("  ")
+        ).join("\n");
+        preview.appendChild(notes);
+      }
     }
     $("searchBtn").onclick = runSearch;
     $("q").addEventListener("keydown", (e) => { if (e.key === "Enter") runSearch(); });
@@ -124,6 +161,110 @@
       const res = await api("/inbox/api/verify", { method: "POST" });
       const data = await res.json();
       status.textContent = data.ok ? `verify ok · ${data.files || 0} files` : (data.error || "verify failed");
+    };
+    $("plansBtn").onclick = async () => {
+      const statusRes = await api("/inbox/api/status");
+      const statusData = await statusRes.json();
+      const plans = statusData.recent_plans || [];
+      hits.innerHTML = "";
+      for (const plan of plans) {
+        const res = await api("/inbox/api/plan?id=" + encodeURIComponent(plan.plan_id));
+        const data = await res.json();
+        const el = document.createElement("pre");
+        el.textContent = data.ok
+          ? [data.kind, data.plan_id, data.state, "applied=" + data.applied, "executable=" + data.executable].join("  ")
+          : (data.error || "plan get failed");
+        hits.appendChild(el);
+      }
+      if (!plans.length) hits.textContent = statusData.error || "No plans.";
+    };
+    $("snapshotsBtn").onclick = async () => {
+      const res = await api("/inbox/api/snapshots");
+      const data = await res.json();
+      const snaps = data.snapshots || [];
+      hits.innerHTML = "";
+      snaps.forEach((snap) => {
+        const el = document.createElement("div");
+        el.className = "hit";
+        el.textContent = [snap.snapshot_ref, snap.created_at, snap.manifest_digest].filter(Boolean).join("  —  ");
+        hits.appendChild(el);
+      });
+      if (!snaps.length) hits.textContent = data.error || "No snapshots.";
+      if (snaps.length >= 2) {
+        const from = snaps[snaps.length - 2].snapshot_ref;
+        const to = snaps[snaps.length - 1].snapshot_ref;
+        const diffRes = await api("/inbox/api/diff?from=" + encodeURIComponent(from) + "&to=" + encodeURIComponent(to));
+        const diff = await diffRes.json();
+        const pre = document.createElement("pre");
+        pre.textContent = (diff.changes || []).map((c) =>
+          [c.kind, c.path || c.to_path].filter(Boolean).join("  ")
+        ).join("\n") || (diff.error || "no changes");
+        hits.appendChild(pre);
+      }
+    };
+    $("importBtn").onclick = async () => {
+      const file = $("importFile").files && $("importFile").files[0];
+      if (!file) {
+        $("itemMsg").textContent = "choose an annotation bundle";
+        return;
+      }
+      const bundle = JSON.parse(await file.text());
+      bundle.conflict = $("conflictPolicy").value || "fail";
+      const res = await api("/inbox/api/annotations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(bundle)
+      });
+      const data = await res.json();
+      $("itemMsg").textContent = data.ok
+        ? `imported ${data.imported || 0} annotations`
+        : (data.error || "import failed");
+    };
+    $("exportBtn").onclick = async () => {
+      if (!current || !current.subject_ref) {
+        $("itemMsg").textContent = "open an item first";
+        return;
+      }
+      const res = await api("/inbox/api/annotations?id=" + encodeURIComponent(current.subject_ref));
+      const data = await res.json();
+      $("itemMsg").textContent = data.ok
+        ? `exported ${(data.annotations || []).length} annotations`
+        : (data.error || "export failed");
+    };
+    $("doctorBtn").onclick = async () => {
+      const res = await api("/inbox/api/doctor");
+      const data = await res.json();
+      if (data.error && !data.checks) {
+        status.textContent = data.error;
+        return;
+      }
+      const failed = (data.checks || []).filter((c) => !c.ok).map((c) => c.id);
+      status.textContent = data.ok
+        ? `doctor ok · ${(data.checks || []).length} checks`
+        : `doctor degraded · ${failed.join(", ") || "failed"}`;
+    };
+    $("preflightBtn").onclick = async () => {
+      const res = await api("/inbox/api/restore", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({})
+      });
+      const data = await res.json();
+      $("itemMsg").textContent = data.ok
+        ? `preflight · ${data.files || 0} files · ${data.bytes || 0} bytes · wrote=${!!data.wrote}`
+        : (data.error || "preflight failed");
+    };
+    $("recoveryBtn").onclick = async () => {
+      const dest = $("recoveryDest").value.trim();
+      const res = await api("/inbox/api/recovery", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ destination: dest })
+      });
+      const data = await res.json();
+      $("itemMsg").textContent = data.ok
+        ? `recovery exported ${data.files || 0} files to ${data.artifact_path}`
+        : (data.error || "recovery export failed");
     };
     $("restoreBtn").onclick = async () => {
       const dest = $("dest").value.trim();
@@ -134,7 +275,7 @@
       });
       const data = await res.json();
       $("itemMsg").textContent = data.ok
-        ? `restored ${data.files || 0} files to ${data.destination}`
+        ? (data.wrote ? `restored ${data.files || 0} files to ${data.destination}` : `preflight · ${data.files || 0} files`)
         : (data.error || "restore failed");
     };
     loadStatus();

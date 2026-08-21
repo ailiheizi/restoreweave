@@ -105,11 +105,7 @@ func (s *Server) serveArtists(w http.ResponseWriter, r *http.Request) {
 		writeSubsonicError(w, r, 0, err.Error())
 		return
 	}
-	type artist struct {
-		ID         string `json:"id"`
-		Name       string `json:"name"`
-		AlbumCount int    `json:"albumCount"`
-	}
+	starred, _ := s.starredTimes(r)
 	counts := map[string]int{}
 	names := map[string]string{}
 	for _, album := range data.Albums {
@@ -117,7 +113,7 @@ func (s *Server) serveArtists(w http.ResponseWriter, r *http.Request) {
 		counts[id]++
 		names[id] = album.Artist
 	}
-	indexes := map[string][]artist{}
+	indexes := map[string][]map[string]any{}
 	order := make([]string, 0)
 	seen := map[string]bool{}
 	for _, album := range data.Albums {
@@ -130,7 +126,9 @@ func (s *Server) serveArtists(w http.ResponseWriter, r *http.Request) {
 		if _, ok := indexes[key]; !ok {
 			order = append(order, key)
 		}
-		indexes[key] = append(indexes[key], artist{ID: id, Name: names[id], AlbumCount: counts[id]})
+		indexes[key] = append(indexes[key], markStarred(map[string]any{
+			"id": id, "name": names[id], "albumCount": counts[id],
+		}, artistStarred(data, starred, id)))
 	}
 	index := make([]map[string]any, 0, len(order))
 	for _, key := range order {
@@ -150,6 +148,7 @@ func (s *Server) serveArtist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.URL.Query().Get("id")
+	starred, _ := s.starredTimes(r)
 	albums := make([]map[string]any, 0)
 	name := ""
 	for _, album := range data.Albums {
@@ -157,7 +156,7 @@ func (s *Server) serveArtist(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		name = album.Artist
-		albums = append(albums, map[string]any{
+		albums = append(albums, markStarred(map[string]any{
 			"id":        albumID(album.Artist, album.Title),
 			"name":      firstNonEmpty(album.Title, "Unknown Album"),
 			"artist":    album.Artist,
@@ -165,14 +164,14 @@ func (s *Server) serveArtist(w http.ResponseWriter, r *http.Request) {
 			"songCount": len(album.SubjectRefs),
 			"duration":  int(album.DurationMS / 1000),
 			"year":      album.Year,
-		})
+		}, collectionStarred(data, starred, album.SubjectRefs)))
 	}
 	if name == "" && id != "" {
 		writeSubsonicError(w, r, 70, "artist not found")
 		return
 	}
 	writeSubsonicOK(w, r, map[string]any{
-		"artist": map[string]any{"id": id, "name": name, "albumCount": len(albums), "album": albums},
+		"artist": markStarred(map[string]any{"id": id, "name": name, "albumCount": len(albums), "album": albums}, artistStarred(data, starred, id)),
 	})
 }
 
@@ -199,8 +198,9 @@ func (s *Server) serveAlbumOrDirectory(w http.ResponseWriter, r *http.Request) {
 		writeSubsonicError(w, r, 70, "album not found")
 		return
 	}
-	songs := songsForAlbum(data.Tracks, *found)
-	payload := map[string]any{
+	starred, _ := s.starredTimes(r)
+	songs := songsForAlbum(data.Tracks, *found, starred)
+	payload := markStarred(map[string]any{
 		"id":        id,
 		"name":      firstNonEmpty(found.Title, "Unknown Album"),
 		"artist":    found.Artist,
@@ -209,7 +209,7 @@ func (s *Server) serveAlbumOrDirectory(w http.ResponseWriter, r *http.Request) {
 		"duration":  int(found.DurationMS / 1000),
 		"song":      songs,
 		"child":     songs,
-	}
+	}, collectionStarred(data, starred, found.SubjectRefs))
 	if strings.Contains(r.URL.Path, "getMusicDirectory") {
 		writeSubsonicOK(w, r, map[string]any{"directory": payload})
 		return
@@ -223,9 +223,10 @@ func (s *Server) serveAlbumList(w http.ResponseWriter, r *http.Request, name str
 		writeSubsonicError(w, r, 0, err.Error())
 		return
 	}
+	starred, _ := s.starredTimes(r)
 	albums := make([]map[string]any, 0, len(data.Albums))
 	for _, album := range data.Albums {
-		albums = append(albums, map[string]any{
+		albums = append(albums, markStarred(map[string]any{
 			"id":        albumID(album.Artist, album.Title),
 			"name":      firstNonEmpty(album.Title, "Unknown Album"),
 			"artist":    album.Artist,
@@ -233,7 +234,7 @@ func (s *Server) serveAlbumList(w http.ResponseWriter, r *http.Request, name str
 			"songCount": len(album.SubjectRefs),
 			"duration":  int(album.DurationMS / 1000),
 			"year":      album.Year,
-		})
+		}, collectionStarred(data, starred, album.SubjectRefs)))
 	}
 	key := "albumList2"
 	if name == "getAlbumList" {
@@ -249,9 +250,10 @@ func (s *Server) serveSong(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.URL.Query().Get("id")
+	starred, _ := s.starredTimes(r)
 	for _, track := range data.Tracks {
 		if track.SubjectRef == id {
-			writeSubsonicOK(w, r, map[string]any{"song": songPayload(track)})
+			writeSubsonicOK(w, r, map[string]any{"song": songPayloadWithStar(track, starred[track.SubjectRef])})
 			return
 		}
 	}
@@ -293,7 +295,7 @@ func (s *Server) serveScrobble(w http.ResponseWriter, r *http.Request) {
 	writeSubsonicOK(w, r, nil)
 }
 
-func songsForAlbum(tracks []command.AudioTrack, album command.AudioAlbum) []map[string]any {
+func songsForAlbum(tracks []command.AudioTrack, album command.AudioAlbum, starred map[string]string) []map[string]any {
 	wanted := map[string]bool{}
 	for _, ref := range album.SubjectRefs {
 		wanted[ref] = true
@@ -301,7 +303,7 @@ func songsForAlbum(tracks []command.AudioTrack, album command.AudioAlbum) []map[
 	songs := make([]map[string]any, 0, len(album.SubjectRefs))
 	for _, track := range tracks {
 		if wanted[track.SubjectRef] {
-			songs = append(songs, songPayload(track))
+			songs = append(songs, songPayloadWithStar(track, starred[track.SubjectRef]))
 		}
 	}
 	return songs

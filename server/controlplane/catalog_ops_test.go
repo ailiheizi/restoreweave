@@ -35,14 +35,7 @@ func TestIndexLossDegradesSearchOnly(t *testing.T) {
 		t.Fatalf("write fixture: %v", err)
 	}
 
-	ingested := dispatcher.Handle(ctx, mustEnvelope(t, command.OpPlanIngest, map[string]any{"root": root}))
-	if ingested.Status != command.StatusSucceeded {
-		t.Fatalf("ingest = %q: %+v", ingested.Status, ingested.Reasons)
-	}
-	var ingestData command.PlanIngestData
-	if err := json.Unmarshal(ingested.Data, &ingestData); err != nil {
-		t.Fatalf("decode ingest: %v", err)
-	}
+	ingestData := mustAppliedIngest(t, ctx, dispatcher, map[string]any{"root": root})
 
 	listed := dispatcher.Handle(ctx, mustEnvelope(t, command.OpNamespaceList, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
@@ -107,6 +100,12 @@ func TestIndexLossDegradesSearchOnly(t *testing.T) {
 	if len(searchData.Hits) != 1 || searchData.Hits[0].SubjectRef != fileID {
 		t.Fatalf("search hits = %+v", searchData.Hits)
 	}
+	if searchData.Dimension != search.DimensionLexical || searchData.Provider != search.ProviderLexicalFTS5 {
+		t.Fatalf("search provenance = %+v", searchData)
+	}
+	if searchData.GenerationID == "" || searchData.ScoreSemantics != search.ScoreLexicalRank {
+		t.Fatalf("search generation/score = %+v", searchData)
+	}
 
 	taggedHits := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
@@ -116,7 +115,7 @@ func TestIndexLossDegradesSearchOnly(t *testing.T) {
 		t.Fatalf("search tag = %q: %+v", taggedHits.Status, taggedHits.Reasons)
 	}
 
-	generation, err := store.LatestIndexGeneration(ctx, ingestData.WorkspaceID)
+	generation, err := store.LatestIndexGeneration(ctx, ingestData.WorkspaceID, search.DimensionLexical)
 	if err != nil {
 		t.Fatalf("latest generation: %v", err)
 	}
@@ -193,13 +192,7 @@ func TestIndexLossDegradesSearchOnly(t *testing.T) {
 		t.Fatalf("verify after index loss = %q: %+v", verified.Status, verified.Reasons)
 	}
 	dest := filepath.Join(t.TempDir(), "out")
-	restored := dispatcher.Handle(ctx, mustEnvelope(t, command.OpPlanRestore, map[string]any{
-		"snapshot_ref": ingestData.SnapshotRef,
-		"destination":  dest,
-	}))
-	if restored.Status != command.StatusSucceeded {
-		t.Fatalf("restore after index loss = %q: %+v", restored.Status, restored.Reasons)
-	}
+	mustAppliedRestore(t, ctx, dispatcher, ingestData.WorkspaceID, ingestData.SnapshotRef, dest)
 	got, err := os.ReadFile(filepath.Join(dest, "docs", "quarterly-report.txt"))
 	if err != nil {
 		t.Fatalf("read restored file: %v", err)
@@ -273,5 +266,238 @@ func TestAnnotationRevisionConflict(t *testing.T) {
 	}
 	if got.Body != "first" || got.Revision != 1 {
 		t.Fatalf("annotation mutated on conflict: %+v", got)
+	}
+}
+
+func TestAnnotationImportConflictPolicy(t *testing.T) {
+	store := testutil.OpenStore(t, filepath.Join(t.TempDir(), "catalog.sqlite"))
+	repo, err := repository.OpenDir(filepath.Join(t.TempDir(), "repository"))
+	if err != nil {
+		t.Fatalf("open repository: %v", err)
+	}
+	dispatcher := NewDispatcher(store, "catalog.sqlite", "/tmp/rw.sock", WithExact(&exact.Service{
+		Store: store,
+		Repo:  repo,
+	}))
+	seed := testutil.SeedNamespace(t, store)
+	created := dispatcher.Handle(context.Background(), mustEnvelope(t, command.OpAnnotationUpsert, map[string]any{
+		"workspace_id": seed.WorkspaceID,
+		"subject_ref":  seed.FileEntryID,
+		"kind":         "NOTE",
+		"body":         "local",
+	}))
+	if created.Status != command.StatusSucceeded {
+		t.Fatalf("create = %q: %+v", created.Status, created.Reasons)
+	}
+	var local command.AnnotationUpsertData
+	if err := json.Unmarshal(created.Data, &local); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	fork := command.AnnotationExportData{
+		Schema: command.AnnotationBundleSchema,
+		Annotations: []command.AnnotationData{{
+			ID:          local.Annotation.ID,
+			WorkspaceID: seed.WorkspaceID,
+			SubjectRef:  seed.FileEntryID,
+			Kind:        "NOTE",
+			Body:        "imported",
+			Revision:    9,
+		}},
+	}
+
+	fail := dispatcher.Handle(context.Background(), mustEnvelope(t, command.OpAnnotationImport, fork))
+	if fail.Status != command.StatusFailed || !hasReasonCode(fail, ReasonCodeConflict) {
+		t.Fatalf("default import = %q: %+v", fail.Status, fail.Reasons)
+	}
+	still, err := store.GetAnnotation(context.Background(), seed.WorkspaceID, local.Annotation.ID)
+	if err != nil || still.Body != "local" || still.Revision != 1 {
+		t.Fatalf("fail policy mutated local: %+v %v", still, err)
+	}
+
+	fork.Conflict = command.AnnotationConflictKeepLocal
+	keep := dispatcher.Handle(context.Background(), mustEnvelope(t, command.OpAnnotationImport, fork))
+	if keep.Status != command.StatusSucceeded {
+		t.Fatalf("keep-local = %q: %+v", keep.Status, keep.Reasons)
+	}
+	kept, err := store.GetAnnotation(context.Background(), seed.WorkspaceID, local.Annotation.ID)
+	if err != nil || kept.Body != "local" || kept.Revision != 1 {
+		t.Fatalf("keep-local changed local: %+v %v", kept, err)
+	}
+
+	fork.Conflict = command.AnnotationConflictKeepImported
+	take := dispatcher.Handle(context.Background(), mustEnvelope(t, command.OpAnnotationImport, fork))
+	if take.Status != command.StatusSucceeded {
+		t.Fatalf("keep-imported = %q: %+v", take.Status, take.Reasons)
+	}
+	updated, err := store.GetAnnotation(context.Background(), seed.WorkspaceID, local.Annotation.ID)
+	if err != nil || updated.Body != "imported" || updated.Revision != 2 {
+		t.Fatalf("keep-imported = %+v %v", updated, err)
+	}
+}
+
+func TestSearchQueryDimensions(t *testing.T) {
+	ctx := context.Background()
+	store := testutil.OpenStore(t, filepath.Join(t.TempDir(), "catalog.sqlite"))
+	repo, err := repository.OpenDir(filepath.Join(t.TempDir(), "repository"))
+	if err != nil {
+		t.Fatalf("open repository: %v", err)
+	}
+	dispatcher := NewDispatcher(store, "catalog.sqlite", "/tmp/rw.sock", WithExact(&exact.Service{
+		Store: store,
+		Repo:  repo,
+	}))
+
+	caps := dispatcher.Handle(ctx, mustEnvelope(t, command.OpCapabilityList, map[string]any{}))
+	if caps.Status != command.StatusSucceeded {
+		t.Fatalf("capability.list = %q: %+v", caps.Status, caps.Reasons)
+	}
+	var capData command.CapabilityListData
+	if err := json.Unmarshal(caps.Data, &capData); err != nil {
+		t.Fatalf("decode capabilities: %v", err)
+	}
+	states := map[string]string{}
+	for _, capability := range capData.Capabilities {
+		states[capability.Kind+":"+capability.ID] = capability.State
+	}
+	if states["index-dimension:"+search.DimensionLexical] != command.CapabilityAvailable {
+		t.Fatalf("lexical dimension = %q, want AVAILABLE", states["index-dimension:"+search.DimensionLexical])
+	}
+	if states["index-dimension:"+search.DimensionAcoustic] != command.CapabilityUnavailable {
+		t.Fatalf("acoustic dimension = %q, want UNAVAILABLE without fixture opt-in", states["index-dimension:"+search.DimensionAcoustic])
+	}
+	if states["index-dimension:"+search.DimensionSemantic] != command.CapabilityUnavailable {
+		t.Fatalf("semantic dimension = %q, want UNAVAILABLE without a real provider", states["index-dimension:"+search.DimensionSemantic])
+	}
+	if states["index-dimension:"+search.DimensionGraph] != command.CapabilityAvailable {
+		t.Fatalf("graph dimension = %q, want AVAILABLE", states["index-dimension:"+search.DimensionGraph])
+	}
+	if states["query-broker:"+search.ProviderBrokerFuse] != command.CapabilityAvailable {
+		t.Fatalf("fuse broker = %q, want AVAILABLE", states["query-broker:"+search.ProviderBrokerFuse])
+	}
+
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "docs"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "docs", "quarterly-report.txt"), []byte("quarterly experiment report"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	ingestData := mustAppliedIngest(t, ctx, dispatcher, map[string]any{"root": root})
+
+	listed := dispatcher.Handle(ctx, mustEnvelope(t, command.OpNamespaceList, map[string]any{
+		"workspace_id": ingestData.WorkspaceID,
+		"root_id":      ingestData.RootID,
+	}))
+	var listData command.NamespaceListData
+	if err := json.Unmarshal(listed.Data, &listData); err != nil {
+		t.Fatalf("decode namespace list: %v", err)
+	}
+	var docsID string
+	for _, entry := range listData.Entries {
+		if entry.DisplayName == "docs" {
+			docsID = entry.ID
+		}
+	}
+	children := dispatcher.Handle(ctx, mustEnvelope(t, command.OpNamespaceList, map[string]any{
+		"workspace_id": ingestData.WorkspaceID,
+		"root_id":      ingestData.RootID,
+		"parent_id":    docsID,
+	}))
+	var childrenData command.NamespaceListData
+	if err := json.Unmarshal(children.Data, &childrenData); err != nil {
+		t.Fatalf("decode children: %v", err)
+	}
+	var fileID string
+	for _, entry := range childrenData.Entries {
+		if entry.DisplayName == "quarterly-report.txt" {
+			fileID = entry.ID
+		}
+	}
+	if fileID == "" {
+		t.Fatalf("quarterly-report.txt missing: %+v", childrenData.Entries)
+	}
+	tagged := dispatcher.Handle(ctx, mustEnvelope(t, command.OpAnnotationUpsert, map[string]any{
+		"workspace_id": ingestData.WorkspaceID,
+		"subject_ref":  fileID,
+		"kind":         "TAG",
+		"body":         "reviewed",
+	}))
+	if tagged.Status != command.StatusSucceeded {
+		t.Fatalf("tag = %q: %+v", tagged.Status, tagged.Reasons)
+	}
+
+	unknown := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
+		"workspace_id": ingestData.WorkspaceID,
+		"query":        "quarterly",
+		"dimension":    "not-a-dimension",
+	}))
+	if unknown.Status != command.StatusFailed || !hasReasonCode(unknown, ReasonCodeInvalidInput) {
+		t.Fatalf("unknown dimension = %q: %+v", unknown.Status, unknown.Reasons)
+	}
+
+	badAxis := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
+		"workspace_id":   ingestData.WorkspaceID,
+		"query":          "quarterly",
+		"construct_axes": []string{"lyrics"},
+	}))
+	if badAxis.Status != command.StatusFailed || !hasReasonCode(badAxis, ReasonCodeInvalidInput) {
+		t.Fatalf("unknown axis = %q: %+v", badAxis.Status, badAxis.Reasons)
+	}
+
+	acoustic := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
+		"workspace_id": ingestData.WorkspaceID,
+		"query":        map[string]any{"text": "quarterly", "dimension": search.DimensionAcoustic},
+	}))
+	if acoustic.Status != command.StatusDegraded || !hasReasonCode(acoustic, ReasonCodeUnavailable) {
+		t.Fatalf("acoustic search = %q reasons=%+v", acoustic.Status, acoustic.Reasons)
+	}
+	var acousticData command.SearchQueryData
+	if err := json.Unmarshal(acoustic.Data, &acousticData); err != nil {
+		t.Fatalf("decode acoustic: %v", err)
+	}
+	if acousticData.Dimension != search.DimensionAcoustic || len(acousticData.Hits) != 0 {
+		t.Fatalf("acoustic payload = %+v", acousticData)
+	}
+
+	tagsOnly := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
+		"workspace_id":   ingestData.WorkspaceID,
+		"query":          "reviewed",
+		"construct_axes": []string{"tags"},
+	}))
+	if tagsOnly.Status != command.StatusSucceeded {
+		t.Fatalf("tags-only search = %q: %+v", tagsOnly.Status, tagsOnly.Reasons)
+	}
+	var tagsData command.SearchQueryData
+	if err := json.Unmarshal(tagsOnly.Data, &tagsData); err != nil {
+		t.Fatalf("decode tags-only: %v", err)
+	}
+	if tagsData.Dimension != search.DimensionLexical || len(tagsData.Hits) != 1 || tagsData.Hits[0].SubjectRef != fileID {
+		t.Fatalf("tags-only hits = %+v", tagsData)
+	}
+	if len(tagsData.ConstructAxes) != 1 || tagsData.ConstructAxes[0] != search.AxisTags {
+		t.Fatalf("tags-only axes = %v", tagsData.ConstructAxes)
+	}
+
+	extractedOnly := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
+		"workspace_id":   ingestData.WorkspaceID,
+		"query":          "reviewed",
+		"construct_axes": []string{"extracted"},
+	}))
+	if extractedOnly.Status != command.StatusSucceeded {
+		t.Fatalf("extracted-only search = %q: %+v", extractedOnly.Status, extractedOnly.Reasons)
+	}
+	var extractedData command.SearchQueryData
+	if err := json.Unmarshal(extractedOnly.Data, &extractedData); err != nil {
+		t.Fatalf("decode extracted-only: %v", err)
+	}
+	if len(extractedData.Hits) != 0 {
+		t.Fatalf("extracted-only reviewed hits = %+v", extractedData.Hits)
+	}
+
+	verified := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSnapshotVerify, map[string]any{
+		"snapshot_ref": ingestData.SnapshotRef,
+	}))
+	if verified.Status != command.StatusSucceeded {
+		t.Fatalf("verify after dimension queries = %q: %+v", verified.Status, verified.Reasons)
 	}
 }

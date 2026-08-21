@@ -25,20 +25,31 @@ import (
 // It only reads the rebuildable SQLite projection; it never fabricates success
 // for operations that have no implementation in this build.
 type Dispatcher struct {
-	store         *sqlite.Store
-	catalogPath   string
-	socketPath    string
-	now           func() time.Time
-	exact         *exact.Service
-	search        *search.Indexer
-	sessions      *contentSessions
-	access        *access.Service
-	implemented   map[string]bool
-	unimplemented []string
+	store             *sqlite.Store
+	catalogPath       string
+	socketPath        string
+	configDigest      string
+	now               func() time.Time
+	exact             *exact.Service
+	search            *search.Indexer
+	fixtureDimensions bool
+	sessions          *contentSessions
+	access            *access.Service
+	recoveryReader    *recoveryReaderState
+	implemented       map[string]bool
+	unimplemented     []string
 }
 
 // DispatcherOption configures optional exact-lane handlers.
 type DispatcherOption func(*Dispatcher)
+
+// WithConfigDigest binds the resolved, redacted operator profile to status,
+// plans, and publications without exposing credential material.
+func WithConfigDigest(digest string) DispatcherOption {
+	return func(d *Dispatcher) {
+		d.configDigest = strings.TrimSpace(digest)
+	}
+}
 
 // WithExact enables capture-qualified ingest, snapshot list/diff/verify,
 // recovery.export, and catalog-free restore when a repository-backed exact
@@ -46,6 +57,15 @@ type DispatcherOption func(*Dispatcher)
 func WithExact(service *exact.Service) DispatcherOption {
 	return func(d *Dispatcher) {
 		d.exact = service
+	}
+}
+
+// WithFixtureDimensions enables deterministic acoustic/embedding fixtures for
+// tests and qualification harnesses. It does not represent the production
+// local BGE+zvec capability; the real provider must replace this wiring.
+func WithFixtureDimensions() DispatcherOption {
+	return func(d *Dispatcher) {
+		d.fixtureDimensions = true
 	}
 }
 
@@ -68,12 +88,22 @@ func WithExactDir(store *sqlite.Store, repoDir string) (DispatcherOption, error)
 func NewDispatcher(store *sqlite.Store, catalogPath, socketPath string, opts ...DispatcherOption) *Dispatcher {
 	implemented := map[string]bool{
 		command.OpStatusGet:          true,
+		command.OpDoctorCheck:        true,
 		command.OpCapabilityList:     true,
 		command.OpNamespaceList:      true,
 		command.OpNamespaceResolve:   true,
 		command.OpNamespaceStat:      true,
 		command.OpNamespaceReadlink:  true,
 		command.OpRepresentationList: true,
+		command.OpPlanGet:            true,
+		command.OpPlanApply:          true,
+		command.OpPlanRevise:         true,
+		command.OpPlanAbandon:        true,
+		command.OpJobEvents:          true,
+		command.OpJobCancel:          true,
+		command.OpDescriptionList:    true,
+		command.OpDescriptionGet:     true,
+		command.OpDescriptionCreate:  true,
 	}
 	dispatcher := &Dispatcher{
 		store:       store,
@@ -94,6 +124,16 @@ func NewDispatcher(store *sqlite.Store, catalogPath, socketPath string, opts ...
 		implemented[command.OpSnapshotDiff] = true
 		implemented[command.OpSnapshotVerify] = true
 		implemented[command.OpRecoveryExport] = true
+		implemented[command.OpRecoveryAnchorExport] = true
+		implemented[command.OpRecoveryImport] = true
+		implemented[command.OpRecoveryTokenExport] = true
+		implemented[command.OpExportPlan] = true
+		implemented[command.OpExportApply] = true
+		implemented[command.OpExportVerify] = true
+		implemented[command.OpViewSave] = true
+		implemented[command.OpViewGet] = true
+		implemented[command.OpViewEvaluate] = true
+		implemented[command.OpViewList] = true
 		implemented[command.OpAnnotationList] = true
 		implemented[command.OpAnnotationUpsert] = true
 		implemented[command.OpAnnotationDelete] = true
@@ -106,9 +146,13 @@ func NewDispatcher(store *sqlite.Store, catalogPath, socketPath string, opts ...
 		if dispatcher.search == nil && dispatcher.exact.Repo != nil {
 			dir := filepath.Join(dispatcher.exact.Repo.Root(), "indexes")
 			dispatcher.search = &search.Indexer{
-				Store:  store,
-				Engine: &search.Engine{Dir: dir},
+				Store:                   store,
+				Engine:                  &search.Engine{Dir: dir},
+				EnableFixtureDimensions: dispatcher.fixtureDimensions,
 			}
+		}
+		if dispatcher.search != nil && dispatcher.fixtureDimensions {
+			dispatcher.search.EnableFixtureDimensions = true
 		}
 		if dispatcher.exact.Indexer == nil {
 			dispatcher.exact.Indexer = dispatcher.search
@@ -147,9 +191,17 @@ func (d *Dispatcher) Handle(ctx context.Context, raw command.Envelope) command.R
 	if err != nil {
 		return failedRawResult(raw, started, newReason(ReasonCodeInvalidRequest, err.Error()))
 	}
+	if !d.implemented[env.Operation] {
+		if command.IsKnown(env.Operation) {
+			return unimplementedResult(env, started)
+		}
+		return unknownOperationResult(env, started)
+	}
 	switch env.Operation {
 	case command.OpStatusGet:
 		return d.handleStatusGet(ctx, env, started)
+	case command.OpDoctorCheck:
+		return d.handleDoctorCheck(ctx, env, started)
 	case command.OpCapabilityList:
 		return d.handleCapabilityList(env, started)
 	case command.OpNamespaceList:
@@ -164,6 +216,24 @@ func (d *Dispatcher) Handle(ctx context.Context, raw command.Envelope) command.R
 		return d.handleRepresentationList(ctx, env, started)
 	case command.OpPlanIngest:
 		return d.handlePlanIngest(ctx, env, started)
+	case command.OpPlanGet:
+		return d.handlePlanGet(ctx, env, started)
+	case command.OpPlanApply:
+		return d.handlePlanApply(ctx, env, started)
+	case command.OpPlanRevise:
+		return d.handlePlanRevise(ctx, env, started)
+	case command.OpPlanAbandon:
+		return d.handlePlanAbandon(ctx, env, started)
+	case command.OpJobEvents:
+		return d.handleJobEvents(ctx, env, started)
+	case command.OpJobCancel:
+		return d.handleJobCancel(ctx, env, started)
+	case command.OpDescriptionList:
+		return d.handleDescriptionList(ctx, env, started)
+	case command.OpDescriptionGet:
+		return d.handleDescriptionGet(ctx, env, started)
+	case command.OpDescriptionCreate:
+		return d.handleDescriptionCreate(ctx, env, started)
 	case command.OpPlanRestore:
 		return d.handlePlanRestore(ctx, env, started)
 	case command.OpSnapshotList:
@@ -174,6 +244,26 @@ func (d *Dispatcher) Handle(ctx context.Context, raw command.Envelope) command.R
 		return d.handleSnapshotVerify(ctx, env, started)
 	case command.OpRecoveryExport:
 		return d.handleRecoveryExport(ctx, env, started)
+	case command.OpRecoveryAnchorExport:
+		return d.handleRecoveryAnchorExport(ctx, env, started)
+	case command.OpRecoveryImport:
+		return d.handleRecoveryImport(ctx, env, started)
+	case command.OpRecoveryTokenExport:
+		return d.handleRecoveryTokenExport(ctx, env, started)
+	case command.OpViewSave:
+		return d.handleViewSave(ctx, env, started)
+	case command.OpViewGet:
+		return d.handleViewGet(ctx, env, started)
+	case command.OpViewEvaluate:
+		return d.handleViewEvaluate(ctx, env, started)
+	case command.OpViewList:
+		return d.handleViewList(ctx, env, started)
+	case command.OpExportPlan:
+		return d.handleExportPlan(ctx, env, started)
+	case command.OpExportApply:
+		return d.handleExportApply(ctx, env, started)
+	case command.OpExportVerify:
+		return d.handleExportVerify(ctx, env, started)
 	case command.OpAnnotationList:
 		return d.handleAnnotationList(ctx, env, started)
 	case command.OpAnnotationUpsert:
@@ -192,10 +282,6 @@ func (d *Dispatcher) Handle(ctx context.Context, raw command.Envelope) command.R
 		return d.handleContentRead(ctx, env, started)
 	case command.OpContentClose:
 		return d.handleContentClose(ctx, env, started)
-	case command.OpGatewayMount:
-		return d.handleGatewayMount(ctx, env, started)
-	case command.OpGatewayUnmount:
-		return d.handleGatewayUnmount(ctx, env, started)
 	case command.OpAudioList:
 		return d.handleAudioList(ctx, env, started)
 	case command.OpBooksList:
@@ -220,7 +306,8 @@ func (d *Dispatcher) handleStatusGet(ctx context.Context, env command.Envelope, 
 		catalogOK = false
 	}
 	data := command.StatusData{
-		Controller: "restoreweaved",
+		Controller:   "restoreweaved",
+		ConfigDigest: d.configDigest,
 		Catalog: command.CatalogStatus{
 			Path: d.catalogPath,
 			OK:   catalogOK,
@@ -231,6 +318,60 @@ func (d *Dispatcher) handleStatusGet(ctx context.Context, env command.Envelope, 
 		},
 		Listen:        d.socketPath,
 		Unimplemented: d.unimplemented,
+	}
+	if pubs, err := d.store.ListPublications(ctx); err == nil {
+		data.Publications = len(pubs)
+	}
+	if count, err := d.store.CountPlans(ctx); err == nil {
+		data.Plans = count
+	}
+	if plans, err := d.store.ListRecentPlans(ctx, 8); err == nil {
+		recent := make([]command.PlanSummary, 0, len(plans))
+		for _, plan := range plans {
+			recent = append(recent, command.PlanSummary{
+				PlanID:      plan.ID,
+				WorkspaceID: plan.WorkspaceID,
+				Kind:        plan.Kind,
+				State:       string(plan.State),
+				PlanDigest:  plan.PlanDigest,
+				CreatedAt:   plan.CreatedAt.UTC().Format(time.RFC3339),
+			})
+		}
+		data.RecentPlans = recent
+	}
+	if count, err := d.store.CountJobs(ctx); err == nil {
+		data.Jobs = count
+	}
+	if jobs, err := d.store.ListRecentJobs(ctx, 8); err == nil {
+		recent := make([]command.JobSummary, 0, len(jobs))
+		for _, job := range jobs {
+			recent = append(recent, command.JobSummary{
+				JobID:       job.ID,
+				WorkspaceID: job.WorkspaceID,
+				PlanID:      job.PlanID,
+				Kind:        job.Kind,
+				State:       string(job.State),
+				UpdatedAt:   job.UpdatedAt.UTC().Format(time.RFC3339),
+			})
+		}
+		data.RecentJobs = recent
+	}
+	if d.sessions != nil {
+		data.ReapedHandles = d.sessions.sweep(time.Now())
+		data.OpenHandles = d.sessions.len()
+	}
+	if d.exact != nil && d.exact.Repo != nil {
+		profile := repository.DescribeProfile(d.exact.Repo)
+		repo := &command.RepositoryStatus{
+			Path: d.exact.Repo.Root(), RepositoryProfile: profile.Repository,
+			CompressionProfile: profile.Compression, OK: true,
+		}
+		if manifests, err := d.exact.ListSnapshots(ctx); err != nil {
+			repo.OK = false
+		} else {
+			repo.Snapshots = len(manifests)
+		}
+		data.Repository = repo
 	}
 	return succeeded(env, started, data)
 }
@@ -267,6 +408,29 @@ func (d *Dispatcher) handleCapabilityList(env command.Envelope, started time.Tim
 			Notes:   "host-owned suffix and magic-byte detector",
 		},
 	)
+	for _, dimension := range search.DeclaredDimensions(search.IndexerReadiness(d.search)) {
+		capabilities = append(capabilities, command.Capability{
+			Kind:    search.CapabilityKindDimension,
+			ID:      dimension.ID,
+			State:   dimension.State,
+			Version: dimension.Version,
+			Source:  dimension.Provider,
+			Notes:   dimension.Notes,
+		})
+	}
+	brokerState := command.CapabilityUnavailable
+	brokerNotes := "host-owned fusion broker; unavailable until the exact lane wires a search indexer"
+	if d.search != nil {
+		brokerState = command.CapabilityAvailable
+		brokerNotes = "fuses separately generation-pinned QueryProvider results; does not invent a hybrid score"
+	}
+	capabilities = append(capabilities, command.Capability{
+		Kind:    search.CapabilityKindBroker,
+		ID:      search.ProviderBrokerFuse,
+		State:   brokerState,
+		Version: "1",
+		Notes:   brokerNotes,
+	})
 	return succeeded(env, started, command.CapabilityListData{Capabilities: capabilities})
 }
 

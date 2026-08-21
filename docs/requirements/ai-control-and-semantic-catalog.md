@@ -9,7 +9,7 @@ AI participates through two ordinary boundaries:
 1. A bounded `Processor` may classify, extract, caption, transcribe, embed, compare, or enrich content.
 2. An external harness may call the same typed CLI or local MCP operations available to scripts and other clients.
 
-The storage product remains useful when both boundaries are unused. It must still ingest, reduce storage, preserve a recoverable filesystem view, and support path, filename, type, metadata, tag, note, and available extracted-text discovery.
+Exact ingest, storage, verification, restore, and lexical/structured degraded discovery remain useful when learned processors are unavailable. A qualified `RW-MVP-1` default discovery installation nevertheless includes the pinned local text-embedding processor and zvec generation; disabling them is an explicit degraded state, not an alternate completed default.
 
 This is the operator-facing catalog, annotation, and AI-authority profile. Provider capability schemas, semantic artifact envelopes, lifecycle identifiers, feature-space identity, index-generation protocol, and query wire contracts are defined by [External AI and Semantic Extension Requirements](external-ai-and-semantic-extensions.md). Processor mechanics are defined by [Extension System Requirements](plugin-system.md) and [Driver and Processor Interface Requirements](driver-and-processor-interfaces.md). Client transport behavior is defined by [CLI and MCP Contract](cli-and-mcp-contract.md).
 
@@ -29,9 +29,9 @@ RestoreWeave discovery has three layers with different durability:
 
 Search, catalog views, and AI answers reference stable `SubjectRef` values. They MUST NOT make an index document ID, vector row ID, display path, filename, repository object key, or model output the identity of a file.
 
-## 3. Baseline discovery before embeddings
+## 3. Lexical and structured degradation baseline
 
-The reference self-hosted distribution MUST ship useful discovery without an AI model or vector database. At minimum it supports:
+The reference self-hosted distribution MUST ship the pinned local semantic profile plus lexical and structured discovery. Exact storage and recovery remain useful without that derivative state. At minimum it supports:
 
 - Namespace path and filename token search.
 - Exact and prefix filters for type, suffix, selected format, and content class.
@@ -46,7 +46,7 @@ This baseline is a real product feature, not a placeholder for later semantic se
 
 ## 4. Operator annotations and machine suggestions
 
-`RW-MVP-1` supports durable whole-subject tags and plain-text notes. Later catalog profiles may add ratings, corrections, aliases, descriptions, collections, relationships, and typed segments such as a page, time range, image region, archive member, source symbol, or media track.
+`RW-MVP-1` supports durable whole-subject tags, plain-text notes, versioned `DescriptionDocument` revisions, and source-aligned `SemanticSegment` records. AI description generation is optional and on-demand; user-authored and imported descriptions do not depend on a model. Later catalog profiles may add ratings, corrections, aliases, collections, relationships, and richer typed segments such as a page, time range, image region, archive member, source symbol, or media track.
 
 Operator-authored semantics are durable user data. They MUST:
 
@@ -87,7 +87,7 @@ A local model is not inherently trusted, and a remote model is not inherently fo
 
 ## 6. Embedding and CLIP product behavior
 
-Embeddings and CLIP-compatible features are optional later capabilities, not prerequisites for ingest or baseline search.
+The default local text embeddings are part of the first discovery profile. CLIP-compatible features and additional embedding spaces remain optional later capabilities and are not prerequisites for exact ingest or recovery.
 
 Embedding generation is a processor capability. An `IndexProvider` consumes its versioned feature artifacts into a named rebuildable generation, and a `QueryProvider` queries that named generation. Exact feature-space identity and compatibility follow the external-extension requirements.
 
@@ -171,7 +171,7 @@ The UI and machine results MUST NOT describe a file as lost merely because a sem
 
 ## 12. Acceptance criteria
 
-1. A fresh self-hosted installation can ingest, deduplicate, browse, restore, mutate durable tags/notes through CLI, and search metadata, annotations, and extracted text without an LLM or embedding model.
+1. A fresh self-hosted installation can ingest, deduplicate, browse, restore, mutate durable tags/notes through CLI, and search metadata, annotations, extracted text, and local semantic embeddings through the bundled profile. Disabling the semantic derivative leaves exact recovery operational but is a degraded installation.
 2. Operator annotations, processor suggestions, and external metadata remain separately attributable and versioned.
 3. AI processors cannot broaden scope, approve destructive work, publish recovery truth, or mark their own output verified.
 4. An embedding record identifies its model, preprocessing, feature schema, source revision, and lineage.

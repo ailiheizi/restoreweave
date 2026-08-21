@@ -1,10 +1,10 @@
 # Experience Completion Plan
 
-> **Status:** Informative implementation plan, recorded 2026-08-14. This document does not add product requirements, select a release repository engine, or make a WebUI / player / reader part of `RW-MVP-1`. Authority stays in the existing requirement set. Open-source introduction order stays in [Whole-Architecture Open-Source Reference](architecture-open-source-reference.md). Darwin/Linux engineering gates stay in [Implementation Completion Plan](implementation-completion-plan.md).
+> **Status:** Archived optional-adapter experiment, reclassified 2026-08-19. D1–D5 record interface and request-sequence harness coverage only; they are not a completed user experience, live-client qualification, or `RW-MVP-1` progress. D6 is a closed non-goal, not a completed feature. All adapter feature work is maintenance-only until [Core MVP Execution Plan](core-mvp-execution-plan.md) closes. This document adds no product requirement or release gate.
 
-The job is to finish the **experience introduction path** already decided: connect existing open-source clients through RestoreWeave-owned surfaces. Do not embed a media server. Do not wait for live FUSE to prove the catalog.
+This file now preserves the completed adapter experiments and their limits. It is not an active implementation queue. Do not embed a media server, extend these adapters ahead of core work, or wait for live FUSE to prove the catalog.
 
-## 1. What “complete” means
+## 1. What adapter evidence means
 
 Two proofs stay separate.
 
@@ -16,41 +16,47 @@ Two proofs stay separate.
 
 A phase is done only when the listed exit test is green. “Looks like Subsonic” is not an exit.
 
-## 2. Current checkout (2026-08-14, updated same day)
+## 2. Current checkout (2026-08-15)
+
+The D1–D5 harness experiments are closed to new feature work. Their coded tests cover only the listed adapter contracts. D6 records the decision not to build FUSE. None closes the core user loop, semantic default, export workflow, or release repository gate.
 
 Present:
 
-- Command ABI: ingest, search, tags/notes, `PROGRESS`, `audio.list`, `books.list`, `content.open`/`read`/`close`, verify, restore.
-- Optional loopback facade (`restoreweaved --facade-listen`): OpenSubsonic client-viable methods; OPDS navigation/search/pagination/acquire; `POST /opds/progress` JSON write-back; thin Inbox at `/inbox`.
-- IDs on the facade are `SubjectRef`. The facade calls the command ABI only.
-- Inbox item page can stream exact bytes and write `PROGRESS`. Verify/restore stay command-ABI calls.
+- Command ABI: ingest, search, tags/notes, `PROGRESS`, `audio.list`, `books.list`, bounded `content.open`/`read`/`close`, verify, restore preflight and write, `doctor.check`, `plan.get`/`apply`/`revise`/`abandon`, `job.events`/`job.cancel`, `snapshot.list`/`diff`/`verify`, `recovery.export`, `namespace.resolve`/`stat`/`readlink`, `annotation.export`/`import`.
+- Optional loopback facade (`restoreweaved --facade-listen`): OpenSubsonic client-viable methods; OPDS navigation/search/pagination/acquire; `POST /opds/progress` JSON write-back; thin Inbox at `/inbox` plus `/inbox/api/*` (status, search, item, preview, progress, verify, restore preflight/write, doctor, plan, job, snapshots, diff, annotations export/import, path resolve, recovery export).
+- IDs on the facade are `SubjectRef`. The facade calls the command ABI only. No fourth public REST catalog.
+- Inbox item page streams exact bytes and writes `PROGRESS`. Item JSON includes display path, `snapshot_ref`, representations, and annotations. Delete the page and CLI recovery still works.
+- D5 pin: this host’s Supersonic 0.22.1 method sequence is harness-covered (`TestD5PinnedSupersonicCallSequence`). XML artist/album lists emit Subsonic attributes (`name="…"`).
 - Namespace records carry source mtime/uid/gid. RestoreWeave does not own a FUSE server; foreign tools may mount a restored tree.
-- Fake directory CAS is still the in-tree driver.
+- Raw development CAS and the local-zstd candidate are the in-tree drivers. Release repository qualification is a separate gate, not an experience-path hole.
 
-Absent or later:
+Operator-only, not remaining product engineering:
 
-- Live client qualification (Feishin, DSub, KOReader, or equivalents) has not been run on this host.
-- KOReader’s private progress-sync protocol is not implemented; D2 ships RestoreWeave JSON progress, not that protocol.
+- Someone may point the installed Supersonic 0.22.1 GUI at the loopback facade and click login. The methods that GUI issues are already harness-green. Do not write a Feishin substitute.
+- No KOReader/DSub install on this host. KOReader’s private progress-sync protocol is not implemented; D2 ships RestoreWeave JSON progress, not that protocol.
+
+Later (not D1–D6):
+
 - Isolated Tika/ffprobe, NAS/S3, engine selection, video/release packaging. Live FUSE is a closed non-goal, not an absence.
 
 ## 3. Long sequence
 
-Engineering gates (Phase B) and this experience sequence run in parallel. Experience work must not wait for `/dev/fuse`. Experience work must not replace the fake CAS.
+This archived sequence is not an active parallel workstream. Existing adapter regressions may be maintained, but no new experience feature work starts until the Core MVP Execution Plan permits it. Nothing waits for `/dev/fuse`, and this document cannot select or promote a release repository.
 
 ```text
-D1  Client-viable OpenSubsonic
-D2  Client-viable OPDS
-D3  Thin Inbox shell over the command ABI
-D4  Item-page FileAccess preview + PROGRESS
-D5  Live client qualification
-D6  File egress via restore / FileAccess (not our FUSE)
-D7  Isolated processors and remaining repository gates
-D8  Later video / release packaging
+D1  OpenSubsonic adapter contract              adapter-harness-complete; maintenance-only
+D2  OPDS adapter contract                      adapter-harness-complete; maintenance-only
+D3  Thin Inbox shell                           implemented; no drop/attach/import workflow
+D4  Item-page preview/progress                 adapter-harness-complete; not a client product
+D5  Pinned request-sequence replay             adapter-harness-complete; live client not qualified
+D6  RestoreWeave FUSE                          closed non-goal
+D7  Isolated processors and remaining repository gates   later
+D8  Later video / release packaging            later
 ```
 
 ### D1 — Client-viable OpenSubsonic
 
-Status (2026-08-14): implemented in `server/internal/gateway/protocol` and covered by `TestProtocolFacadeUsesCommandABI` plus `TestExperienceSurfacesOverCommandABI`. Live Feishin/DSub login is still D5.
+Status (2026-08-19): **adapter-harness-complete; maintenance-only**. Implemented in `server/internal/gateway/protocol` and covered by `TestProtocolFacadeUsesCommandABI` plus `TestExperienceSurfacesOverCommandABI`. This is compatibility evidence, not a core product or live-client qualification.
 
 **Why first.** Feishin, DSub, and similar clients fail closed on missing search, cover, user, and playlist endpoints even when stream works.
 
@@ -69,7 +75,7 @@ Still out of D1: transcoding, multi-workspace, non-loopback bind, cover extracti
 
 ### D2 — Client-viable OPDS
 
-Status (2026-08-14): implemented. `/opds/search`, `start`/`count` pagination with `rel=next`, acquire, and `POST /opds/progress` JSON (`subject_ref`, `position_ms`, `completed`) write `PROGRESS` with `source=opds`. Covered by `TestExperienceSurfacesOverCommandABI`.
+Status (2026-08-19): **adapter-harness-complete; maintenance-only**. `/opds/search`, `start`/`count` pagination with `rel=next`, acquire, and `POST /opds/progress` JSON (`subject_ref`, `position_ms`, `completed`) write `PROGRESS` with `source=opds`. Covered by `TestExperienceSurfacesOverCommandABI`; no pinned live reader is qualified.
 
 | Piece | RestoreWeave meaning | Exit |
 | --- | --- | --- |
@@ -78,49 +84,49 @@ Status (2026-08-14): implemented. `/opds/search`, `start`/`count` pagination wit
 | Acquire | Existing `content.*` loop | Bytes match restore SHA-256 |
 | Progress | RestoreWeave JSON write-back on `/opds/progress` | Do not invent a private KOReader sync protocol in D2 |
 
-KOReader’s built-in progress sync is not OPDS. D2 ships acquire and a documented RestoreWeave progress POST. A KOReader-specific sync adapter is a D5 experiment, not a second catalog.
+KOReader’s built-in progress sync is not OPDS. D2 ships acquire and a documented RestoreWeave progress POST. A KOReader-specific sync adapter is a later experiment, not a second catalog.
 
 ### D3 — Thin Inbox shell
 
-Status (2026-08-14): implemented as embedded `inbox.html` at `/inbox` and `/inbox/api/*`. Not `RW-MVP-1` restore authority.
+Status (2026-08-19): **optional shell implemented; workflow incomplete and maintenance-only**. Embedded `inbox.html` at `/inbox` and `/inbox/api/*`. Item JSON walks `namespace.stat` for a display path and includes `snapshot_ref`, representations, and annotations. There is no Inbox drop/attach/import action; ingest still occurs through the CLI. The shell is not `RW-MVP-1` restore authority or completion evidence.
 
 Must have: triage/status, search, item detail (provenance, annotations, representations), verify, restore.
 
 Must not: open repository packs, open SQLite files, mutate the source tree, embed File Browser’s writable job.
 
-Exit: drop a mixed tree → find any item in the shell → restore original bytes. CLI-only recovery still works if the shell is deleted. Harness: `TestExperienceSurfacesOverCommandABI`.
+Harness scope: after a tree has already been ingested through the CLI, find an item in the shell and exercise the restore operations. CLI-only recovery still works if the shell is deleted. This does not prove a one-surface import-to-restore workflow.
 
 ### D4 — Item-page preview
 
-Status (2026-08-14): implemented. Audio preview streams exact `content.*` bytes; text/EPUB shows a short extract; the page writes `PROGRESS` through the same OPDS progress command.
+Status (2026-08-19): **adapter-harness-complete; maintenance-only**. Audio preview streams exact `content.*` bytes; text/EPUB shows a short extract; the page writes `PROGRESS` through the same OPDS progress command.
 
-Exit: play/read one admitted subject; `annotation.list` shows `PROGRESS`; exact restore still matches. Harness green. Browser `FileAccess` and a real `<audio>` session are not required for this exit.
+Harness evidence: fixture preview/read updates `PROGRESS`, and exact restore still matches. A real browser media session was deliberately not required, so this cannot be called client-experience qualification.
 
-### D5 — Live client qualification
+### D5 — Pinned request-sequence replay
 
-Status (2026-08-14): **harness only**. OpenSubsonic handshake/search/star/bookmark/stream and OPDS search/pagination/progress are covered in-process. Feishin, DSub, KOReader, or equivalents have not been run.
+Status (2026-08-19): **adapter-harness-complete; live client qualification not performed**. This host has Supersonic.app **0.22.1** (`io.github.supersonic-app.supersonic`). `TestD5PinnedSupersonicCallSequence` replays the expected XML methods. It is useful adapter regression evidence, but no GUI session, real library behavior, or pinned OPDS client has been qualified, and none is a core release gate.
 
-Pin one OpenSubsonic client and one OPDS client. Record version, the method they call, and failures.
+Pinned OPDS client: none installed. KOReader private sync stays out.
 
-Exit:
+Replay evidence (all green):
 
-1. Browse + stream/acquire a fixture library.
-2. Star or bookmark returns on a second client or via `annotation.list`.
+1. Browse + stream/acquire a fixture library — harness green for the pinned OpenSubsonic method sequence.
+2. Star or bookmark returns on a second client or via `annotation.list` — harness green for star → `annotation.list`.
 3. No second recovery authority (client DB loss does not lose RestoreWeave identity).
 
-Unverified until someone actually runs those clients. Absence of a NAS-forum survey remains a coverage gap.
+Keep the replay as regression coverage only. Do not turn live GUI qualification into core work and do not write a Feishin substitute. If a later adapter profile claims live-client support, it must define a separate qualification matrix rather than relabel this replay.
 
 ### D6 — File egress, not a RestoreWeave FUSE
 
-Status (2026-08-14, revised same day): **not a RestoreWeave product job.** Source `mod_time` / `uid` / `gid` already project into `NamespaceEntry` for our own records. We do not need a live `/dev/fuse` adapter, a VM, or macFUSE.
+Status (2026-08-15): **closed**. Not a RestoreWeave product job. Source `mod_time` / `uid` / `gid` already project into `NamespaceEntry` for our own records. We do not need a live `/dev/fuse` adapter, a VM, or macFUSE.
 
 Operators who want a mount use other tools (rclone, sshfs, the NAS SMB share, WebDAV helpers) against a restored directory or against exact `FileAccess` / `content.*` bytes. RestoreWeave owns identity, catalog, annotations, verify, and restore. It does not own the kernel filesystem illusion.
 
-The in-tree go-fuse adapter may remain unused. Do not spend further work qualifying it. Same-UID “point a media server at a mount” is not a catalog proof.
+The former in-tree go-fuse adapter, command ABI, CLI verbs, and dependency have been removed. Same-UID “point a media server at a mount” is not a catalog proof.
 
 ### D7 — Processors and repository
 
-Status (2026-08-14): **not started**. Not blocked on FUSE. Isolated Tika/libarchive/ffprobe need Linux bubblewrap only if they join the default pack; otherwise keep them out. Remaining Driver gates (independent SHA-256 readback, then NAS/S3) come before fake-CAS replacement. Cover-art extraction belongs here as an isolated processor, not as a new in-process ID3 picture parser. This Darwin session does not replace the fake CAS.
+Status (2026-08-19): **candidate foundation implemented; qualification open**. Not blocked on FUSE. Raw and local-zstd drivers pass independent SHA-256 readback; local zstd also passes compression, whole-file dedup, corruption, relocation, profile-isolation, and signed-restore tests. Encryption, chunking, GC/repair, corpus measurements, mature-engine qualification, and reader closure remain. Isolated Tika/libarchive/ffprobe need Linux bubblewrap only if they join the default pack; otherwise keep them out. Cover-art extraction belongs here as an isolated processor, not as a new in-process ID3 picture parser.
 
 ### D8 — Later
 
@@ -137,6 +143,7 @@ Status (2026-08-14): **not started**. Jellyfin-style APIs, video transcode, game
 | D6 | Closed: not a RestoreWeave FUSE job; see remaining-work-and-closed-decisions.md |
 | D7 | Completion plan Phase B + adoption default pack |
 | D8 | Completion plan Phase C items 4–5 |
+| Discovery beyond lexical | [Index Dimension Plan](index-dimension-plan.md) I1–I9 path is in tree. Facades stay on `search.query` |
 
 ## 5. What would reverse a row
 

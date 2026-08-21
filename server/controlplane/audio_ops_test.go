@@ -47,14 +47,7 @@ func TestAudioListAfterIngest(t *testing.T) {
 		t.Fatalf("write txt: %v", err)
 	}
 
-	ingested := dispatcher.Handle(ctx, mustEnvelope(t, command.OpPlanIngest, map[string]any{"root": root}))
-	if ingested.Status != command.StatusSucceeded {
-		t.Fatalf("ingest = %q: %+v", ingested.Status, ingested.Reasons)
-	}
-	var ingestData command.PlanIngestData
-	if err := json.Unmarshal(ingested.Data, &ingestData); err != nil {
-		t.Fatalf("decode ingest: %v", err)
-	}
+	ingestData := mustAppliedIngest(t, ctx, dispatcher, map[string]any{"root": root})
 
 	listed := dispatcher.Handle(ctx, mustEnvelope(t, command.OpAudioList, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
@@ -136,14 +129,7 @@ func TestAudioSubjectRangeRead(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "song.mp3"), payload, 0o644); err != nil {
 		t.Fatalf("write mp3: %v", err)
 	}
-	ingested := dispatcher.Handle(ctx, mustEnvelope(t, command.OpPlanIngest, map[string]any{"root": root}))
-	if ingested.Status != command.StatusSucceeded {
-		t.Fatalf("ingest = %q: %+v", ingested.Status, ingested.Reasons)
-	}
-	var ingestData command.PlanIngestData
-	if err := json.Unmarshal(ingested.Data, &ingestData); err != nil {
-		t.Fatalf("decode ingest: %v", err)
-	}
+	ingestData := mustAppliedIngest(t, ctx, dispatcher, map[string]any{"root": root})
 	listed := dispatcher.Handle(ctx, mustEnvelope(t, command.OpAudioList, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
 	}))

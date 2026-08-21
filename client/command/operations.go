@@ -1,43 +1,56 @@
 package command
 
 const (
-	OpStatusGet          = "status.get"
-	OpCapabilityList     = "capability.list"
-	OpSnapshotList       = "snapshot.list"
-	OpSnapshotDiff       = "snapshot.diff"
-	OpSnapshotVerify     = "snapshot.verify"
-	OpPlanIngest         = "plan.ingest"
-	OpPlanRevise         = "plan.revise"
-	OpPlanAbandon        = "plan.abandon"
-	OpPlanRestore        = "plan.restore"
-	OpPlanGet            = "plan.get"
-	OpPlanApply          = "plan.apply"
-	OpJobEvents          = "job.events"
-	OpJobCancel          = "job.cancel"
-	OpRecoveryExport     = "recovery.export"
-	OpNamespaceList      = "namespace.list"
-	OpNamespaceResolve   = "namespace.resolve"
-	OpNamespaceStat      = "namespace.stat"
-	OpNamespaceReadlink  = "namespace.readlink"
-	OpRepresentationList = "representation.list"
-	OpContentOpen        = "content.open"
-	OpContentRead        = "content.read"
-	OpContentClose       = "content.close"
-	OpAnnotationList     = "annotation.list"
-	OpAnnotationUpsert   = "annotation.upsert"
-	OpAnnotationDelete   = "annotation.delete"
-	OpAnnotationExport   = "annotation.export"
-	OpAnnotationImport   = "annotation.import"
-	OpSearchQuery        = "search.query"
-	OpGatewayMount       = "gateway.mount"
-	OpGatewayUnmount     = "gateway.unmount"
-	OpAudioList          = "audio.list"
-	OpBooksList          = "books.list"
+	OpStatusGet            = "status.get"
+	OpDoctorCheck          = "doctor.check"
+	OpCapabilityList       = "capability.list"
+	OpSnapshotList         = "snapshot.list"
+	OpSnapshotDiff         = "snapshot.diff"
+	OpSnapshotVerify       = "snapshot.verify"
+	OpPlanIngest           = "plan.ingest"
+	OpPlanRevise           = "plan.revise"
+	OpPlanAbandon          = "plan.abandon"
+	OpPlanRestore          = "plan.restore"
+	OpPlanGet              = "plan.get"
+	OpPlanApply            = "plan.apply"
+	OpJobEvents            = "job.events"
+	OpJobCancel            = "job.cancel"
+	OpRecoveryExport       = "recovery.export"
+	OpRecoveryAnchorExport = "recovery.anchor.export"
+	OpNamespaceList        = "namespace.list"
+	OpNamespaceResolve     = "namespace.resolve"
+	OpNamespaceStat        = "namespace.stat"
+	OpNamespaceReadlink    = "namespace.readlink"
+	OpRepresentationList   = "representation.list"
+	OpContentOpen          = "content.open"
+	OpContentRead          = "content.read"
+	OpContentClose         = "content.close"
+	OpAnnotationList       = "annotation.list"
+	OpAnnotationUpsert     = "annotation.upsert"
+	OpAnnotationDelete     = "annotation.delete"
+	OpAnnotationExport     = "annotation.export"
+	OpAnnotationImport     = "annotation.import"
+	OpSearchQuery          = "search.query"
+	OpAudioList            = "audio.list"
+	OpBooksList            = "books.list"
+	OpDescriptionList      = "description.list"
+	OpDescriptionGet       = "description.get"
+	OpDescriptionCreate    = "description.create"
+	OpRecoveryImport       = "recovery.import"
+	OpRecoveryTokenExport  = "recovery.token.export"
+	OpViewSave             = "view.save"
+	OpViewGet              = "view.get"
+	OpViewEvaluate         = "view.evaluate"
+	OpViewList             = "view.list"
+	OpExportPlan           = "export.plan"
+	OpExportApply          = "export.apply"
+	OpExportVerify         = "export.verify"
 )
 
 func KnownOperations() []string {
 	return []string{
 		OpStatusGet,
+		OpDoctorCheck,
 		OpCapabilityList,
 		OpSnapshotList,
 		OpSnapshotDiff,
@@ -51,6 +64,7 @@ func KnownOperations() []string {
 		OpJobEvents,
 		OpJobCancel,
 		OpRecoveryExport,
+		OpRecoveryAnchorExport,
 		OpNamespaceList,
 		OpNamespaceResolve,
 		OpNamespaceStat,
@@ -65,10 +79,20 @@ func KnownOperations() []string {
 		OpAnnotationExport,
 		OpAnnotationImport,
 		OpSearchQuery,
-		OpGatewayMount,
-		OpGatewayUnmount,
 		OpAudioList,
 		OpBooksList,
+		OpDescriptionList,
+		OpDescriptionGet,
+		OpDescriptionCreate,
+		OpRecoveryImport,
+		OpRecoveryTokenExport,
+		OpViewSave,
+		OpViewGet,
+		OpViewEvaluate,
+		OpViewList,
+		OpExportPlan,
+		OpExportApply,
+		OpExportVerify,
 	}
 }
 

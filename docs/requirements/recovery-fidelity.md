@@ -1,6 +1,6 @@
 # Recovery Fidelity Requirements
 
-> **Applicability:** The NAS-first managed-archive MVP publishes only exact source-byte recovery and preserves readable unknown or processor-failed content through exact fallback in one qualified mature repository. It also ships baseline path, metadata, checksum, duplicate, media-metadata, and extracted-text search whose results are discovery evidence rather than recovery claims. Normalized, perceptual, functional, semantic-substitution, and source-reacquisition outcomes remain future opt-in profiles, retained here so their validators and safety boundaries do not need to be reinvented later.
+> **Applicability:** The NAS-first managed-archive MVP publishes only exact source-byte recovery and preserves readable unknown or processor-failed content through exact fallback in one qualified mature repository. It ships lexical/structured discovery plus the bundled local text-semantic generation; every search result remains discovery evidence rather than a recovery claim. Normalized, perceptual, functional, semantic-substitution, additional semantic spaces, and source-reacquisition outcomes remain future opt-in profiles, retained here so their validators and safety boundaries do not need to be reinvented later.
 
 ## 1. Purpose
 
@@ -132,7 +132,7 @@ Embedding similarity, a summary, or an LLM judgment alone cannot issue this clai
 Subject: any searchable representation<br>
 Relation: MATCH_CANDIDATE
 
-`RW-MVP-1` uses this relation for subject-bound baseline catalog results over path, metadata, checksums, duplicate groups, qualified media metadata, and extracted text. Later providers may add CLIP similarity, audio embeddings, perceptual hashes, acoustic fingerprints, vector ranking, and semantic search scores through the same subject and index-generation model.
+`RW-MVP-1` uses this relation for subject-bound catalog results over path, metadata, checksums, duplicate groups, qualified media metadata, extracted text, and the bundled local text-embedding generation. Later providers may add CLIP similarity, audio embeddings, perceptual hashes, acoustic fingerprints, additional vector spaces, and semantic scores through the same subject and index-generation model.
 
 This claim may rank candidates for review. It is not a recovery success state.
 

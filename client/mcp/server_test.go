@@ -126,6 +126,71 @@ func TestToolsRoundTripOverPipes(t *testing.T) {
 		t.Fatalf("namespace.resolve text = %q", resolveText)
 	}
 
+	statResult, err := clientSession.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name: command.OpNamespaceStat,
+		Arguments: map[string]any{
+			"workspace_id": seed.WorkspaceID,
+			"entry_id":     seed.FileEntryID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("namespace.stat call: %v", err)
+	}
+	if statResult.IsError {
+		t.Fatalf("namespace.stat returned an error result")
+	}
+	if statText := contentText(t, statResult); !strings.Contains(statText, seed.FileEntryID) {
+		t.Fatalf("namespace.stat text = %q", statText)
+	}
+
+	readlinkResult, err := clientSession.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name: command.OpNamespaceReadlink,
+		Arguments: map[string]any{
+			"workspace_id": seed.WorkspaceID,
+			"entry_id":     seed.SymlinkEntryID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("namespace.readlink call: %v", err)
+	}
+	if readlinkResult.IsError {
+		t.Fatalf("namespace.readlink returned an error result")
+	}
+	if readlinkText := contentText(t, readlinkResult); !strings.Contains(readlinkText, seed.SymlinkEntryID) {
+		t.Fatalf("namespace.readlink text = %q", readlinkText)
+	}
+
+	snapshotResult, err := clientSession.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name:      command.OpSnapshotList,
+		Arguments: map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("snapshot.list call: %v", err)
+	}
+	if !snapshotResult.IsError {
+		t.Fatalf("snapshot.list must report the daemon's unimplemented outcome as an error result")
+	}
+	if snapshotText := contentText(t, snapshotResult); !strings.Contains(snapshotText, "unimplemented") {
+		t.Fatalf("snapshot.list text = %q", snapshotText)
+	}
+
+	openResult, err := clientSession.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name: command.OpContentOpen,
+		Arguments: map[string]any{
+			"workspace_id": seed.WorkspaceID,
+			"entry_id":     seed.FileEntryID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("content.open call: %v", err)
+	}
+	if !openResult.IsError {
+		t.Fatalf("content.open must report the daemon's unimplemented outcome as an error result")
+	}
+	if openText := contentText(t, openResult); !strings.Contains(openText, "unimplemented") {
+		t.Fatalf("content.open text = %q", openText)
+	}
+
 	representationResult, err := clientSession.CallTool(ctx, &mcpsdk.CallToolParams{
 		Name: command.OpRepresentationList,
 		Arguments: map[string]any{
@@ -252,17 +317,7 @@ func TestAudioListMCPAfterIngest(t *testing.T) {
 	}), 0o644); err != nil {
 		t.Fatalf("write mp3: %v", err)
 	}
-	ingested := dispatcher.Handle(ctx, command.Envelope{
-		Operation: command.OpPlanIngest,
-		Input:     mustJSON(t, map[string]any{"root": root}),
-	})
-	if ingested.Status != command.StatusSucceeded {
-		t.Fatalf("ingest = %q: %+v", ingested.Status, ingested.Reasons)
-	}
-	var ingestData command.PlanIngestData
-	if err := json.Unmarshal(ingested.Data, &ingestData); err != nil {
-		t.Fatalf("decode ingest: %v", err)
-	}
+	ingestData := mustAppliedMCPIngest(t, ctx, dispatcher, root)
 
 	server := New(conn)
 	serverRead, clientWrite := io.Pipe()
@@ -322,17 +377,7 @@ func TestBooksListMCPAfterIngest(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "notes.md"), []byte("# Driftwood\n\nA shoreline story."), 0o644); err != nil {
 		t.Fatalf("write md: %v", err)
 	}
-	ingested := dispatcher.Handle(ctx, command.Envelope{
-		Operation: command.OpPlanIngest,
-		Input:     mustJSON(t, map[string]any{"root": root}),
-	})
-	if ingested.Status != command.StatusSucceeded {
-		t.Fatalf("ingest = %q: %+v", ingested.Status, ingested.Reasons)
-	}
-	var ingestData command.PlanIngestData
-	if err := json.Unmarshal(ingested.Data, &ingestData); err != nil {
-		t.Fatalf("decode ingest: %v", err)
-	}
+	ingestData := mustAppliedMCPIngest(t, ctx, dispatcher, root)
 
 	server := New(conn)
 	serverRead, clientWrite := io.Pipe()
@@ -384,6 +429,203 @@ func TestBooksListMCPAfterIngest(t *testing.T) {
 	}
 }
 
+func TestSnapshotListAndDiffMCPAfterIngest(t *testing.T) {
+	ctx := context.Background()
+	conn, dispatcher := startExactDaemon(t)
+
+	firstRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(firstRoot, "blob.bin"), []byte("first"), 0o600); err != nil {
+		t.Fatalf("write first: %v", err)
+	}
+	firstData := mustAppliedMCPIngest(t, ctx, dispatcher, firstRoot)
+	secondRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(secondRoot, "blob.bin"), []byte("first"), 0o600); err != nil {
+		t.Fatalf("write second blob: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(secondRoot, "extra.txt"), []byte("second"), 0o600); err != nil {
+		t.Fatalf("write extra: %v", err)
+	}
+	secondData := mustAppliedMCPIngest(t, ctx, dispatcher, secondRoot)
+
+	server := New(conn)
+	serverRead, clientWrite := io.Pipe()
+	clientRead, serverWrite := io.Pipe()
+	serverSession, err := server.Connect(ctx,
+		&mcpsdk.IOTransport{Reader: serverRead, Writer: serverWrite}, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	client := mcpsdk.NewClient(&mcpsdk.Implementation{Name: "harness-test-client", Version: "test"}, nil)
+	clientSession, err := client.Connect(ctx,
+		&mcpsdk.IOTransport{Reader: clientRead, Writer: clientWrite}, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	listed, err := clientSession.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name:      command.OpSnapshotList,
+		Arguments: map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("snapshot.list call: %v", err)
+	}
+	if listed.IsError {
+		t.Fatalf("snapshot.list error: %s", contentText(t, listed))
+	}
+	listText := contentText(t, listed)
+	if !strings.Contains(listText, firstData.SnapshotRef) || !strings.Contains(listText, secondData.SnapshotRef) {
+		t.Fatalf("snapshot.list text = %q", listText)
+	}
+
+	diffed, err := clientSession.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name: command.OpSnapshotDiff,
+		Arguments: map[string]any{
+			"from_snapshot_ref": firstData.SnapshotRef,
+			"to_snapshot_ref":   secondData.SnapshotRef,
+		},
+	})
+	if err != nil {
+		t.Fatalf("snapshot.diff call: %v", err)
+	}
+	if diffed.IsError {
+		t.Fatalf("snapshot.diff error: %s", contentText(t, diffed))
+	}
+	if diffText := contentText(t, diffed); !strings.Contains(diffText, "added extra.txt") {
+		t.Fatalf("snapshot.diff text = %q", diffText)
+	}
+}
+
+func TestContentHandleMCPAfterIngest(t *testing.T) {
+	ctx := context.Background()
+	conn, dispatcher := startExactDaemon(t)
+	root := t.TempDir()
+	payload := []byte("hello-mcp-content")
+	if err := os.WriteFile(filepath.Join(root, "note.txt"), payload, 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	ingestData := mustAppliedMCPIngest(t, ctx, dispatcher, root)
+	listed := dispatcher.Handle(ctx, command.Envelope{
+		Operation: command.OpNamespaceList,
+		Input:     mustJSON(t, map[string]any{"workspace_id": ingestData.WorkspaceID, "root_id": ingestData.RootID}),
+	})
+	var listData command.NamespaceListData
+	if err := json.Unmarshal(listed.Data, &listData); err != nil {
+		t.Fatalf("decode namespace: %v", err)
+	}
+	var fileID string
+	for _, entry := range listData.Entries {
+		if entry.DisplayName == "note.txt" {
+			fileID = entry.ID
+		}
+	}
+	if fileID == "" {
+		t.Fatalf("note.txt missing: %+v", listData.Entries)
+	}
+
+	server := New(conn)
+	serverRead, clientWrite := io.Pipe()
+	clientRead, serverWrite := io.Pipe()
+	serverSession, err := server.Connect(ctx,
+		&mcpsdk.IOTransport{Reader: serverRead, Writer: serverWrite}, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	client := mcpsdk.NewClient(&mcpsdk.Implementation{Name: "harness-test-client", Version: "test"}, nil)
+	clientSession, err := client.Connect(ctx,
+		&mcpsdk.IOTransport{Reader: clientRead, Writer: clientWrite}, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	opened, err := clientSession.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name: command.OpContentOpen,
+		Arguments: map[string]any{
+			"workspace_id": ingestData.WorkspaceID,
+			"entry_id":     fileID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("content.open call: %v", err)
+	}
+	if opened.IsError {
+		t.Fatalf("content.open error: %s", contentText(t, opened))
+	}
+	openText := contentText(t, opened)
+	if !strings.Contains(openText, "handle: hdl_") {
+		t.Fatalf("content.open text = %q", openText)
+	}
+	encoded, err := json.Marshal(opened.StructuredContent)
+	if err != nil {
+		t.Fatalf("encode open: %v", err)
+	}
+	var openData command.ContentOpenData
+	if err := json.Unmarshal(encoded, &openData); err != nil {
+		t.Fatalf("decode open: %v", err)
+	}
+
+	tooBig, err := clientSession.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name: command.OpContentRead,
+		Arguments: map[string]any{
+			"handle": openData.Handle,
+			"length": 5000,
+		},
+	})
+	if err != nil {
+		t.Fatalf("oversized content.read call: %v", err)
+	}
+	if !tooBig.IsError || !strings.Contains(contentText(t, tooBig), "4096") {
+		t.Fatalf("oversized content.read = %q", contentText(t, tooBig))
+	}
+
+	read, err := clientSession.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name: command.OpContentRead,
+		Arguments: map[string]any{
+			"handle": openData.Handle,
+			"offset": 0,
+			"length": int64(len(payload)),
+		},
+	})
+	if err != nil {
+		t.Fatalf("content.read call: %v", err)
+	}
+	if read.IsError {
+		t.Fatalf("content.read error: %s", contentText(t, read))
+	}
+	readText := contentText(t, read)
+	if !strings.Contains(readText, "hello-mcp-content") || !strings.Contains(readText, "digest: sha256:") {
+		t.Fatalf("content.read text = %q", readText)
+	}
+	if strings.Contains(readText, "unbounded") {
+		t.Fatalf("content.read leaked bulk framing: %q", readText)
+	}
+	readEncoded, err := json.Marshal(read.StructuredContent)
+	if err != nil {
+		t.Fatalf("encode read: %v", err)
+	}
+	var readData contentReadMCPData
+	if err := json.Unmarshal(readEncoded, &readData); err != nil {
+		t.Fatalf("decode read: %v", err)
+	}
+	if !readData.EOF || readData.Preview != string(payload) || !readData.Untrusted {
+		t.Fatalf("content.read structured = %+v", readData)
+	}
+
+	closed, err := clientSession.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name:      command.OpContentClose,
+		Arguments: map[string]any{"handle": openData.Handle},
+	})
+	if err != nil {
+		t.Fatalf("content.close call: %v", err)
+	}
+	if closed.IsError {
+		t.Fatalf("content.close error: %s", contentText(t, closed))
+	}
+}
+
 func startExactDaemon(t *testing.T) (*transport.Conn, *controlplane.Dispatcher) {
 	t.Helper()
 	catalogPath := filepath.Join(t.TempDir(), "catalog.sqlite")
@@ -415,6 +657,40 @@ func startExactDaemon(t *testing.T) (*transport.Conn, *controlplane.Dispatcher) 
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 	return conn, dispatcher
+}
+
+func mustAppliedMCPIngest(t *testing.T, ctx context.Context, dispatcher *controlplane.Dispatcher, root string) command.PlanApplyData {
+	t.Helper()
+	planned := dispatcher.Handle(ctx, command.Envelope{
+		Operation: command.OpPlanIngest,
+		Input:     mustJSON(t, map[string]any{"root": root}),
+	})
+	if planned.Status != command.StatusSucceeded {
+		t.Fatalf("plan.ingest = %q: %+v", planned.Status, planned.Reasons)
+	}
+	var plan command.PlanIngestData
+	if err := json.Unmarshal(planned.Data, &plan); err != nil {
+		t.Fatalf("decode plan.ingest: %v", err)
+	}
+	applied := dispatcher.Handle(ctx, command.Envelope{
+		Operation: command.OpPlanApply,
+		Input: mustJSON(t, map[string]any{
+			"workspace_id": plan.WorkspaceID,
+			"plan_id":      plan.PlanID,
+			"plan_digest":  plan.PlanDigest,
+		}),
+	})
+	if applied.Status != command.StatusSucceeded && applied.Status != command.StatusDegraded {
+		t.Fatalf("plan.apply = %q: %+v", applied.Status, applied.Reasons)
+	}
+	var result command.PlanApplyData
+	if err := json.Unmarshal(applied.Data, &result); err != nil {
+		t.Fatalf("decode plan.apply: %v", err)
+	}
+	if result.SnapshotRef == "" || result.RootID == "" {
+		t.Fatalf("plan.apply omitted publication identity: %+v", result)
+	}
+	return result
 }
 
 func mustJSON(t *testing.T, input any) []byte {

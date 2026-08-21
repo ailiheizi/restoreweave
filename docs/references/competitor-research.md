@@ -2,6 +2,8 @@
 
 > **Research status:** This synthesis was updated on 2026-08-12 from the current RestoreWeave repository, a bounded Siftline run, and a fresh primary-source competitor scan. `Observed` means inspected in current project or primary-source material, `Documented` means stated by a project source, `Inferred` means a RestoreWeave design conclusion, and `Unverified` means that behavior, performance, licensing, or demand still requires a dedicated check.
 
+> **Historical decision note (superseded 2026-08-19):** The competitor evidence remains useful, but bundled-FUSE and embedding-optional RestoreWeave recommendations below are no longer active. The current profile uses explicit export materialization, exposes no RestoreWeave mount API, and requires the bundled local ONNX/BGE plus in-process zvec semantic default defined in [Content Store, Views, and Export Requirements](../requirements/content-store-views-and-exports.md).
+
 ## 1. Conclusion
 
 RestoreWeave has a credible but unproven product position as a self-hosted, content-aware storage layer for NAS systems and heterogeneous collections.

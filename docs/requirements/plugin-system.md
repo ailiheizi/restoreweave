@@ -13,7 +13,7 @@ The product is not an empty plugin framework. The reference distribution MUST pr
 - Original-directory browse, read, verify, and restore.
 - Durable whole-subject tags and plain-text notes with revisioned CRUD and portable export/import.
 - Metadata, filename, path, type, checksum, duplicate, processing-state, and available extracted-text search.
-- A bundled read-only Linux FUSE projection over the same authenticated namespace and content-read contracts.
+- Export-manifest materialization over the same authenticated namespace and content-read contracts.
 - CLI and local read-only MCP access to the same typed core operations.
 
 Optional extensions add better classification, extraction, compression, media understanding, indexing, ranking, storage placement, or source capture. They do not become recovery authority.
@@ -31,8 +31,8 @@ RestoreWeave exposes extension seams only where implementations are expected to 
 | `CaptureDriver` | Present a bounded source view, snapshot, share, or export. | One platform-neutral filesystem profile is required; snapshot-specific drivers are optional. |
 | `Processor` | Analyze or transform one declared class of content through typed inputs and outputs. | The host ships strong baseline processors; richer modality processors are optional. |
 | `RepositoryDriver` | Place, read, verify, and restore admitted representations. | One qualified deduplicating and compressing path is required. |
-| `IndexProvider` | Consume a replayable authorized feed and build or update a versioned discovery projection. | A baseline lexical implementation is required. |
-| `QueryProvider` | Query exactly one explicitly named `IndexGenerationRef` per invocation and return subject-bound candidates; the host validates compatibility before invocation. | Baseline metadata and text query is required; vector and multimodal query are optional. |
+| `IndexProvider` | Consume a replayable authorized feed and build or update a versioned discovery projection. | Hybrid lexical/structured plus local semantic generations are required. |
+| `QueryProvider` | Query exactly one explicitly named `IndexGenerationRef` per invocation and return subject-bound candidates; the host validates compatibility before invocation. | The default broker fuses lexical, structured, and local semantic candidates; other vector and multimodal query is optional. |
 | Later `RetrieverDriver` | Reacquire a pinned external artifact under a qualified policy. | Reserved; not required by `RW-MVP-1`. |
 
 One package MAY implement more than one role, but each capability is negotiated, versioned, authorized, and tested separately. One implementation MAY provide both `IndexProvider` and `QueryProvider`, but index-feed and query schemas and generation identities remain separate.
@@ -64,7 +64,7 @@ inventory
 
 A route is a typed host-owned plan, not a user-authored arbitrary workflow graph. Each node binds an exact capability version, configuration digest, declared input schema, output schema, resource budget, and fallback. The host rejects schema-incompatible or cyclic routes before execution.
 
-The mandatory exact lane is not a `Processor` route and cannot be delayed by an optional classifier, parser, extractor, transform, validator, embedding, or index. A failed optional branch reports degraded coverage while the readable file remains eligible for exact publication.
+The mandatory exact lane is not a `Processor` route and cannot be delayed by any classifier, parser, extractor, transform, validator, embedding, or index. The local text-embedding profile is required for release-level default discovery, but its invocation remains asynchronous and non-authoritative; failure reports degraded coverage while readable bytes remain eligible for exact publication.
 
 Routes MAY branch. For example, an image can be preserved exactly, have metadata and a thumbnail extracted, and later receive a CLIP-compatible embedding. The exact representation, thumbnail, and embedding have different lifecycle and authority classes even when produced in one ingest job.
 
@@ -117,7 +117,7 @@ Every index generation MUST bind the provider version, schema digest, source inv
 
 A query provider returns immutable subject references, optional segment references, provider and generation IDs, score components, explanations, and completeness or staleness information. The core query broker MUST reauthorize every candidate before any presentation adapter receives metadata or may open content. Counts, facets, snippets, nearest neighbors, and error messages MUST NOT leak unauthorized subjects.
 
-The reference distribution MUST provide useful lexical and structured discovery without embeddings. CLIP, text embeddings, audio embeddings, learned rerankers, and hybrid fusion are later providers. Their outputs and index generations are rebuildable, replaceable, and removable without affecting namespace browsing, exact reads, verification, or restore.
+The reference distribution MUST provide hybrid lexical, structured, and local semantic discovery by default. CLIP, audio embeddings, learned rerankers, and additional hybrid fusion providers are later capabilities. Their outputs and index generations are rebuildable, replaceable, and removable without affecting namespace browsing, exact reads, verification, or restore.
 
 ## 6. Package and capability declaration
 
@@ -201,8 +201,8 @@ Through the initial MCP profile, an external harness may inspect inventory, stat
 
 ## 11. Acceptance criteria
 
-1. A qualified NAS/server deployment can ingest, reduce storage, browse, mount, search, verify, and restore without any non-reference platform capture driver, learned model, vector database, or WebUI.
-2. The default distribution remains useful when every optional extension is disabled.
+1. A qualified NAS/server deployment can ingest, reduce storage, export, search with the default local semantic profile, verify, and restore without any non-reference platform capture driver, distributed vector service, or WebUI.
+2. Exact storage, verification, and restore remain useful when the local semantic extension is disabled; that degraded state is not reported as the complete default experience.
 3. Extension upgrades create new immutable profiles and output generations instead of rewriting provenance.
 4. Text, image, audio, video, game, application, archive, model, and future content processors use one typed contract.
 5. Unknown content and failed optional processors fall back to exact preservation.

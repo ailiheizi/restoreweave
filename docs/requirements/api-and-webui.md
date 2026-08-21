@@ -11,7 +11,7 @@ The initial qualified interaction surfaces are:
 
 A REST service and WebUI are valuable optional adapters for remote administration, multi-user access, job monitoring, search, and everyday NAS use. They MUST sit over the same typed operations and MUST NOT introduce a second source of truth, policy model, scheduler, job lifecycle, plan format, index authority, or recovery meaning.
 
-This profile is deferred from the smallest core release unless another release document explicitly promotes it. The underlying product MUST remain fully operable without an HTTP server, browser, JavaScript runtime, vector database, or AI model.
+This profile is deferred from the smallest core release unless another release document explicitly promotes it. The underlying product MUST remain fully operable without an HTTP server, browser, JavaScript runtime, or distributed vector service. The reference local semantic profile is embedded in the core distribution, but exact recovery does not depend on it.
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are normative.
 
@@ -239,7 +239,7 @@ Browser compatibility, remote-service availability, multitenancy, and accessibil
 1. Removing the REST service and WebUI does not prevent ingest, storage reduction, search, browse, verification, restore, reprocessing, or reindexing through qualified headless surfaces.
 2. The same canonical request through CLI, MCP, and REST produces equivalent domain results, plans, reason codes, references, and audit effects after transport metadata is removed.
 3. Every UI mutation has an equivalent documented typed core operation.
-4. The UI works usefully with the baseline lexical index and no embedding or AI provider.
+4. The UI remains useful in an explicitly degraded lexical/structured mode when the local embedding generation is unavailable; that state cannot be presented as the qualified default discovery experience.
 5. Large file content and exports use bounded scoped streams or handles rather than ordinary JSON responses.
 6. A disconnected browser can resume job observation without duplicating work or losing the durable terminal result.
 7. Search results are reauthorized and cannot disclose unauthorized counts, snippets, previews, or neighbors.

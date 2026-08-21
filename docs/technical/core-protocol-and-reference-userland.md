@@ -10,9 +10,10 @@ The core product loop is:
 capture -> inventory
   |-> exact ingest and storage minimization
   |-> classify -> process -> derive -> index
--> publish authenticated namespace
--> browse, read, search, annotate, and serve
--> incrementally rescan, reprocess, reindex, migrate, verify, or restore
+-> publish authenticated content, fact, namespace, and recovery records
+-> search, annotate, and save a dynamic view
+-> freeze and materialize an export, read exact bytes, verify, or restore
+-> incrementally rescan, reprocess, reindex, migrate, or rebuild projections
 ~~~
 
 The reference distribution MUST ship a useful default path rather than an empty plugin framework:
@@ -134,7 +135,7 @@ flowchart TB
     QueryProvider --> Generation
     QueryProvider -. "ranked SubjectRefs" .-> QueryBroker
     QueryBroker --> Access
-    Access --> Fuse["Bundled read-only Linux FUSE"]
+    Access --> Export["ExportManifest materializer"]
 
     Capture --> Sources["NAS, local filesystems, shares, snapshots, object views"]
     Repository --> Storage["Local disks, NAS pools, object stores, backup repositories"]
@@ -483,10 +484,11 @@ The reference distribution MUST include:
 - Filesystem and share capture drivers appropriate to the host platform.
 - One qualified repository driver with exact deduplicated and compressed storage.
 - A built-in suffix and magic-byte detector.
-- Bundled baseline lexical `IndexProvider` and `QueryProvider` implementations over paths, filenames, types, recorded metadata, durable tags and notes, and safely extracted text, backed by a replayable feed.
+- Bundled lexical/structured `IndexProvider` and `QueryProvider` implementations over paths, filenames, types, recorded metadata, checksums, duplicate groups, protection state, durable tags/notes/descriptions, and safely extracted text, backed by a replayable feed.
+- A bundled local text-embedding `Processor` and in-process zvec generation for the default semantic dimension; its failure is explicit degradation and never a recovery failure.
 - Durable tag and note CRUD plus portable annotation export/import.
-- A bundled read-only Linux FUSE adapter over `SnapshotTree` and `FileAccess`.
-- Optional processor-produced CLIP, embedding, fingerprint, and media features that compatible index and query implementations may project later.
+- Export-manifest materialization over `SnapshotTree` and `FileAccess`; mounting is external.
+- Optional processor-produced CLIP, alternate embedding spaces, fingerprints, and media features that compatible index and query implementations may project later.
 - RRF storage, portable export, clean-recovery tooling, namespace browse, content reads, verification, and exact restore.
 
 Optional WebUI and REST services are adapters over the same typed operations. They do not own a second scheduler, policy model, database authority, or publication state machine.
@@ -515,7 +517,6 @@ internal/indexfeed/               replayable feed and IndexProvider coordination
 internal/query/                   QueryProvider broker and result authorization
 internal/binding/cli/             human, JSON, JSONL, and byte-stream binding
 internal/binding/mcp/             local read-only MCP binding
-internal/binding/fuse/            bundled read-only Linux FUSE adapter
 internal/binding/http/            optional REST and WebUI adapter
 internal/store/sqlite/            rebuildable operational projection
 
@@ -566,7 +567,7 @@ An index query, processor success, repository-native check, or local cache hit c
 - Ship exact, deduplicated, compressed, encrypted storage through one qualified repository driver.
 - Ship suffix and magic-byte identification with exact fallback.
 - Ship incremental immutable snapshots, browse, range read, full restore, and verification.
-- Ship a bundled read-only Linux FUSE view pinned to immutable snapshots.
+- Ship export-manifest materialization pinned to immutable subjects and representations.
 - Ship the full authorized CLI operation set and equivalent semantics for the bounded operations exposed by local read-only MCP.
 - Ship bundled lexical `IndexProvider` and `QueryProvider` implementations, durable tag/note CRUD and portable export/import, `search.query`, and a replayable metadata and extracted-text feed.
 
@@ -577,7 +578,7 @@ An index query, processor success, repository-native check, or local cache hit c
 - Collections, ratings, relationship graphs, recommendations, and other richer catalog semantics.
 - Alternative compression and neural representation processors.
 - Multiple repositories, placement migration, retention execution, and gated physical GC.
-- SMB, NFS, WebDAV, S3-compatible, media-server, alternate FUSE, and writable gateways.
+- External SMB, NFS, WebDAV, S3-compatible, media-server, and other consumers of materialized exports or authorized reads.
 - Retrieval-backed representations and explicitly qualified non-exact recovery contracts.
 
 ## 18. Definition of done
@@ -595,5 +596,5 @@ The core protocol and reference userland are conforming when:
 9. Processor, index, query, repository, and capture failures remain typed and do not silently weaken exact recovery.
 10. REST or WebUI adapters can be removed without changing core operation meaning or recovery behavior.
 11. A fresh reference installation can search paths, metadata, durable tags and notes, and available extracted text through one exact generation-bound query without installing an LLM, embedding model, or vector database.
-12. A bundled Linux FUSE mount returns the same exact bytes and namespace metadata as `SnapshotTree` and `FileAccess`, remains snapshot-pinned, and rejects all mutation.
+12. Export-manifest materialization returns the same exact bytes and namespace metadata as `SnapshotTree` and `FileAccess`, remains manifest-pinned, and reports conflicts without substitution.
 13. Tag and note export/import preserves subject bindings and revisions after loss of SQLite and every search index.

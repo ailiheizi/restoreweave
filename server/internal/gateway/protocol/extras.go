@@ -124,49 +124,62 @@ func (s *Server) serveStar(w http.ResponseWriter, r *http.Request, add bool) {
 		writeSubsonicError(w, r, 10, "id is required")
 		return
 	}
-	if strings.HasPrefix(id, "al_") || strings.HasPrefix(id, "ar_") {
-		writeSubsonicError(w, r, 0, "star only applies to SubjectRef songs")
-		return
-	}
-	if add {
-		if _, err := s.call(r.Context(), command.OpAnnotationUpsert, map[string]any{
-			"workspace_id": s.opts.WorkspaceID,
-			"subject_ref":  id,
-			"kind":         "TAG",
-			"body":         starredTag,
-		}); err != nil {
-			writeSubsonicError(w, r, 0, err.Error())
-			return
-		}
-		writeSubsonicOK(w, r, nil)
-		return
-	}
-	listed, err := s.call(r.Context(), command.OpAnnotationList, map[string]any{
-		"workspace_id": s.opts.WorkspaceID,
-		"subject_ref":  id,
-	})
+	catalog, err := s.audioCatalog(r)
 	if err != nil {
 		writeSubsonicError(w, r, 0, err.Error())
 		return
 	}
-	var data command.AnnotationListData
-	if err := json.Unmarshal(listed.Data, &data); err != nil {
-		writeSubsonicError(w, r, 0, err.Error())
+	targets := starSubjectRefs(catalog, id)
+	if len(targets) == 0 {
+		writeSubsonicError(w, r, 70, "star target not found")
 		return
 	}
-	for _, annotation := range data.Annotations {
-		if annotation.Kind == "TAG" && annotation.Body == starredTag && !annotation.Tombstoned {
-			if _, err := s.call(r.Context(), command.OpAnnotationDelete, map[string]any{
-				"workspace_id":      s.opts.WorkspaceID,
-				"annotation_id":     annotation.ID,
-				"expected_revision": annotation.Revision,
+	for _, subject := range targets {
+		if add {
+			if _, err := s.call(r.Context(), command.OpAnnotationUpsert, map[string]any{
+				"workspace_id": s.opts.WorkspaceID,
+				"subject_ref":  subject,
+				"kind":         "TAG",
+				"body":         starredTag,
 			}); err != nil {
 				writeSubsonicError(w, r, 0, err.Error())
 				return
 			}
+			continue
+		}
+		if err := s.unstarSubject(r, subject); err != nil {
+			writeSubsonicError(w, r, 0, err.Error())
+			return
 		}
 	}
 	writeSubsonicOK(w, r, nil)
+}
+
+func (s *Server) unstarSubject(r *http.Request, subject string) error {
+	listed, err := s.call(r.Context(), command.OpAnnotationList, map[string]any{
+		"workspace_id": s.opts.WorkspaceID,
+		"subject_ref":  subject,
+	})
+	if err != nil {
+		return err
+	}
+	var data command.AnnotationListData
+	if err := json.Unmarshal(listed.Data, &data); err != nil {
+		return err
+	}
+	for _, annotation := range data.Annotations {
+		if annotation.Kind != "TAG" || annotation.Body != starredTag || annotation.Tombstoned {
+			continue
+		}
+		if _, err := s.call(r.Context(), command.OpAnnotationDelete, map[string]any{
+			"workspace_id":      s.opts.WorkspaceID,
+			"annotation_id":     annotation.ID,
+			"expected_revision": annotation.Revision,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Server) serveStarred(w http.ResponseWriter, r *http.Request) {
@@ -175,35 +188,43 @@ func (s *Server) serveStarred(w http.ResponseWriter, r *http.Request) {
 		writeSubsonicError(w, r, 0, err.Error())
 		return
 	}
-	listed, err := s.call(r.Context(), command.OpAnnotationList, map[string]any{
-		"workspace_id": s.opts.WorkspaceID,
-	})
+	starred, err := s.starredTimes(r)
 	if err != nil {
 		writeSubsonicError(w, r, 0, err.Error())
 		return
 	}
-	var annotations command.AnnotationListData
-	if err := json.Unmarshal(listed.Data, &annotations); err != nil {
-		writeSubsonicError(w, r, 0, err.Error())
-		return
-	}
-	starred := map[string]bool{}
-	for _, annotation := range annotations.Annotations {
-		if annotation.Kind == "TAG" && annotation.Body == starredTag && !annotation.Tombstoned {
-			starred[annotation.SubjectRef] = true
-		}
-	}
 	songs := make([]map[string]any, 0)
 	for _, track := range data.Tracks {
-		if starred[track.SubjectRef] {
-			songs = append(songs, songPayload(track))
+		if when := starred[track.SubjectRef]; when != "" {
+			songs = append(songs, songPayloadWithStar(track, when))
+		}
+	}
+	albums := make([]map[string]any, 0)
+	artists := make([]map[string]any, 0)
+	seenArtist := map[string]bool{}
+	for _, album := range data.Albums {
+		if when := collectionStarred(data, starred, album.SubjectRefs); when != "" {
+			albums = append(albums, map[string]any{
+				"id": albumID(album.Artist, album.Title), "name": firstNonEmpty(album.Title, "Unknown Album"),
+				"artist": album.Artist, "artistId": artistID(album.Artist), "starred": when,
+			})
+		}
+		id := artistID(album.Artist)
+		if seenArtist[id] {
+			continue
+		}
+		seenArtist[id] = true
+		if when := artistStarred(data, starred, id); when != "" {
+			artists = append(artists, map[string]any{
+				"id": id, "name": album.Artist, "albumCount": 1, "starred": when,
+			})
 		}
 	}
 	key := "starred"
 	if strings.Contains(r.URL.Path, "getStarred2") {
 		key = "starred2"
 	}
-	writeSubsonicOK(w, r, map[string]any{key: map[string]any{"song": songs, "album": []any{}, "artist": []any{}}})
+	writeSubsonicOK(w, r, map[string]any{key: map[string]any{"song": songs, "album": albums, "artist": artists}})
 }
 
 func (s *Server) serveGetBookmarks(w http.ResponseWriter, r *http.Request) {
@@ -442,4 +463,96 @@ func (s *Server) serveHandshake(w http.ResponseWriter, r *http.Request, name str
 	default:
 		writeSubsonicError(w, r, 0, "unimplemented OpenSubsonic method")
 	}
+}
+
+func (s *Server) starredTimes(r *http.Request) (map[string]string, error) {
+	listed, err := s.call(r.Context(), command.OpAnnotationList, map[string]any{
+		"workspace_id": s.opts.WorkspaceID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var annotations command.AnnotationListData
+	if err := json.Unmarshal(listed.Data, &annotations); err != nil {
+		return nil, err
+	}
+	starred := map[string]string{}
+	for _, annotation := range annotations.Annotations {
+		if annotation.Kind != "TAG" || annotation.Body != starredTag || annotation.Tombstoned {
+			continue
+		}
+		when := firstNonEmpty(annotation.UpdatedAt, annotation.CreatedAt)
+		if when == "" {
+			when = "1970-01-01T00:00:00Z"
+		}
+		starred[annotation.SubjectRef] = when
+	}
+	return starred, nil
+}
+
+func starSubjectRefs(data command.AudioListData, id string) []string {
+	if strings.HasPrefix(id, "ar_") {
+		seen := map[string]bool{}
+		refs := make([]string, 0)
+		for _, track := range data.Tracks {
+			if artistID(track.Artist) != id || seen[track.SubjectRef] {
+				continue
+			}
+			seen[track.SubjectRef] = true
+			refs = append(refs, track.SubjectRef)
+		}
+		return refs
+	}
+	if strings.HasPrefix(id, "al_") {
+		for _, album := range data.Albums {
+			if albumID(album.Artist, album.Title) == id {
+				return append([]string(nil), album.SubjectRefs...)
+			}
+		}
+		return nil
+	}
+	for _, track := range data.Tracks {
+		if track.SubjectRef == id {
+			return []string{id}
+		}
+	}
+	return nil
+}
+
+func artistStarred(data command.AudioListData, starred map[string]string, artistIDValue string) string {
+	refs := make([]string, 0)
+	for _, track := range data.Tracks {
+		if artistID(track.Artist) == artistIDValue {
+			refs = append(refs, track.SubjectRef)
+		}
+	}
+	return collectionStarred(data, starred, refs)
+}
+
+func collectionStarred(_ command.AudioListData, starred map[string]string, refs []string) string {
+	if len(refs) == 0 {
+		return ""
+	}
+	when := ""
+	for _, ref := range refs {
+		ts, ok := starred[ref]
+		if !ok {
+			return ""
+		}
+		if ts > when {
+			when = ts
+		}
+	}
+	return when
+}
+
+func markStarred(payload map[string]any, when string) map[string]any {
+	if when != "" {
+		payload["starred"] = when
+	}
+	return payload
+}
+
+func songPayloadWithStar(track command.AudioTrack, when string) map[string]any {
+	return markStarred(songPayload(track), when)
 }

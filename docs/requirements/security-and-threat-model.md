@@ -1,6 +1,6 @@
 # Security and Threat Model
 
-> **Profile status:** This document preserves the broad cross-phase threat inventory. As frozen by the [MVP and Operator Contract](mvp-and-operator-contract.md), `RW-MVP-1` is a single-node, single-operator, single-workspace managed-archive profile for Linux/NAS deployments. It protects one local or mounted filesystem root through an honest generic capture profile, one mature exact deduplicating and compressing repository engine reported as one placement, baseline metadata and extracted-text search, a portable namespace and recovery closure, CLI, and a read-only local `stdio` MCP adapter. Platform- and engine-specific implementations qualify independently and never define product identity or a global release gate. REST, WebUI, A2A, embedded AI, vector or multimodal search, retrieval, public plugins, multitenancy, multiple placements, destructive lifecycle operations, and enterprise or cold-media custody are later-profile concerns.
+> **Profile status:** This document preserves the broad cross-phase threat inventory. As frozen by the [MVP and Operator Contract](mvp-and-operator-contract.md), `RW-MVP-1` is a single-node, single-operator, single-workspace managed-archive profile for Linux/NAS deployments. It protects one local or mounted filesystem root through an honest generic capture profile, one mature exact deduplicating and compressing repository engine reported as one placement, hybrid lexical/structured search plus the bundled local ONNX/zvec semantic generation, a portable namespace and recovery closure, CLI, and a read-only local `stdio` MCP adapter. Platform- and engine-specific implementations qualify independently and never define product identity or a global release gate. REST, WebUI, A2A, remote AI, multimodal search, retrieval, public plugins, multitenancy, multiple placements, destructive lifecycle operations, and enterprise or cold-media custody are later-profile concerns.
 
 ## 1. Security objective and profile boundary
 
@@ -20,7 +20,7 @@ The first qualified profile has these security invariants:
 - Exact protection is the only source-recovery representation. A human- or published-policy-selected exclusion is explicitly unprotected and outside recoverable coverage; it is not a substitute, retrieval recipe, or smaller recoverable representation. Unknown, unsupported, ambiguously classified, and processor-failed readable bytes remain exact through `EXACT_FALLBACK`.
 - The default suffix-then-magic identification, common metadata/text processing, content hashing, duplicate accounting, and baseline search surfaces are in scope. Their parsers and indexes are untrusted or rebuildable derivatives and cannot publish recovery truth.
 - The CLI is the primary authority-bearing interface. The MVP MCP adapter is local `stdio`, opens no listener, and exposes only the qualified read-only surface. It cannot mutate plans, initialize or write a repository, restore a destination, read ambient host paths, access credentials, invoke arbitrary processors, or execute shell commands.
-- No REST service, WebUI, hosted control plane, embedded model, prompt loop, embedding or CLIP service, external retrieval path, P2P path, or public plugin marketplace is required or enabled by the MVP profile.
+- No REST service, WebUI, hosted control plane, generative model, prompt loop, CLIP service, external retrieval path, P2P path, or public plugin marketplace is required or enabled by the MVP profile. The bundled local ONNX text-embedding worker and in-process zvec generation are the sole model-backed default: they run without network egress, remain rebuildable, and hold no recovery authority.
 - Planning never writes the repository. Only application of an immutable plan may initialize or write the selected target, and the MVP exposes no automatic prune, delete, retention reduction, last-copy deletion, or autonomous exclusion operation.
 - Exact planning, protection, verification, browse, and restore must pass with every optional Processor and every AI-related component disabled.
 
@@ -28,7 +28,7 @@ Portable recovery authority is intentionally small. A clean installation starts 
 
 ### 1.2 Later profiles
 
-Enterprise bootstrap chains, threshold custody, Recovery Bootstrap Seeds and Envelopes, RecoveryHeadWitness histories, ControlPlaneRecoverySets, Capsule Cores, multiple failure-independent placements, retrieval, embeddings, CLIP, multimodal ranking, P2P, distributed workers, remote APIs, and browser clients remain useful design directions. They are conditional requirements for later enterprise, cold-media, network, or semantic profiles and cannot gate or satisfy `RW-MVP-1`.
+Enterprise bootstrap chains, threshold custody, Recovery Bootstrap Seeds and Envelopes, RecoveryHeadWitness histories, ControlPlaneRecoverySets, Capsule Cores, multiple failure-independent placements, retrieval, additional embedding spaces, CLIP, multimodal ranking, P2P, distributed workers, remote APIs, and browser clients remain useful design directions. They are conditional requirements for later enterprise, cold-media, network, or semantic profiles and cannot gate or satisfy `RW-MVP-1`.
 
 ## 2. Protected assets
 
@@ -117,7 +117,7 @@ Requirements:
 
 ## 6. Parser, archive, and media threats
 
-`RW-MVP-1` requires bounded suffix-then-magic identification, qualified common metadata and text extraction, and a generic exact route. Deep recursive archive analysis, OCR, ASR, learned classification, embeddings, CLIP, and codecs remain optional or later. Every shipped parser, detector, and extractor remains inside this boundary. Unsupported or failed processing of readable bytes selects exact protection rather than omission or a blocking intelligence dependency.
+`RW-MVP-1` requires bounded suffix-then-magic identification, qualified common metadata and text extraction, and a generic exact route. Deep recursive archive analysis, OCR, ASR, learned classification, additional embedding spaces, CLIP, and codecs remain optional or later. Every shipped parser, detector, and extractor remains inside this boundary. Unsupported or failed processing of readable bytes selects exact protection rather than omission or a blocking intelligence dependency.
 
 Threats:
 
@@ -172,7 +172,7 @@ Requirements:
 
 ## 8. AI and prompt-injection threats
 
-`RW-MVP-1` embeds no model, prompt loop, agent runtime, embedding service, vector database, external enrichment client, or retrieval engine. It does include a rebuildable baseline metadata and extracted-text index whose results resolve through host-owned subjects and namespace authorization. Exact protection must remain independent of every index. The qualified MCP surface is read-only and carries no approval authority. The threats and controls below apply when a later profile or an explicitly selected optional processor introduces learned or semantic processing.
+`RW-MVP-1` embeds no prompt loop or agent runtime. It ships a local ONNX embedding worker and in-process zvec generation as rebuildable discovery derivatives whose results resolve through host-owned subjects and namespace authorization. Exact protection must remain independent of every index. The qualified MCP surface is read-only and carries no approval authority. The threats and controls below apply to the default local semantic processing as well as later remote or multimodal providers.
 
 Threats:
 
@@ -415,7 +415,7 @@ Trusted peers have explicit enrollment, authenticated device identity, operator 
 
 ## 14. Multitenancy and deduplication
 
-This section is not part of `RW-MVP-1`. The MVP has one local workspace and one local operator, no hosted identity, no team sharing, and no cross-workspace deduplication. Its local metadata/text index is single-workspace and rebuildable; vector, multimodal, and cross-workspace semantic services remain later profiles.
+This section is not part of `RW-MVP-1`. The MVP has one local workspace and one local operator, no hosted identity, no team sharing, and no cross-workspace deduplication. Its local lexical/structured/zvec generations are single-workspace and rebuildable; remote, multimodal, and cross-workspace semantic services remain later profiles.
 
 Threats:
 
@@ -499,11 +499,11 @@ Required responses:
 2. Attempt path traversal, final and ancestor symlink swaps, parent and root replacement, bind-mount substitution, mount escape, hard-link confusion, magic-link traversal, reserved-name collisions, and root remapping. Confirm every traversal and read remains component-relative to one retained root anchor, no operation escapes or changes capture basis, and every authoritative observation binds the declared capture or applied-inventory basis.
 3. Exercise both a retained immutable capture and a validated live mounted tree. Substitute or reuse stale handles, unmount and remount or replace the source, replace the snapshot, and mutate files during reads. Confirm root, filesystem or volume, mount, snapshot or live basis, resolver profile, and lease or hold evidence are revalidated; snapshot claims require current snapshot evidence, live capture reports its weaker consistency, stable files may remain exact, and unresolved drift blocks the affected claim or requires a new plan.
 4. Race regular files with FIFOs, sockets, block and character devices, and ancestor substitutions before open. Confirm type pinning occurs before a potentially blocking content open, special files remain metadata-only under the generic profile, and a missing boundary checker or invalid `CaptureRootBinding` cannot produce an authoritative complete generation.
-5. Present unknown, unsupported, malformed, ambiguous, polyglot, encrypted, and processor-failed readable content. Confirm it remains `EXACT` or `EXACT_FALLBACK`; no detector, processor, search result, MCP client, or model-shaped output can silently exclude it or claim a substitute as exact.
+5. Present unknown, unsupported, malformed, ambiguous, polyglot, encrypted, and processor-failed readable content. Confirm it remains `EXACT_PROTECTED` or `EXACT_FALLBACK`; no detector, processor, search result, MCP client, or model-shaped output can silently exclude it or claim a substitute as exact.
 6. Verify suffix evidence is retained before magic-byte evidence, conflicts remain visible, and every file enters either a qualified class route or the generic exact route.
 7. Fuzz and resource-exhaust the default metadata and text processors. Confirm sandboxes, cumulative limits, typed partial coverage, and exact fallback prevent escape, unbounded expansion, secret access, or a false complete-processing claim.
 8. Delete, corrupt, roll back, or replace the baseline metadata/text index. Confirm search reports stale or incomplete coverage, rebuilds from durable subjects and processor artifacts, resolves every hit through the portable namespace, and cannot change recovery or publication authority.
-9. Disable every optional AI, embedding, CLIP, vector, and learned component. Confirm exact plan, protection, baseline search, verification, browse, recovery-reference export, and restore still complete without REST, WebUI, retrieval, an agent runtime, or a public plugin registry.
+9. Disable every model and vector component, including the required-by-default local semantic profile. Confirm exact plan, protection, lexical/structured degraded search, verification, browse, recovery-reference export, and restore still work, while status refuses to call the installation a complete default discovery experience.
 10. Confirm ingest planning performs no repository write. Between planning and application, create a conflicting repository or unrelated target data and confirm revalidation blocks initialization and placement creation.
 11. Interrupt `InitializeTarget` at every supported boundary and exercise `ReconcileTargetInitialization`: matching intent and compatible repository state reconcile; conflicting identity or unrelated data blocks; indeterminate observation remains `RECONCILING` or terminates `UNKNOWN_EXTERNAL_OUTCOME`.
 12. Crash or cancel before, during, and after each payload, prepared-closure, and commit-marker side effect. Confirm reconciliation creates at most one logical publication, records equivalent physical engine duplicates without publishing twice, blocks conflicting candidates, and never blindly retries an unknown effect.

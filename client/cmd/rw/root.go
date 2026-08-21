@@ -66,8 +66,8 @@ func (e *clientEnv) do(ctx context.Context, operation string, input any) (comman
 }
 
 // request runs one operation and renders its outcome. A failed round trip
-// prints "cannot reach restoreweaved at <socket>" and exits 1. A failed
-// result prints its reasons and exits with the result's exit code.
+// prints "cannot reach restoreweaved at <socket>" and exits 1. Degraded
+// results still render their useful data before returning the declared code.
 func (e *clientEnv) request(cmd *cobra.Command, operation string, input any, render func(cmd *cobra.Command, result command.Result) error) int {
 	ctx, cancel := context.WithTimeout(cmd.Context(), e.timeout)
 	defer cancel()
@@ -85,18 +85,26 @@ func (e *clientEnv) request(cmd *cobra.Command, operation string, input any, ren
 		fmt.Fprintln(cmd.OutOrStdout(), string(payload))
 		return result.ExitCode()
 	}
-	if result.Status != command.StatusSucceeded && result.Status != command.StatusAccepted {
+	renderable := result.Status == command.StatusSucceeded || result.Status == command.StatusAccepted || result.Status == command.StatusDegraded
+	if renderable && render != nil {
+		if err := render(cmd, result); err != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "render result: %v\n", err)
+			return 1
+		}
+	}
+	if result.Status == command.StatusDegraded {
+		for _, reason := range result.Reasons {
+			fmt.Fprintf(cmd.ErrOrStderr(), "%s: %s\n", reason.Code, reason.Message)
+		}
+		fmt.Fprintf(cmd.ErrOrStderr(), "operation %s completed with degraded capabilities\n", result.Operation)
+		return result.ExitCode()
+	}
+	if !renderable {
 		for _, reason := range result.Reasons {
 			fmt.Fprintf(cmd.ErrOrStderr(), "%s: %s\n", reason.Code, reason.Message)
 		}
 		fmt.Fprintf(cmd.ErrOrStderr(), "operation %s failed\n", result.Operation)
 		return result.ExitCode()
-	}
-	if render != nil {
-		if err := render(cmd, result); err != nil {
-			fmt.Fprintf(cmd.ErrOrStderr(), "render result: %v\n", err)
-			return 1
-		}
 	}
 	return 0
 }
@@ -121,18 +129,21 @@ func NewRootCommand() *exitCommand {
 	root.PersistentFlags().DurationVar(&env.timeout, "timeout", defaultTimeout,
 		"socket round-trip timeout")
 	root.AddCommand(newStatusCommand(env))
+	root.AddCommand(newConfigCommand(env))
 	root.AddCommand(newCapabilityCommand(env))
 	root.AddCommand(newNamespaceCommand(env))
 	root.AddCommand(newIngestCommand(env))
+	root.AddCommand(newPlanCommand(env))
 	root.AddCommand(newSnapshotCommand(env))
 	root.AddCommand(newRestoreCommand(env))
 	root.AddCommand(newRecoveryCommand(env))
-	root.AddCommand(newMountCommand(env))
-	root.AddCommand(newUnmountCommand(env))
+	root.AddCommand(newViewCommand(env))
+	root.AddCommand(newExportCommand(env))
 	root.AddCommand(newSearchCommand(env))
 	root.AddCommand(newTagCommand(env))
 	root.AddCommand(newNoteCommand(env))
 	root.AddCommand(newAnnotationCommand(env))
+	root.AddCommand(newDescriptionCommand(env))
 	root.AddCommand(newRepresentationCommand(env))
 	root.AddCommand(newContentCommand(env))
 	root.AddCommand(newAudioCommand(env))

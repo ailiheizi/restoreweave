@@ -1,5 +1,7 @@
 # Thin-Core Product Research Audit
 
+> **Historical decision note (superseded 2026-08-19):** This audit preserves the evidence and reasoning available when it was written. Its bundled-FUSE and embedding-optional recommendations are not current product requirements. [Content Store, Views, and Export Requirements](../requirements/content-store-views-and-exports.md) now requires explicit export materialization with no RestoreWeave mount API, plus a bundled local ONNX/BGE and in-process zvec semantic profile for the default experience.
+
 ## 1. Conclusion
 
 RestoreWeave should be delivered as a small authoritative core plus an opinionated self-hosted NAS distribution. It should not be delivered as a Mac backup utility, a generic storage SDK, an embedded AI agent, or a marketplace of empty interfaces.

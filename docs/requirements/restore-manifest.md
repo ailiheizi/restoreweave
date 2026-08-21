@@ -1155,7 +1155,7 @@ Before retiring any location or representation needed by an existing Recovery Bo
 
 ### 20.1 RW-MVP-1 portable publication commit
 
-`RW-MVP-1` stores one exact payload restore point through a qualified mature exact repository and its `RepositoryDriver`, plus two small records with the `RECOVERY_CLOSURE` placement role in that repository. Restic may implement this profile, but the manifest contract does not depend on its private format:
+`RW-MVP-1` stores one exact payload restore point through a qualified mature exact repository and its `RepositoryDriver`, plus two required publication records with the `RECOVERY_CLOSURE` placement role in that repository. Post-commit RRF supplements may be stored beside them, but they are not additional publication commits. Restic may implement this profile, but the manifest contract does not depend on its private format:
 
 1. The signed `PREPARED_CLOSURE` contains or authenticates the RRF root and binds the exact payload receipt, plan digest, platform-neutral capture-set digest, policy revision, explicit exclusions, and authenticated-metadata verification evidence.
 2. After the prepared closure placement is durably observed and reconciled, RestoreWeave signs a `PublicationCommitRecord` with closure subtype `PUBLICATION_COMMIT`.
@@ -1179,6 +1179,78 @@ The `PublicationCommitRecord` binds at least:
 The commit record must not contain its own storage-placement receipt. The recovery reader validates the signed record bytes and then observes the repository placement, avoiding a self-referential digest cycle. An exclusion is represented as an explicit non-recoverable decision and never contributes protected or verified coverage.
 
 Clean-machine discovery starts from valid `PUBLICATION_COMMIT` records, resolves their bound prepared closures and payload restore points, and ignores orphan payloads or prepared closures. A crash or lost response after storage is reconciled by observing and validating existing records. Reconciliation may accept physically duplicated but equivalent repository objects while preserving exactly one logical publication. SQLite heads, search indexes, caches, and local publication pointers are rebuildable projections and do not establish commitment.
+
+Post-publication processor attempts use a separate signed `PROCESSOR_ATTEMPT_CLOSURE`; they MUST NOT create another `PUBLICATION_COMMIT` for the same snapshot or make exact commitment wait for optional processing. The v1 child record binds the already committed parent digest, publication domain and ID, snapshot and manifest digests, repository identity, fence, deterministic attempt-bundle schema, digest, byte length, terminal-attempt count, signer, and signing time. Its bundle retains the immutable attempt identity, subject reference, route, capability, terminal status, reason, provenance, processor digest, fence, timestamps, and admitted artifact references.
+
+A catalog-free processor-provenance reader MUST first validate the complete parent publication and prepared closure, then validate the child signature, repository and snapshot bindings, canonical bundle bytes, terminal attempt fields, and bundle digest/length/count. A missing child means processor provenance is unavailable; an invalid child fails the processor-provenance read closed. Neither state invalidates an already committed exact payload, snapshot listing, verification, or restore. Repeating the same parent and bundle is idempotent; two different v1 bundles for one parent are a conflict. Explicit reprocessing requires a later signed successor-lineage contract and MUST NOT silently replace the v1 child. Artifact references in this first child do not make artifact bodies, descriptions, annotations, or catalog-local subject mappings portable.
+
+Durable post-publication subject facts use a separate signed
+`PORTABLE_FACT_CLOSURE`. It is not a second publication commit and MUST NOT
+rewrite the prepared closure, publication generation, manifest digest, or exact
+payload receipt. Version 1 is a complete-state successor chain rooted at one
+committed parent rather than a delta log: every sequence contains the complete
+set of admitted portable subject mappings, metadata facts, annotation
+revisions, description revisions, semantic segments, and processor-artifact
+descriptors known for that snapshot at that sequence.
+
+The signed v1 child binds at least:
+
+- schema, signature domain, and record kind;
+- workspace ID, publication domain and ID, snapshot and manifest digests, and
+  the committed parent digest and generation;
+- positive `closure_sequence` and the immediately preceding portable-fact
+  closure digest, absent only for sequence 1;
+- bundle schema, canonical digest, logical byte length, record count, and
+  attachment count;
+- the authenticated processor-attempt closure digest when admitted processor
+  artifacts are present;
+- repository identity, writer and key identities, fence, signing time, and
+  signature;
+- required reader dependencies, canonicalization profile, known critical
+  extensions, and an optional-extension container.
+
+The canonical bundle contains sorted typed records for `SUBJECT_MAPPING`,
+`METADATA_FACT`, `ANNOTATION_REVISION`, `DESCRIPTION_REVISION`,
+`SEMANTIC_SEGMENT`, and `PROCESSOR_ARTIFACT_DESCRIPTOR`. Records are ordered by
+kind, stable record ID, and revision. Each record binds its schema, workspace,
+snapshot, stable subject, revision, predecessor record ID when applicable,
+canonical payload digest, logical length, and provenance. Duplicate logical
+keys with different canonical bytes invalidate the whole bundle.
+
+`SUBJECT_MAPPING` is the catalog-free bridge from a stable subject to the
+snapshot namespace. It binds the namespace root and entry identities, parent
+subject when present, raw component sequence or its authenticated portable
+reference, entry type, content identity and length when known, file-version and
+selected representation references, protection record, and ordered recovery
+references. A catalog-local ID without this mapping is not a portable subject.
+
+Annotation and description revisions are immutable portable records with
+explicit predecessor record IDs. Updating or tombstoning an annotation creates
+a new revision and MUST NOT destroy the bytes of the prior revision. A
+description body, processor artifact, or other body that is not safely bounded
+for the JSON bundle is placed as an immutable logical-byte object through the
+same `RepositoryDriver`; its descriptor binds purpose, media type, SHA-256
+content ID, logical length, reader profile, and repository identity. Such an
+attachment is not an exact source representation and does not enter or change
+the parent's source-payload receipt. Inline bodies remain bound by the same
+digest and logical-length rules.
+
+For one parent, `(record_kind, closure_sequence)` is unique. Repeating the same
+sequence, predecessor, and bundle digest is idempotent. A different bundle at
+the same sequence, two successors of one predecessor, a skipped sequence, a
+missing attachment, a mismatched processor-attempt child, or a cross-workspace
+record is a conflict and the portable-fact read fails closed. The current
+personal profile admits one operational workspace per publication domain; an
+independent trust-anchor export binds that domain-to-workspace assertion for
+clean import.
+
+A catalog-free reader validates the complete exact parent first, then the
+portable-fact chain and every referenced attachment. A missing chain means the
+durable-fact coverage is incomplete. An invalid chain prevents catalog rebuild
+or a complete recovery-health claim. Neither condition invalidates already
+authenticated exact snapshot discovery or exact-byte restore. A newer valid
+sequence supersedes the active fact projection but never erases authenticated
+history.
 
 ### 20.2 Deferred distributed-control publication state model
 

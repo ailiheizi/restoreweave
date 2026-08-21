@@ -10,7 +10,7 @@ RestoreWeave can support a family of useful applications over one managed data p
 RestoreWeave Core
   -> universal catalog and Inbox
   -> domain packs (audio, video, books, images, documents, games, ...)
-  -> clients (catalog UI, players, readers, CLI, MCP, FUSE, ...)
+  -> clients (catalog UI, players, readers, CLI, MCP, export consumers, ...)
 ```
 
 The core owns durable identity, exact bytes, namespace, provenance, annotations, access authorization, publication, verification, and restore meaning. Domain packs provide schemas and bounded processors. Clients provide presentation and ephemeral interaction state. A client MUST NOT read SQLite tables, repository packs, object locators, or source paths directly.
@@ -234,7 +234,7 @@ Domain results should include:
 - Snapshot/index generation, producer digest, freshness, coverage, and authorization state.
 - A linkable `PathRef` or app deep link only after host authorization.
 
-Semantic search, CLIP, acoustic fingerprints, OCR, ASR, and external metadata are optional processors/artifacts. Deleting them degrades discovery only.
+The bundled local text-semantic generation is required by the qualified default discovery profile but remains a rebuildable derivative. Alternate embeddings, CLIP, acoustic fingerprints, OCR, ASR, and external metadata are optional processors/artifacts. Deleting any of them affects discovery only; deleting the required local generation also makes the installation visibly degraded and non-conforming until it is rebuilt.
 
 ## 8. Capability grants and authorization
 
@@ -290,7 +290,7 @@ An app cannot fetch arbitrary URLs, magnets, stores, or launcher endpoints throu
 5. Add video only after seek, transcode, subtitle, and resource-budget qualification.
 6. Add image/document packs selectively or integrate existing applications through the same APIs.
 7. Add read-only application/game collection resolution; defer retrieval and execution until source, rights, quarantine, and validation gates are proven.
-8. Add embeddings/CLIP/ASR/OCR and external enrichment as optional rebuildable projections.
+8. Add alternate embeddings, CLIP, ASR, OCR, and external enrichment as optional rebuildable projections; the bundled local text embedding is already part of the core MVP gate.
 
 Do not implement a universal player/reader/downloader binary. Implement the shared contracts and a compelling universal catalog first, then focused clients with narrow domain responsibility.
 

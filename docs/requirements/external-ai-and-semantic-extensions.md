@@ -2,7 +2,7 @@
 
 ## 1. Purpose
 
-Semantic discovery is part of RestoreWeave's product value. A self-hosted operator should be able to find data by path, metadata, text, meaning, similarity, relationship, or personal annotation while retaining a normal recoverable filesystem view.
+Semantic discovery is part of RestoreWeave's product value. A self-hosted operator should be able to find data by path, metadata, text, meaning, similarity, relationship, or personal annotation while retaining a recoverable original-path projection.
 
 Concrete AI models, embedding stacks, CLIP implementations, OCR engines, speech recognizers, vector databases, and ranking algorithms remain replaceable. RestoreWeave standardizes the subject, artifact, indexing, query, provenance, authorization, and lifecycle contracts that let those implementations change safely.
 
@@ -10,12 +10,12 @@ RestoreWeave is not a general AI harness. It does not need an embedded agent loo
 
 The discovery extension flow has four bounded participants:
 
-1. A **Processor** optionally examines content and emits typed extracted information, fingerprints, embeddings, or other provider-neutral features.
+1. A **Processor** examines explicitly routed content and emits typed extracted information, fingerprints, embeddings, or other provider-neutral features. Individual capabilities are optional except for profiles, such as the default local text embedding profile, that the reference distribution explicitly requires.
 2. An **IndexProvider** builds or updates one named rebuildable projection generation.
 3. A **QueryProvider** performs retrieval, ranking, and fusion against one named generation per invocation.
 4. An external client or AI harness calls the same CLI or MCP operations as any other authorized client.
 
-The `RW-MVP-1` reference distribution MUST bundle lexical `IndexProvider` and `QueryProvider` implementations. The core product MUST also work when all learned components are disabled. Disabling learned processing may reduce semantic recall, but it MUST NOT break baseline lexical search, ingest, namespace browsing, exact reads, verification, or restore.
+The `RW-MVP-1` reference distribution MUST bundle the local ONNX embedding processor, the local zvec semantic `IndexProvider`/`QueryProvider`, and lexical/structured providers. Exact ingest, namespace reads, verification, and restore MUST also work when learned components are disabled; disabling them is an explicit degraded semantic state, not the qualified default experience.
 
 This document complements [Driver and Processor Interface Requirements](driver-and-processor-interfaces.md), [File Identification and Extraction Requirements](file-identification-and-extraction.md), [CLI and MCP Contract](cli-and-mcp-contract.md), and [Namespace and Content Access Technical Design](../technical/namespace-and-content-access.md).
 
@@ -57,7 +57,7 @@ No AI component becomes authority merely because it produced a confident score, 
 
 ## 3. First-class discovery capability
 
-RestoreWeave MUST expose a provider-neutral discovery contract even when its initial implementation is lexical.
+RestoreWeave MUST expose a provider-neutral discovery contract even though its initial implementation is hybrid lexical, structured, and local semantic.
 
 The reference distribution MUST support:
 
@@ -66,18 +66,20 @@ The reference distribution MUST support:
 - Content-class and format filters.
 - Durable operator tags and notes.
 - Full-text search over safely extracted text when available.
+- Segment-level local semantic search over authorized filenames, descriptions, notes, and extracted text using the pinned default profile.
+- Host-owned fusion of lexical, structured, and local semantic candidates with per-component provenance.
 - Result resolution to the original directory entry and recoverable content.
 
 Optional providers MAY add:
 
-- Semantic text search.
+- Alternate local or online text semantic spaces and learned rerankers.
 - Image-text and image-image similarity.
 - Audio similarity and acoustic fingerprint lookup.
 - Video scene and caption search.
 - Source-code symbol and concept search.
 - Application, game, package, dependency, and asset relationships.
 - Model, dataset, and tensor metadata search.
-- Hybrid lexical, vector, graph, and structured ranking.
+- Graph, multimodal, or additional cross-provider ranking beyond the default lexical/structured/local-semantic fusion.
 - Collections, ratings, relationship graphs, and richer personal catalog views.
 
 The stable product promise is the ability to submit typed discovery requests and receive authorized SubjectRef results. It is not a promise that every provider implements every query mode.
@@ -122,7 +124,7 @@ The artifact envelope does not make its payload authoritative. It becomes visibl
 
 ### 5.1 Durable user semantics
 
-User-authored tags and notes are MVP **AUTHORITATIVE_DATA** with subtype **DURABLE_USER_SEMANTICS**. Later catalog profiles MAY add ratings, corrections, collections, aliases, descriptions, and relationships; once enabled, those values use the same authoritative lifecycle rather than disposable index state.
+User-authored tags, notes, and description revisions are MVP **AUTHORITATIVE_DATA** with subtype **DURABLE_USER_SEMANTICS**. Imported and model-generated descriptions are durable attributed records with their own authority/provenance class. Later catalog profiles MAY add ratings, corrections, collections, aliases, and relationships; once enabled, those values use the same authoritative lifecycle rather than disposable index state.
 
 Durable user semantics MUST:
 
@@ -439,6 +441,8 @@ The reference product SHOULD deliver semantic value incrementally:
 - Path, filename, type, size, time, source, and metadata search.
 - Durable operator tags and notes.
 - Full-text indexing of safely extracted text.
+- Segment-level local text embeddings through the pinned ONNX/BGE profile and in-process zvec generation.
+- Host-owned lexical, structured, and local-semantic fusion with per-component provenance.
 - Provider-neutral query API through CLI and MCP.
 - Visible processing and index coverage.
 
@@ -450,9 +454,9 @@ The reference product SHOULD deliver semantic value incrementally:
 - Application, game, package, source-code, model, and dataset metadata.
 - External metadata enrichment.
 
-### Optional semantic processing and query profiles
+### Additional semantic processing and query profiles
 
-- Processor-produced text embeddings.
+- Alternate text-embedding spaces and remote embedding profiles.
 - Processor-produced CLIP-compatible image and text features.
 - Processor-produced audio, video, code, graph, and domain-specific features.
 - Compatible IndexProvider projections and QueryProvider-owned hybrid retrieval, ranking, recommendations, and related-content views.
@@ -468,7 +472,7 @@ Experimental representations remain behind explicit recovery contracts, independ
 
 ## 17. Acceptance criteria
 
-1. A self-hosted installation provides useful metadata, tag, and available full-text search without an LLM, embedding model, or vector database.
+1. A self-hosted installation provides useful metadata, tag, full-text, and local semantic search through the bundled embedding model and vector generation; exact storage remains usable without those derivatives.
 2. Installing a CLIP-compatible Processor plus compatible index and query implementations adds multimodal search without changing core subject, namespace, storage, or authorization semantics.
 3. Removing all AI processors and semantic providers leaves ingest, exact browse, read, verify, and restore operational.
 4. Every semantic result resolves to an immutable SubjectRef and is reauthorized before disclosure.
@@ -482,4 +486,4 @@ Experimental representations remain behind explicit recovery contracts, independ
 12. The CLI exposes the full authorized operation set, and operations included in the initial bounded read-only MCP subset have identical discovery, authorization, and audit semantics.
 13. An external AI harness can inspect, search, propose, and invoke authorized operations without RestoreWeave embedding a general agent runtime.
 14. Search status distinguishes stale, partial, degraded, unavailable, and fully current provider generations.
-15. Failure of an optional semantic branch affects only declared discovery coverage. A profile-specific processor requirement may block only that branch, derived representation, or stronger profile claim and never the mandatory exact lane for readable bytes.
+15. Failure of the required default local semantic branch makes the installation visibly degraded and prevents default-experience qualification; failure of an additional optional semantic branch affects only its declared discovery coverage. A profile-specific processor requirement may block only that branch, derived representation, or stronger profile claim and never the mandatory exact lane for readable bytes.

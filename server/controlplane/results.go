@@ -9,15 +9,17 @@ import (
 
 // Reason codes returned inside command.Result.Reasons.
 const (
-	ReasonCodeUnknownOperation    = "unknown_operation"
-	ReasonCodeUnimplemented       = "unimplemented"
-	ReasonCodeInvalidRequest      = "invalid_request"
-	ReasonCodeInvalidInput        = "invalid_input"
-	ReasonCodeNotFound            = "not_found"
-	ReasonCodeConflict            = "conflict"
-	ReasonCodeCatalogError        = "catalog_error"
-	ReasonCodeUnavailable         = "unavailable"
-	ReasonCodeUnsupportedPlatform = "unsupported_platform"
+	ReasonCodeUnknownOperation       = "unknown_operation"
+	ReasonCodeUnimplemented          = "unimplemented"
+	ReasonCodeInvalidRequest         = "invalid_request"
+	ReasonCodeInvalidInput           = "invalid_input"
+	ReasonCodeNotFound               = "not_found"
+	ReasonCodeConflict               = "conflict"
+	ReasonCodeCatalogError           = "catalog_error"
+	ReasonCodeUnavailable            = "unavailable"
+	ReasonCodeUnsupportedPlatform    = "unsupported_platform"
+	ReasonCodeUnknownExternalOutcome = "unknown_external_outcome"
+	ReasonCodeNeedsReconciliation    = "needs_reconciliation"
 )
 
 // IdentifyBuiltinID names the host-owned suffix and magic-byte detector
@@ -57,6 +59,20 @@ func succeeded(env command.Envelope, started time.Time, data any) command.Result
 
 func failed(env command.Envelope, started time.Time, reason command.Reason) command.Result {
 	return command.NewResult(env, command.StatusFailed, started, time.Now().UTC(), nil, reason)
+}
+
+func unknownExternalOutcomeResult(env command.Envelope, started time.Time, err error) command.Result {
+	reason := newReason(ReasonCodeUnknownExternalOutcome, err.Error())
+	reason.Retryable = false
+	reason.Resolution = &command.Resolution{
+		Action: "reconcile",
+		Arguments: map[string]any{
+			"state":       "NEEDS_RECONCILIATION",
+			"reason_code": ReasonCodeNeedsReconciliation,
+		},
+	}
+	reason.Details = map[string]any{"state": "NEEDS_RECONCILIATION"}
+	return command.NewResult(env, command.StatusUnknownExternalOutcome, started, time.Now().UTC(), nil, reason)
 }
 
 func unimplementedResult(env command.Envelope, started time.Time) command.Result {

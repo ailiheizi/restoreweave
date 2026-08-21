@@ -1,6 +1,6 @@
 # Protection Policy and Planning Requirements
 
-> **Profile status:** This document preserves the broader optimization, retention, drill, legacy bootstrap, and enterprise policy model. The MVP planner and exact-fallback contract are defined by [Product Requirements](product-requirements.md), [Core Kernel and Interface Requirements](core-kernel-and-interface.md), and [MVP and Operator Contract](mvp-and-operator-contract.md). `RW-MVP-1` is a single-node Linux/NAS managed archive over one local or mounted root, an honest generic capture profile, one mature exact deduplicating and compressing repository engine reported as one placement, deterministic suffix-then-magic identification, bounded default metadata/text processing, baseline search, CLI plus read-only MCP, and a portable signed RRF namespace and publication commit. Platform- and engine-specific implementations qualify independently. Capsule, Seed, witness, multi-repository, remote REST, semantic-vector, destructive-retention, and enterprise-availability rules below are inactive unless a later named profile activates them.
+> **Profile status:** This document preserves the broader optimization, retention, drill, legacy bootstrap, and enterprise policy model. The MVP planner and exact-fallback contract are defined by [Product Requirements](product-requirements.md), [Core Kernel and Interface Requirements](core-kernel-and-interface.md), [Content Store, Views, and Export Requirements](content-store-views-and-exports.md), and [MVP and Operator Contract](mvp-and-operator-contract.md). `RW-MVP-1` is a single-node Linux/NAS managed archive over one local or mounted root, an honest generic capture profile, one mature exact deduplicating and compressing repository engine reported as one placement, deterministic suffix-then-magic identification, bounded default metadata/text processing, hybrid lexical/structured/local-semantic discovery, CLI plus read-only MCP, and a portable signed RRF namespace and publication commit. Platform- and engine-specific implementations qualify independently. Capsule, Seed, witness, multi-repository, remote REST, additional semantic/vector spaces, destructive-retention, and enterprise-availability rules below are inactive unless a later named profile activates them.
 
 ## 1. Purpose
 
@@ -318,7 +318,9 @@ The former `POST_PUBLICATION_BOOTSTRAP_DRILL` and `COLD_VERIFIED` ceremony is re
 
 Draft, validate, simulate, publish, explain, activate, rollback, and compare operations are distinct. Simulation never mutates storage or policy state.
 
-## 13. MVP profile
+## 13. Protection-planning slice of the MVP profile
+
+This extended-profile document does not independently define the current `RW-MVP-1` product boundary. The [MVP and Operator Contract](mvp-and-operator-contract.md) and [Content Store, Views, and Export Requirements](content-store-views-and-exports.md) activate the bundled local ONNX text-embedding worker and in-process zvec generation for the default discovery experience. The requirements below define protection and planning behavior and must be read with those active MVP documents.
 
 The first implementation supports:
 
@@ -333,11 +335,11 @@ The first implementation supports:
 - Exact hashing, duplicate grouping, distinct logical-path accounting, and separately reported repository compression, deduplication, index overhead, and transfer effects.
 - A rebuildable baseline index over paths, types, checksums, duplicate groups, declared metadata, processing state, common media metadata, and extracted text. Search results resolve through the durable subject and namespace model.
 - Deterministic plan explanation, human review through `plan.revise`, and measurable storage and indexing analysis.
-- CLI human and machine output plus a read-only MCP adapter. No embedded AI, embedding or CLIP provider, WebUI, scheduler, recurring daemon, or REST service is required.
+- CLI human and machine output plus a read-only MCP adapter. The bundled local text-embedding profile is required for default discovery, but no generative AI, prompt loop, CLIP provider, WebUI, scheduler, recurring daemon, or REST service is required.
 - A portable RRF companion closure whose signed `PublicationCommitRecord` binds the payload receipt, prepared-closure receipt, plan digest, capture or applied-inventory digest, and authenticated-metadata evidence.
 - Clean exact recovery from the target, an independently retained recovery reference, a scoped credential source, an independent trust anchor, and a compatible reader without the operational catalog, baseline index, processor registry, or source host.
 
-APFS, ZFS, Btrfs, LVM, and vendor snapshot integrations may supply stronger optional capture profiles. Their availability or failure never determines whether the generic MVP can qualify. Embeddings, CLIP, vector search, hybrid ranking, and multimodal discovery are staged provider profiles over the same subjects and do not redefine recovery authority.
+APFS, ZFS, Btrfs, LVM, and vendor snapshot integrations may supply stronger optional capture profiles. Their availability or failure never determines whether the generic MVP can qualify. The bundled local text embedding and hybrid lexical/structured/semantic query are part of the default discovery profile. Alternate embedding spaces, online providers, CLIP, and multimodal discovery are staged provider profiles over the same subjects; none redefine recovery authority.
 
 Multitenancy, automated retention reduction, non-exact recovery authority, source deletion, automated destructive garbage collection, multiple placements, cost-driven placement changes, cold media, and enterprise lifecycle policy are outside the MVP.
 

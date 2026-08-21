@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/ailiheizi/restoreweave/client/command"
+	"github.com/ailiheizi/restoreweave/server/internal/search"
 	"github.com/ailiheizi/restoreweave/server/internal/store/sqlite"
 	"github.com/ailiheizi/restoreweave/server/testutil"
 )
@@ -30,6 +31,76 @@ func mustEnvelope(t *testing.T, operation string, input any) command.Envelope {
 	return env
 }
 
+// mustAppliedIngest keeps tests that need a published namespace explicit about
+// the Phase 2 boundary: planning is read-only and only plan.apply mutates the
+// repository/catalog publication state.
+func mustAppliedIngest(t *testing.T, ctx context.Context, dispatcher *Dispatcher, input any) command.PlanIngestData {
+	t.Helper()
+	planned := dispatcher.Handle(ctx, mustEnvelope(t, command.OpPlanIngest, input))
+	if planned.Status != command.StatusSucceeded {
+		t.Fatalf("plan.ingest = %q: %+v", planned.Status, planned.Reasons)
+	}
+	var plan command.PlanIngestData
+	if err := json.Unmarshal(planned.Data, &plan); err != nil {
+		t.Fatalf("decode plan.ingest: %v", err)
+	}
+	applied := dispatcher.Handle(ctx, mustEnvelope(t, command.OpPlanApply, map[string]any{
+		"workspace_id": plan.WorkspaceID,
+		"plan_id":      plan.PlanID,
+		"plan_digest":  plan.PlanDigest,
+	}))
+	if applied.Status != command.StatusSucceeded {
+		t.Fatalf("plan.apply = %q: %+v", applied.Status, applied.Reasons)
+	}
+	var result command.PlanApplyData
+	if err := json.Unmarshal(applied.Data, &result); err != nil {
+		t.Fatalf("decode plan.apply: %v", err)
+	}
+	plan.WorkspaceID = firstNonEmpty(result.WorkspaceID, plan.WorkspaceID)
+	plan.SourceID = firstNonEmpty(result.SourceID, plan.SourceID)
+	plan.ScanID = result.ScanID
+	plan.RootID = result.RootID
+	plan.SnapshotRef = result.SnapshotRef
+	plan.ManifestDigest = result.ManifestDigest
+	plan.Files = result.Files
+	plan.Bytes = result.Bytes
+	plan.JobID = result.JobID
+	return plan
+}
+
+func mustAppliedRestore(
+	t *testing.T,
+	ctx context.Context,
+	dispatcher *Dispatcher,
+	workspaceID, snapshotRef, destination string,
+) command.PlanApplyData {
+	t.Helper()
+	planned := dispatcher.Handle(ctx, mustEnvelope(t, command.OpPlanRestore, map[string]any{
+		"snapshot_ref": snapshotRef,
+		"destination":  destination,
+	}))
+	if planned.Status != command.StatusSucceeded {
+		t.Fatalf("plan.restore = %q: %+v", planned.Status, planned.Reasons)
+	}
+	var plan command.PlanRestoreData
+	if err := json.Unmarshal(planned.Data, &plan); err != nil {
+		t.Fatalf("decode plan.restore: %v", err)
+	}
+	applied := dispatcher.Handle(ctx, mustEnvelope(t, command.OpPlanApply, map[string]any{
+		"workspace_id": workspaceID,
+		"plan_id":      plan.PlanID,
+		"plan_digest":  plan.PlanDigest,
+	}))
+	if applied.Status != command.StatusSucceeded {
+		t.Fatalf("apply restore = %q: %+v", applied.Status, applied.Reasons)
+	}
+	var result command.PlanApplyData
+	if err := json.Unmarshal(applied.Data, &result); err != nil {
+		t.Fatalf("decode restore apply: %v", err)
+	}
+	return result
+}
+
 func TestDispatcherUnknownOperationFails(t *testing.T) {
 	dispatcher, _ := newTestDispatcher(t)
 	result := dispatcher.Handle(context.Background(), mustEnvelope(t, "controller.dance", map[string]any{}))
@@ -44,7 +115,7 @@ func TestDispatcherUnknownOperationFails(t *testing.T) {
 func TestDispatcherKnownButUnimplementedOperationFails(t *testing.T) {
 	dispatcher, _ := newTestDispatcher(t)
 	for _, operation := range []string{
-		command.OpPlanIngest, command.OpJobEvents, command.OpSearchQuery,
+		command.OpPlanIngest, command.OpSearchQuery,
 		command.OpContentOpen, command.OpSnapshotVerify, command.OpAnnotationList,
 		command.OpRecoveryExport, command.OpAudioList, command.OpBooksList,
 	} {
@@ -99,6 +170,15 @@ func TestDispatcherStatusGet(t *testing.T) {
 	if !containsString(data.Unimplemented, command.OpPlanIngest) {
 		t.Fatalf("unimplemented operation %s missing from status", command.OpPlanIngest)
 	}
+	if containsString(data.Unimplemented, command.OpPlanGet) {
+		t.Fatalf("implemented operation %s listed as unimplemented", command.OpPlanGet)
+	}
+	if data.Publications != 0 {
+		t.Fatalf("publications = %d, want 0", data.Publications)
+	}
+	if data.Repository != nil {
+		t.Fatalf("repository present without exact lane: %+v", data.Repository)
+	}
 }
 
 func TestDispatcherCapabilityList(t *testing.T) {
@@ -121,8 +201,15 @@ func TestDispatcherCapabilityList(t *testing.T) {
 	if states["operation:"+command.OpSearchQuery] != command.CapabilityUnavailable {
 		t.Fatalf("search.query capability = %q, want UNAVAILABLE", states["operation:"+command.OpSearchQuery])
 	}
-	if len(data.Capabilities) != len(command.KnownOperations())+2 {
-		t.Fatalf("capability count = %d, want %d", len(data.Capabilities), len(command.KnownOperations())+2)
+	if states["index-dimension:"+search.DimensionLexical] != command.CapabilityUnavailable {
+		t.Fatalf("lexical dimension = %q, want UNAVAILABLE", states["index-dimension:"+search.DimensionLexical])
+	}
+	if states["index-dimension:"+search.DimensionAcoustic] != command.CapabilityUnavailable {
+		t.Fatalf("acoustic dimension = %q, want UNAVAILABLE", states["index-dimension:"+search.DimensionAcoustic])
+	}
+	want := len(command.KnownOperations()) + 2 + len(search.DeclaredDimensions(search.ProviderReadiness{})) + 1
+	if len(data.Capabilities) != want {
+		t.Fatalf("capability count = %d, want %d", len(data.Capabilities), want)
 	}
 }
 

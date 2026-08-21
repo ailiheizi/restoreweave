@@ -4,6 +4,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"reflect"
 	"sort"
 )
 
@@ -54,16 +55,18 @@ func writeXMLTree(w io.Writer, extra map[string]any, status, codeMsg string, cod
 }
 
 func writeXMLValue(enc *xml.Encoder, name string, value any) error {
-	switch typed := value.(type) {
-	case nil:
+	if value == nil {
 		return nil
-	case []any:
-		for _, item := range typed {
-			if err := writeXMLValue(enc, name, item); err != nil {
+	}
+	if rv := reflect.ValueOf(value); rv.Kind() == reflect.Slice && rv.Type() != reflect.TypeOf([]byte(nil)) {
+		for i := 0; i < rv.Len(); i++ {
+			if err := writeXMLValue(enc, name, rv.Index(i).Interface()); err != nil {
 				return err
 			}
 		}
 		return nil
+	}
+	switch typed := value.(type) {
 	case map[string]any:
 		start := xml.StartElement{Name: xml.Name{Local: name}}
 		childKeys := make([]string, 0)

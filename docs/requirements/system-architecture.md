@@ -10,7 +10,7 @@ The architecture follows a kernel-and-userland model:
 
 - A small authoritative core owns identities, accepted decisions, provenance, transactions, verification, namespace meaning, and recovery semantics.
 - Versioned extensions own algorithms that should improve independently. The stable seams are `CaptureDriver`, capability-oriented `Processor`, `RepositoryDriver`, `IndexProvider`, `QueryProvider`, and the later `RetrieverDriver`. Learned classification, parsing, extraction, enrichment, fingerprinting, transformation, validation, and index preparation are conceptual roles within `Processor`, not separate public protocols.
-- A complete reference distribution ships strong defaults. RestoreWeave MUST be useful without installing third-party plugins, an AI model, a WebUI, or an external automation harness.
+- A complete reference distribution ships strong defaults, including the pinned local semantic profile. RestoreWeave MUST remain operational for exact ingest and recovery without third-party plugins or an external automation harness, while the default discovery experience includes its bundled model and local vector store.
 
 The core MUST retain an exact, verifiable path for readable bytes when an optional processor or provider is absent, fails, or does not understand the content. Storage reduction and semantic enrichment are first-class product values, but neither may silently weaken recoverability.
 
@@ -27,7 +27,7 @@ For an operator, the product provides:
 - Exact content-addressed storage with deduplication and lossless compression by default.
 - A recoverable original directory tree independent of pack, chunk, object, or repository layout.
 - Metadata, path, type, checksum, duplicate, durable tag/note, processing-state, and extracted-text search in the reference distribution.
-- A bundled read-only Linux FUSE view over the authenticated original-path namespace.
+- Export-manifest materialization and bounded `FileAccess` over the authenticated original-path namespace; filesystem mounts and network shares are external concerns.
 - Exact browse, bounded reads, verification, recovery export, and clean restore even when every optional model and search derivative is unavailable.
 - CLI and local read-only MCP interfaces for humans and automation clients; optional WebUI and REST adapters may later bind the same operations.
 
@@ -40,9 +40,12 @@ RestoreWeave does not require a visual node editor. A UI may expose presets, che
 The authoritative core owns:
 
 - Stable identities for sources, source views, namespace entries, file versions, byte content, chunks, representations, snapshots, indexes, operations, policies, and placements.
+- Stable identities for protection records, recovery references, description documents, semantic segments, and resolved configuration profiles.
+- Namespaced metadata bundles and optional signed recovery tokens are durable facts/proof envelopes, not alternate content identities.
 - Immutable accepted plans and policy decisions, including any explicit decision to use a non-exact representation.
 - The evidence-to-decision boundary for content classification and processor selection.
-- Provenance linking every derived fact or representation to its inputs, implementation, version, parameters, and validation result.
+- Provenance linking every derived fact, description, or representation to its inputs, implementation, version, parameters, and validation result.
+- Durable original-name and filesystem-fact closure, including the explicit distinction between locally protected bytes and externally replayable references.
 - Durable transactions, idempotency, cancellation, leases, fencing, checkpoints, reconciliation, and typed terminal outcomes.
 - Verification meaning and the decision that a representation or placement satisfies a declared contract.
 - Publication of portable records and commit evidence.
@@ -68,7 +71,7 @@ Learned classification, parsing, extraction, enrichment, fingerprinting, transfo
 
 RestoreWeave also delegates the following presentation and control concerns without making them stable storage-algorithm seams:
 
-- FUSE, SMB, NFS, WebDAV, S3-compatible, media-server, and other presentation gateways.
+- External tools that consume export manifests or authorized `FileAccess` streams.
 - WebUI, REST, desktop, automation, and fleet-management adapters.
 
 An extension may report evidence, candidates, derived outputs, costs, or receipts. It cannot change an accepted plan, grant itself authority, publish a snapshot, accept its own validation as final truth, or silently replace exact content.
@@ -106,11 +109,15 @@ flowchart TB
     Magic --> Route["Host classification and ProcessingRoute"]
     Magic -. "optional" .-> Learned["Processor: CLASSIFY_LEARNED"]
     Learned --> Route
-    Route -. "selected typed capabilities" .-> Processors["PARSE / EXTRACT / ENRICH / FINGERPRINT / TRANSFORM / VALIDATE / INDEX_PREPARE"]
+    Route -. "selected typed capabilities" .-> Processors["PARSE / EXTRACT / DESCRIBE / ENRICH / FINGERPRINT / TRANSFORM / VALIDATE / INDEX_PREPARE"]
     Processors --> Stage["Host-controlled staging"]
     Stage --> Admission["Host validation and admission"]
     Admission -. "admitted representation" .-> DerivedPlace["RepositoryDriver"]
     Admission --> Records
+    Records --> Protection["ProtectionRecord + RecoveryReference[]"]
+    Protection --> Records
+    Processors -. "DESCRIBE / EXTRACT" .-> Descriptions["DescriptionDocument + SemanticSegment"]
+    Descriptions --> Records
 
     Core <--> Capture
     Core <--> Suffix
@@ -136,8 +143,8 @@ flowchart TB
     Rank --> Reauthorize["Broker resolves and reauthorizes subjects"]
     Reauthorize --> QueryResponse["Authorized adapter response"]
 
-    Namespace --> Fuse["Bundled read-only Linux FUSE"]
-    Namespace --> Gateways["Later alternate gateways"]
+    Namespace --> Export["ExportManifest materializer"]
+    Export --> Foreign["External tools"]
     Retrieval["Later RetrieverDriver"] --> Core
 ~~~
 
@@ -158,6 +165,12 @@ At minimum, the core distinguishes:
 - `ContentId` (catalog `ContentRef`): exact byte identity, based on a required cryptographic digest.
 - `ChunkId`: exact identity within a named chunking profile.
 - `RepresentationId` (catalog `RepresentationRef`): exact raw bytes or a derived encoding with provenance and decoder requirements.
+- `ProtectionRecordId`: the selected `STORE_EXACT`, `STORE_EXACT_WITH_EXTERNAL_FALLBACK`, `LINK_ONLY`, or `METADATA_ONLY` policy and outcome.
+- `RecoveryReferenceId`: one ordered exact, reversible, external, or user-supplied recovery route with validation evidence.
+- `MetadataBundleId`: a versioned set of typed facts with per-field provenance and authority.
+- `RecoveryTokenId`: an optional signed portable pointer to a recovery recipe; it never contains or replaces repository payload.
+- `DescriptionDocumentId` and `SemanticSegmentId`: versioned long-form source, user, imported, or model-generated information and its searchable segments.
+- `ConfigProfileId`: one resolved configuration snapshot whose digest is bound into plans and generations.
 - `SnapshotId`: one published logical namespace and its selected representations.
 - `PlacementId`: one durable physical placement of a representation or portable record.
 - `IndexGenerationId`: one rebuildable index projection bound to source records, `IndexProvider` capability profile, and model space.
@@ -251,12 +264,12 @@ The reference exact profile is the baseline product, not a demonstration plugin.
 
 1. Capture or validate a source view with an explicit consistency claim.
 2. Inventory the original namespace and filesystem metadata.
-3. Start the mandatory exact lane: compute host-owned full-content identity, reuse trusted exact content where allowed, and place a raw or repository-native losslessly compressed representation.
+3. Start the mandatory protection lane: compute host-owned full-content identity when bytes are readable, apply the configured `STORE_EXACT`/`LINK_ONLY` policy, and place a raw or repository-native losslessly compressed representation when local protection is selected.
 4. In parallel, identify content using suffix evidence, magic-byte evidence, optional learned classification, and bounded structural parsing.
-5. Run qualified extraction, enrichment, fingerprint, transform, validation, and index-preparation capabilities selected by the host route.
+5. Run qualified extraction, description/enrichment, fingerprint, transform, validation, and index-preparation capabilities selected by the host route.
 6. Admit a transformed exact representation only after independent decode-and-hash validation; otherwise retain the mandatory exact representation.
 7. Extract safe baseline metadata and searchable text for supported formats.
-8. Build and activate a local path, metadata, type, and extracted-text index generation.
+8. Persist descriptions and provenance, split long text into semantic segments, and build/activate local lexical, structured, and semantic index generations.
 9. Read back required samples or full content according to policy.
 10. Publish the exact snapshot after portable records and placement evidence commit; optional discovery branches may complete later and report their coverage explicitly.
 
@@ -316,7 +329,7 @@ Clean recovery begins from a valid publication marker, authenticates the bound p
 
 `FileAccess` opens the representation selected for one namespace entry. An empty or default selector means the authoritative exact representation. It never means “return something similar.” Approximate, normalized, preview, or reacquired representations require explicit selection and authorization.
 
-The reference distribution bundles read-only Linux FUSE over these interfaces. SMB, NFS, WebDAV, S3-compatible, media, database-like, alternate FUSE, and writable gateways are later adapters. None receives repository-private object access or authority to reinterpret the namespace.
+The reference distribution bundles export-manifest materialization over these interfaces. RestoreWeave does not implement FUSE, SMB, NFS, WebDAV, S3-compatible, media, database-like, or writable gateways. External tools may consume the resulting directory or authorized read stream; none receives repository-private object access or authority to reinterpret the namespace.
 
 ## 10. Search and semantic extensions
 
@@ -324,7 +337,7 @@ Intelligent discovery is part of the product, while any particular model or inde
 
 The reference distribution provides useful search over paths, metadata, detected types, checksums, duplicates, durable tags/notes, processing state, and extracted text. The stable query surface returns logical subject references, representation availability, typed scores, exact generation, coverage, stale state, and provenance. A `QueryProvider` may combine lexical, structured, temporal, vector, graph, visual, or acoustic candidates within one named generation. The host broker may fuse separately generation-pinned provider results without changing stored content identity.
 
-Embeddings, CLIP-like image and video encoders, audio embeddings, captions, OCR, ASR, code intelligence, and domain-specific models are external or optional `Processor`, `IndexProvider`, or `QueryProvider` capabilities. Their outputs bind to:
+The reference distribution's local text embedding worker is a bundled `Processor` profile using ONNX Runtime and a pinned model; CLIP-like image and video encoders, audio embeddings, captions, OCR, ASR, code intelligence, and domain-specific models are later or optional `Processor`, `IndexProvider`, or `QueryProvider` capabilities. Their outputs bind to:
 
 - The exact subject and source representation.
 - The implementation and model digest.
@@ -384,9 +397,9 @@ Conceptual Processor-stage boundaries do not require separate public protocols o
 
 | Phase | Product outcome | Deliberately not required |
 | --- | --- | --- |
-| Phase 1: useful self-hosted storage | NAS-oriented service, CLI and read-only MCP, ordinary-tree capture plus optional snapshot profiles, exact content addressing, deduplication, lossless compression, portable commits, durable tag/note CRUD, original namespace access, bundled read-only Linux FUSE, baseline lexical search, verification, and clean restore | Mandatory AI, approximate replacement, alternate gateways, visual workflow editor, P2P, or enterprise control plane |
+| Phase 1: useful self-hosted storage | NAS-oriented service, CLI and read-only MCP, ordinary-tree capture plus optional snapshot profiles, exact content addressing, deduplication, lossless compression, portable commits, durable tag/note CRUD, export materialization, local hybrid semantic search, verification, and clean restore | Distributed vector infrastructure, approximate replacement, alternate gateways, visual workflow editor, P2P, or enterprise control plane |
 | Phase 2: managed adoption and replaceability | Independently implemented `Processor` and `RepositoryDriver` profiles; reprocessing, migration, decoder-retention, rollback, and a reviewed source-retirement profile after clean-recovery gates | Automatic source deletion, one-way migration, or claiming released capacity before retirement actually completes |
-| Phase 3: richer intelligence and advanced representations | Qualified `IndexProvider` and `QueryProvider` alternatives; optional OCR, ASR, embeddings, CLIP-like encoders, richer annotations, alternate search stores, media-aware transforms, perceptual validation, tiering, retrieval, and multiple backends | Separate public ABI families for every conceptual stage, making one model authoritative, or silent lossy substitution |
+| Phase 3: richer intelligence and advanced representations | Qualified `IndexProvider` and `QueryProvider` alternatives; optional OCR, ASR, additional embedding spaces, CLIP-like encoders, richer annotations, alternate search stores, media-aware transforms, perceptual validation, tiering, retrieval, and multiple backends | Separate public ABI families for every conceptual stage, making one model authoritative, or silent lossy substitution |
 | Phase 4: scale and enterprise operation | Distributed workers, multi-user authorization, immutable storage profiles, independent monitoring, fleet policy, and qualified high-availability deployment | Dependence of existing snapshots on an enterprise control service |
 
 ## 15. Architectural invariants

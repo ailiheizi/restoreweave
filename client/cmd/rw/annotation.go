@@ -13,7 +13,7 @@ func newSearchCommand(env *clientEnv) *cobra.Command {
 	commandNode := newExitCommand(env, "search <query>", "Query the bundled lexical index",
 		func(cmd *cobra.Command, env *clientEnv, args []string) int {
 			if len(args) != 1 {
-				fmt.Fprintf(cmd.ErrOrStderr(), "usage: rw search <query> [--workspace <id>] [--generation <id>]\n")
+				fmt.Fprintf(cmd.ErrOrStderr(), "usage: rw search <query> [--workspace <id>] [--generation <id>] [--dimension <id>] [--fuse <id>] [--axis <name>]\n")
 				return 1
 			}
 			input := map[string]any{"query": args[0]}
@@ -23,10 +23,22 @@ func newSearchCommand(env *clientEnv) *cobra.Command {
 			if generation := cmd.Flags().Lookup("generation").Value.String(); generation != "" {
 				input["index_generation_ref"] = generation
 			}
+			if dimension := cmd.Flags().Lookup("dimension").Value.String(); dimension != "" {
+				input["dimension"] = dimension
+			}
+			if axes, err := cmd.Flags().GetStringSlice("axis"); err == nil && len(axes) > 0 {
+				input["construct_axes"] = axes
+			}
+			if fuse, err := cmd.Flags().GetStringSlice("fuse"); err == nil && len(fuse) > 0 {
+				input["fuse"] = fuse
+			}
 			return env.request(cmd, command.OpSearchQuery, input, func(cmd *cobra.Command, result command.Result) error {
 				var data command.SearchQueryData
 				if err := json.Unmarshal(result.Data, &data); err != nil {
 					return err
+				}
+				if data.Dimension != "" {
+					fmt.Fprintf(cmd.OutOrStdout(), "dimension: %s\n", data.Dimension)
 				}
 				if data.GenerationID != "" {
 					fmt.Fprintf(cmd.OutOrStdout(), "generation: %s\n", data.GenerationID)
@@ -43,6 +55,9 @@ func newSearchCommand(env *clientEnv) *cobra.Command {
 		})
 	commandNode.Flags().String("workspace", "", "catalog workspace stable id")
 	commandNode.Flags().String("generation", "", "index generation stable id")
+	commandNode.Flags().String("dimension", "", "declared index dimension (default lexical-metadata-fts)")
+	commandNode.Flags().StringSlice("axis", nil, "restrict lexical construct axes (path,name,suffix,tags,notes,extracted)")
+	commandNode.Flags().StringSlice("fuse", nil, "host-owned fusion of two or more declared dimensions")
 	return commandNode.Command
 }
 
@@ -273,12 +288,15 @@ func newAnnotationExportCommand(env *clientEnv) *cobra.Command {
 }
 
 func newAnnotationImportCommand(env *clientEnv) *cobra.Command {
-	return newExitCommand(env, "import", "Import a portable annotation bundle from JSON stdin",
+	commandNode := newExitCommand(env, "import", "Import a portable annotation bundle from JSON stdin",
 		func(cmd *cobra.Command, env *clientEnv, args []string) int {
 			var bundle command.AnnotationExportData
 			if err := json.NewDecoder(cmd.InOrStdin()).Decode(&bundle); err != nil {
 				fmt.Fprintf(cmd.ErrOrStderr(), "decode annotation bundle: %v\n", err)
 				return 1
+			}
+			if conflict := cmd.Flags().Lookup("conflict").Value.String(); conflict != "" {
+				bundle.Conflict = conflict
 			}
 			return env.request(cmd, command.OpAnnotationImport, bundle, func(cmd *cobra.Command, result command.Result) error {
 				var data command.AnnotationExportData
@@ -286,9 +304,14 @@ func newAnnotationImportCommand(env *clientEnv) *cobra.Command {
 					return err
 				}
 				fmt.Fprintf(cmd.OutOrStdout(), "imported: %d\n", len(data.Annotations))
+				if data.Conflict != "" {
+					fmt.Fprintf(cmd.OutOrStdout(), "conflict: %s\n", data.Conflict)
+				}
 				return nil
 			})
-		}).Command
+		})
+	commandNode.Flags().String("conflict", command.AnnotationConflictFail, "fail|keep-local|keep-imported")
+	return commandNode.Command
 }
 
 func renderAnnotations(cmd *cobra.Command, result command.Result, kind string) error {

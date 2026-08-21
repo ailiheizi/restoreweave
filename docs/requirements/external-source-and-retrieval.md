@@ -240,6 +240,8 @@ One title match, provider listing, live URL, peer observation, metadata fetch, o
 
 Phase 0 and Phase 1 do not delete originals or use FETCH as the sole recovery path. Retrievers may create reports, bindings, and cold-test evidence only.
 
+The core records this choice as `LINK_ONLY` with an explicit `LINK_ONLY_UNPROTECTED` or `EXTERNAL_REPLAYABLE` outcome. It retains the original filename, captured metadata, expected identity, immutable binding, and all approved locators, but it does not claim local exact protection. Reacquisition is a separate, user-visible operation that quarantines and independently verifies bytes before creating a local exact representation. A bare URL or mutable locator is never a recovery trust root.
+
 ## 15. Revalidation and promotion
 
 Revalidation separately checks:
