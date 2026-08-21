@@ -34,7 +34,10 @@ var (
 type Receipt struct {
 	ContentID string
 	Bytes     int64
-	Existed   bool
+	// StoredBytes is the number of bytes occupied by the repository object.
+	// Bytes always describes the logical, uncompressed payload.
+	StoredBytes int64
+	Existed     bool
 }
 
 // Driver stores and reads exact byte objects addressed by sha256 content IDs.
@@ -48,7 +51,8 @@ type Driver interface {
 
 // Dir is a filesystem CAS. Layout: <root>/blobs/sha256/<ab>/<hex>.
 type Dir struct {
-	root string
+	root     string
+	identity string
 }
 
 // OpenDir creates or opens a directory-backed repository.
@@ -69,7 +73,14 @@ func OpenDir(path string) (*Dir, error) {
 			return nil, fmt.Errorf("create repository directory: %w", err)
 		}
 	}
-	return &Dir{root: absolute}, nil
+	if err := ensureRepositoryProfile(absolute, RepositoryProfileDirectoryCASDev); err != nil {
+		return nil, err
+	}
+	identity, err := loadOrCreateRepositoryIdentity(absolute)
+	if err != nil {
+		return nil, err
+	}
+	return &Dir{root: absolute, identity: identity}, nil
 }
 
 func (repo *Dir) Root() string { return repo.root }
@@ -126,14 +137,28 @@ func (repo *Dir) place(ctx context.Context, expectedID string, body io.Reader) (
 		if err := verifyFile(dest, contentID); err != nil {
 			return Receipt{}, err
 		}
-		return Receipt{ContentID: contentID, Bytes: written, Existed: true}, nil
+		stored, err := fileSize(dest)
+		if err != nil {
+			return Receipt{}, err
+		}
+		return Receipt{ContentID: contentID, Bytes: written, StoredBytes: stored, Existed: true}, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return Receipt{}, err
 	}
-	if err := os.Rename(tempName, dest); err != nil {
+	if err := publishNoReplace(tempName, dest, repo.root); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			if verifyErr := verifyFile(dest, contentID); verifyErr != nil {
+				return Receipt{}, verifyErr
+			}
+			stored, sizeErr := fileSize(dest)
+			if sizeErr != nil {
+				return Receipt{}, sizeErr
+			}
+			return Receipt{ContentID: contentID, Bytes: written, StoredBytes: stored, Existed: true}, nil
+		}
 		return Receipt{}, fmt.Errorf("commit blob: %w", err)
 	}
-	return Receipt{ContentID: contentID, Bytes: written, Existed: false}, nil
+	return Receipt{ContentID: contentID, Bytes: written, StoredBytes: written, Existed: false}, nil
 }
 
 func (repo *Dir) Open(ctx context.Context, contentID string) (io.ReadCloser, error) {
@@ -202,12 +227,18 @@ func parseContentID(contentID string) (string, error) {
 
 // Memory is an in-process CAS used by tests that do not need a directory.
 type Memory struct {
-	mu    sync.Mutex
-	blobs map[string][]byte
+	mu       sync.Mutex
+	blobs    map[string][]byte
+	records  map[RecordRole]map[string][]byte
+	identity string
 }
 
 func NewMemory() *Memory {
-	return &Memory{blobs: make(map[string][]byte)}
+	return &Memory{
+		blobs:    make(map[string][]byte),
+		records:  make(map[RecordRole]map[string][]byte),
+		identity: newInMemoryRepositoryIdentity(),
+	}
 }
 
 func (repo *Memory) Root() string { return ":memory:" }
@@ -235,7 +266,7 @@ func (repo *Memory) PlaceExact(ctx context.Context, contentID string, body io.Re
 	if !existed {
 		repo.blobs[got] = append([]byte(nil), payload...)
 	}
-	return Receipt{ContentID: got, Bytes: int64(len(payload)), Existed: existed}, nil
+	return Receipt{ContentID: got, Bytes: int64(len(payload)), StoredBytes: int64(len(payload)), Existed: existed}, nil
 }
 
 func (repo *Memory) Open(ctx context.Context, contentID string) (io.ReadCloser, error) {
@@ -266,4 +297,74 @@ func (repo *Memory) Verify(ctx context.Context, contentID string) error {
 		return fmt.Errorf("%w: %s", ErrDigestMismatch, contentID)
 	}
 	return nil
+}
+
+func fileSize(path string) (int64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	if !info.Mode().IsRegular() {
+		return 0, fmt.Errorf("repository object is not a regular file: %s", path)
+	}
+	return info.Size(), nil
+}
+
+// publishNoReplace links a fully synced temporary file into place. Unlike
+// rename, link never replaces a concurrently published object.
+func publishNoReplace(tempName, dest, repositoryRoot string) error {
+	if err := os.Link(tempName, dest); err != nil {
+		return err
+	}
+	if err := syncParentChain(filepath.Dir(dest), repositoryRoot); err != nil {
+		_ = os.Remove(dest)
+		return err
+	}
+	if err := os.Remove(tempName); err != nil {
+		return err
+	}
+	return nil
+}
+
+func syncParentChain(start, stop string) error {
+	path := filepath.Clean(start)
+	stop = filepath.Clean(stop)
+	relative, err := filepath.Rel(stop, path)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("sync directory %q is outside repository root %q", start, stop)
+	}
+	for {
+		if err := syncDir(path); err != nil {
+			return err
+		}
+		if path == stop {
+			return nil
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return fmt.Errorf("repository root %q is not an ancestor of %q", stop, start)
+		}
+		path = parent
+	}
+}
+
+func syncFilesystemParentChain(start string) error {
+	root := filepath.Clean(start)
+	for {
+		parent := filepath.Dir(root)
+		if parent == root {
+			break
+		}
+		root = parent
+	}
+	return syncParentChain(start, root)
+}
+
+func syncDir(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return file.Sync()
 }

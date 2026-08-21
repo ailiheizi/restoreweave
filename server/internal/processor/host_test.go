@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,6 +45,12 @@ func TestTextExtractAdmitsUTF8AndSkipsBinary(t *testing.T) {
 	if artifacts[0].State != sqlite.ArtifactAdmitted {
 		t.Fatalf("state = %s", artifacts[0].State)
 	}
+	attempts, err := store.ListProcessorAttempts(ctx, ingested.WorkspaceID, ingested.SnapshotRef)
+	if err != nil {
+		t.Fatalf("list attempts: %v", err)
+	}
+	assertAttempt(t, attempts, CapabilityTextExtract, string(StatusSucceeded), "ADMITTED_ARTIFACT")
+	assertAttempt(t, attempts, CapabilityTextEmbedding, string(StatusInapplicable), "CAPABILITY_NOT_CONFIGURED")
 }
 
 func TestUnsealedOutputIsNotAdmitted(t *testing.T) {
@@ -69,6 +76,11 @@ func TestUnsealedOutputIsNotAdmitted(t *testing.T) {
 	if len(artifacts) != 0 {
 		t.Fatalf("unsealed output was admitted: %+v", artifacts)
 	}
+	attempts, err := store.ListProcessorAttempts(ctx, ingested.WorkspaceID, ingested.SnapshotRef)
+	if err != nil {
+		t.Fatalf("list attempts: %v", err)
+	}
+	assertAttempt(t, attempts, CapabilityTextExtract, string(StatusFailed), "PROCESSOR_STAGE_FAILED")
 }
 
 func TestProcessorPanicDoesNotBlockExactLane(t *testing.T) {
@@ -84,6 +96,12 @@ func TestProcessorPanicDoesNotBlockExactLane(t *testing.T) {
 	ingested, err := service.Ingest(ctx, source)
 	if err != nil {
 		t.Fatalf("ingest with panicking processor: %v", err)
+	}
+	if len(ingested.Warnings) != 1 ||
+		!strings.Contains(ingested.Warnings[0], "subject ") ||
+		!strings.Contains(ingested.Warnings[0], CapabilityTextExtract) ||
+		!strings.Contains(ingested.Warnings[0], "PROCESSOR_STAGE_FAILED") {
+		t.Fatalf("panicking processor warnings = %+v", ingested.Warnings)
 	}
 	if _, err := service.Verify(ctx, ingested.SnapshotRef); err != nil {
 		t.Fatalf("verify: %v", err)
@@ -106,6 +124,11 @@ func TestProcessorPanicDoesNotBlockExactLane(t *testing.T) {
 	if len(artifacts) != 0 {
 		t.Fatalf("panic processor admitted artifacts: %+v", artifacts)
 	}
+	attempts, err := store.ListProcessorAttempts(ctx, ingested.WorkspaceID, ingested.SnapshotRef)
+	if err != nil {
+		t.Fatalf("list attempts: %v", err)
+	}
+	assertAttempt(t, attempts, CapabilityTextExtract, string(StatusFailed), "PROCESSOR_STAGE_FAILED")
 }
 
 func TestProcessorTimeoutDoesNotBlockExactLane(t *testing.T) {
@@ -141,6 +164,21 @@ func TestProcessorTimeoutDoesNotBlockExactLane(t *testing.T) {
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("restored bytes changed")
 	}
+	attempts, err := store.ListProcessorAttempts(ctx, ingested.WorkspaceID, ingested.SnapshotRef)
+	if err != nil {
+		t.Fatalf("list attempts: %v", err)
+	}
+	assertAttempt(t, attempts, CapabilityTextExtract, string(StatusCancelled), "PROCESSOR_STAGE_CANCELLED")
+}
+
+func assertAttempt(t *testing.T, attempts []sqlite.ProcessorAttempt, capabilityID, status, reasonCode string) {
+	t.Helper()
+	for _, attempt := range attempts {
+		if attempt.CapabilityID == capabilityID && attempt.Status == status && attempt.ReasonCode == reasonCode {
+			return
+		}
+	}
+	t.Fatalf("missing attempt capability=%q status=%q reason=%q in %+v", capabilityID, status, reasonCode, attempts)
 }
 
 func testLane(t *testing.T) (*sqlite.Store, repository.Driver) {

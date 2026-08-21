@@ -66,6 +66,17 @@ SELECT namespace_root_id, workspace_id, source_id, scan_generation_id,
 FROM namespace_roots WHERE workspace_id = ? AND namespace_root_id = ?`, workspaceID, rootID))
 }
 
+func (s *Store) GetNamespaceRootBySnapshotRef(ctx context.Context, snapshotRef string) (NamespaceRoot, error) {
+	if err := requireText("snapshot reference", snapshotRef); err != nil {
+		return NamespaceRoot{}, err
+	}
+	return scanNamespaceRoot(s.db.QueryRowContext(ctx, `
+SELECT namespace_root_id, workspace_id, source_id, scan_generation_id,
+       snapshot_ref, name, root_path_key, filesystem_semantics,
+       authority_digest, metadata_json, created_at_ns
+FROM namespace_roots WHERE snapshot_ref = ? LIMIT 1`, snapshotRef))
+}
+
 func scanNamespaceRoot(scanner rowScanner) (NamespaceRoot, error) {
 	var record NamespaceRoot
 	var metadata string
@@ -120,11 +131,14 @@ func (tx *Tx) InsertNamespaceEntry(ctx context.Context, record *NamespaceEntry) 
 	if record.EntryType != EntrySymlink && record.SymlinkTargetRaw != nil {
 		return errors.New("only symlink entries may carry symlink target bytes")
 	}
-	if record.EntryType == EntryFile && record.FileVersionID == "" {
-		return errors.New("a regular-file namespace entry requires a file version id")
-	}
 	if record.EntryType != EntryFile && record.FileVersionID != "" {
 		return errors.New("only regular-file namespace entries may reference a file version")
+	}
+	if record.EntryType == EntryFile && record.FileVersionID == "" && record.ContentID != "" {
+		return errors.New("a regular file without a file version cannot claim a content identity")
+	}
+	if record.EntryType == EntryFile && record.FileVersionID != "" && record.ContentID == "" {
+		return errors.New("a regular file with a file version requires a content identity")
 	}
 	if record.FileVersionID != "" {
 		if err := requireID("file version id", record.FileVersionID); err != nil {

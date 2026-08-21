@@ -168,11 +168,12 @@ func (tx *Tx) InsertPublication(ctx context.Context, record *Publication) error 
 	err = insertOne(ctx, tx.tx, `
 INSERT INTO publications(
     publication_id, workspace_id, snapshot_ref, scan_generation_id,
-    binding_id, namespace_root_id, manifest_digest, committed_at_ns, metadata_json
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`,
+    binding_id, namespace_root_id, manifest_digest, committed_at_ns, metadata_json,
+    plan_digest
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`,
 		record.ID, record.WorkspaceID, record.SnapshotRef, record.ScanGenerationID,
 		record.BindingID, record.NamespaceRootID, record.ManifestDigest,
-		record.CommittedAt.UnixNano(), string(metadata))
+		record.CommittedAt.UnixNano(), string(metadata), record.PlanDigest)
 	if err != nil {
 		return fmt.Errorf("insert publication: %w", err)
 	}
@@ -182,14 +183,16 @@ INSERT INTO publications(
 func (s *Store) GetPublication(ctx context.Context, workspaceID, publicationID string) (Publication, error) {
 	return scanPublication(s.db.QueryRowContext(ctx, `
 SELECT publication_id, workspace_id, snapshot_ref, scan_generation_id,
-       binding_id, namespace_root_id, manifest_digest, committed_at_ns, metadata_json
+       binding_id, namespace_root_id, manifest_digest, committed_at_ns, metadata_json,
+       plan_digest
 FROM publications WHERE workspace_id = ? AND publication_id = ?`, workspaceID, publicationID))
 }
 
 func (s *Store) GetPublicationBySnapshotRef(ctx context.Context, workspaceID, snapshotRef string) (Publication, error) {
 	query := `
 SELECT publication_id, workspace_id, snapshot_ref, scan_generation_id,
-       binding_id, namespace_root_id, manifest_digest, committed_at_ns, metadata_json
+       binding_id, namespace_root_id, manifest_digest, committed_at_ns, metadata_json,
+       plan_digest
 FROM publications WHERE snapshot_ref = ?`
 	args := []any{snapshotRef}
 	if workspaceID != "" {
@@ -200,10 +203,21 @@ FROM publications WHERE snapshot_ref = ?`
 	return scanPublication(s.db.QueryRowContext(ctx, query, args...))
 }
 
+// GetPublicationByPlanDigest returns the immutable publication committed by a
+// particular plan execution. Empty/legacy publication keys are not matched.
+func (s *Store) GetPublicationByPlanDigest(ctx context.Context, workspaceID, planDigest string) (Publication, error) {
+	return scanPublication(s.db.QueryRowContext(ctx, `
+SELECT publication_id, workspace_id, snapshot_ref, scan_generation_id,
+       binding_id, namespace_root_id, manifest_digest, committed_at_ns, metadata_json,
+       plan_digest
+FROM publications WHERE workspace_id = ? AND plan_digest = ?`, workspaceID, planDigest))
+}
+
 func (s *Store) ListPublications(ctx context.Context) ([]Publication, error) {
 	rows, err := s.db.QueryContext(ctx, `
 SELECT publication_id, workspace_id, snapshot_ref, scan_generation_id,
-       binding_id, namespace_root_id, manifest_digest, committed_at_ns, metadata_json
+       binding_id, namespace_root_id, manifest_digest, committed_at_ns, metadata_json,
+       plan_digest
 FROM publications ORDER BY committed_at_ns ASC, snapshot_ref ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("list publications: %w", err)
@@ -230,7 +244,7 @@ func scanPublication(scanner rowScanner) (Publication, error) {
 	if err := scanner.Scan(
 		&record.ID, &record.WorkspaceID, &record.SnapshotRef, &record.ScanGenerationID,
 		&record.BindingID, &record.NamespaceRootID, &record.ManifestDigest,
-		&committed, &metadata,
+		&committed, &metadata, &record.PlanDigest,
 	); err != nil {
 		return record, rowError("publication", err)
 	}

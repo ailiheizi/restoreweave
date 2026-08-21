@@ -275,6 +275,69 @@ func TestLogicalSnapshotNamespacePathTreeAndRangeLookup(t *testing.T) {
 	}
 }
 
+func TestMetadataOnlyRegularFileHasNoContentOrFileVersion(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t, filepath.Join(t.TempDir(), "metadata-only-namespace.sqlite"))
+	defer store.Close()
+
+	workspace := Workspace{ID: testID(t, IDPrefixWorkspace), Name: "Metadata-only workspace"}
+	source := Source{
+		ID: testID(t, IDPrefixSource), WorkspaceID: workspace.ID,
+		StableKey: "local:metadata-only", Kind: "LOCAL_TREE", Locator: "/source", State: SourceActive,
+	}
+	scan := ScanGeneration{
+		ID: testID(t, IDPrefixScanGeneration), WorkspaceID: workspace.ID, SourceID: source.ID,
+		Generation: 1, CaptureSetID: "capture:metadata-only",
+		CaptureSetDigest: "sha256:metadata-only", State: ScanRunning,
+	}
+	root := NamespaceRoot{
+		ID: testID(t, IDPrefixNamespaceRoot), WorkspaceID: workspace.ID,
+		SourceID: source.ID, ScanGenerationID: scan.ID, SnapshotRef: "snapshot:metadata-only",
+		Name: "source", RootPathKey: []byte{}, FilesystemSemantics: "posix",
+		AuthorityDigest: "sha256:metadata-only-root",
+	}
+	size := int64(17)
+	entry := NamespaceEntry{
+		ID: testID(t, IDPrefixNamespaceEntry), WorkspaceID: workspace.ID, RootID: root.ID,
+		RawName: []byte("unreadable.bin"), DisplayName: "unreadable.bin",
+		FullPathKey: []byte("unreadable.bin"), EntryType: EntryFile,
+		LogicalSize: &size, Metadata: json.RawMessage(`{"read_state":"FAILED"}`),
+	}
+	if err := store.Update(ctx, func(tx *Tx) error {
+		if err := tx.InsertWorkspace(ctx, &workspace); err != nil {
+			return err
+		}
+		if err := tx.InsertSource(ctx, &source); err != nil {
+			return err
+		}
+		if err := tx.InsertScanGeneration(ctx, &scan); err != nil {
+			return err
+		}
+		if err := tx.InsertNamespaceRoot(ctx, &root); err != nil {
+			return err
+		}
+		return tx.InsertNamespaceEntry(ctx, &entry)
+	}); err != nil {
+		t.Fatalf("insert metadata-only namespace entry: %v", err)
+	}
+	found, err := store.GetNamespaceEntry(ctx, workspace.ID, entry.ID)
+	if err != nil {
+		t.Fatalf("get metadata-only namespace entry: %v", err)
+	}
+	if found.EntryType != EntryFile || found.ContentID != "" || found.FileVersionID != "" || found.LogicalSize == nil || *found.LogicalSize != size {
+		t.Fatalf("metadata-only namespace entry = %+v", found)
+	}
+
+	invalid := entry
+	invalid.ID = testID(t, IDPrefixNamespaceEntry)
+	invalid.FullPathKey = []byte("false-content.bin")
+	invalid.RawName = []byte("false-content.bin")
+	invalid.ContentID = "sha256:unproven"
+	if err := store.Update(ctx, func(tx *Tx) error { return tx.InsertNamespaceEntry(ctx, &invalid) }); err == nil {
+		t.Fatal("metadata-only entry with an unbacked content identity was accepted")
+	}
+}
+
 func TestNamespaceRejectsCrossRootParentAndInvalidSparseOrdering(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t, filepath.Join(t.TempDir(), "namespace-invariants.sqlite"))

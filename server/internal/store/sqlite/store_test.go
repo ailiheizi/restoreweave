@@ -41,8 +41,9 @@ func TestOpenMigratesAndEnforcesSQLiteSafetyPragmas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SchemaVersion: %v", err)
 	}
-	if version != 6 {
-		t.Fatalf("schema version = %d, want 6", version)
+	wantVersion := migrations[len(migrations)-1].version
+	if version != wantVersion {
+		t.Fatalf("schema version = %d, want %d", version, wantVersion)
 	}
 	pragmas, err := store.RuntimePragmas(ctx)
 	if err != nil {
@@ -64,8 +65,8 @@ func TestOpenMigratesAndEnforcesSQLiteSafetyPragmas(t *testing.T) {
 	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&migrationCount); err != nil {
 		t.Fatalf("count migrations: %v", err)
 	}
-	if migrationCount != 6 {
-		t.Fatalf("migration rows = %d, want 6", migrationCount)
+	if migrationCount != len(migrations) {
+		t.Fatalf("migration rows = %d, want %d", migrationCount, len(migrations))
 	}
 
 	if err := store.Close(); err != nil {
@@ -218,6 +219,19 @@ func TestCatalogRecordsTransactionsJobsAuditAndIdempotency(t *testing.T) {
 	storedPlan, err := store.GetPlan(ctx, workspace.ID, plan.ID)
 	if err != nil || storedPlan.PlanDigest != plan.PlanDigest {
 		t.Fatalf("stored plan = %+v, err=%v", storedPlan, err)
+	}
+	storedJob, err := store.GetJobByPlanKind(ctx, workspace.ID, plan.ID, job.Kind)
+	if err != nil || storedJob.ID != job.ID {
+		t.Fatalf("stored job by plan/kind = %+v, err=%v", storedJob, err)
+	}
+	duplicateJob := job
+	duplicateJob.ID = testID(t, IDPrefixJob)
+	if err := store.Update(ctx, func(tx *Tx) error { return tx.InsertJob(ctx, &duplicateJob) }); !errors.Is(err, ErrConflict) {
+		t.Fatalf("duplicate logical job error = %v, want ErrConflict", err)
+	}
+	storedJob, err = store.GetJobByPlanKind(ctx, workspace.ID, plan.ID, job.Kind)
+	if err != nil || storedJob.ID != job.ID {
+		t.Fatalf("duplicate logical job replaced winner: %+v, err=%v", storedJob, err)
 	}
 
 	secondAudit := AuditEvent{

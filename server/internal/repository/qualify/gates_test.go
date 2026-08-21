@@ -35,6 +35,17 @@ func TestFakeCASPassesDriverGates(t *testing.T) {
 	}
 }
 
+func TestLocalZstdPassesDriverGates(t *testing.T) {
+	ctx := context.Background()
+	repo, err := repository.OpenZstdDir(filepath.Join(t.TempDir(), "repo"))
+	if err != nil {
+		t.Fatalf("open zstd: %v", err)
+	}
+	if err := DriverGates(ctx, repo, []byte("zstd qualification payload")); err != nil {
+		t.Fatalf("zstd driver gates: %v", err)
+	}
+}
+
 func TestResticControlBackupRestoreIndependentHash(t *testing.T) {
 	bin, err := exec.LookPath("restic")
 	if err != nil {

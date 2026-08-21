@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -75,6 +76,21 @@ func TestAnnotationsSurviveIndependentOfIndexPointers(t *testing.T) {
 	if len(all) != 2 {
 		t.Fatalf("all annotations = %+v", all)
 	}
+	revisions, err := store.ListAnnotationRevisions(ctx, workspace.ID, subject)
+	if err != nil {
+		t.Fatalf("list revisions: %v", err)
+	}
+	var tagRevisions []AnnotationRevision
+	for _, revision := range revisions {
+		if revision.AnnotationID == tag.ID {
+			tagRevisions = append(tagRevisions, revision)
+		}
+	}
+	if len(revisions) != 3 || len(tagRevisions) != 2 || tagRevisions[0].Revision != 1 ||
+		tagRevisions[1].Revision != 2 || !tagRevisions[1].Tombstoned ||
+		tagRevisions[1].PredecessorID != tagRevisions[0].ID || !tagRevisions[1].HistoryComplete {
+		t.Fatalf("annotation revisions = %+v", revisions)
+	}
 
 	progress := &Annotation{
 		ID:          testID(t, IDPrefixAnnotation),
@@ -105,11 +121,28 @@ func TestAnnotationsSurviveIndependentOfIndexPointers(t *testing.T) {
 	if err := store.InsertIndexGeneration(ctx, generation); err != nil {
 		t.Fatalf("insert generation: %v", err)
 	}
-	got, err := store.LatestIndexGeneration(ctx, workspace.ID)
+	got, err := store.LatestIndexGeneration(ctx, workspace.ID, "")
 	if err != nil {
 		t.Fatalf("latest generation: %v", err)
 	}
 	if got.ID != generation.ID {
 		t.Fatalf("latest = %+v", got)
+	}
+}
+
+func TestAnnotationRejectsMismatchedBodyDigest(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t, ":memory:")
+	workspace := Workspace{ID: testID(t, IDPrefixWorkspace), Name: "digest mismatch"}
+	if err := store.Update(ctx, func(tx *Tx) error { return tx.InsertWorkspace(ctx, &workspace) }); err != nil {
+		t.Fatal(err)
+	}
+	err := store.CreateAnnotation(ctx, &Annotation{
+		ID: testID(t, IDPrefixAnnotation), WorkspaceID: workspace.ID,
+		SubjectRef: testID(t, IDPrefixNamespaceEntry), Kind: AnnotationNote,
+		Body: "retained body", BodyDigest: "sha256:" + strings.Repeat("0", 64), Revision: 1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "body digest") {
+		t.Fatalf("mismatched digest error = %v", err)
 	}
 }

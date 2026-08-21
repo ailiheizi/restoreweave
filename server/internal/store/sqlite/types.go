@@ -34,6 +34,18 @@ const (
 	IDPrefixIndexGeneration   = "idx"
 	IDPrefixArtifact          = "art"
 	IDPrefixAttempt           = "att"
+	IDPrefixMetadataFact      = "mdf"
+	IDPrefixDescription       = "dsc"
+	IDPrefixSemanticSegment   = "seg"
+	IDPrefixProtectionRecord  = "prt"
+	IDPrefixRecoveryReference = "rrf"
+	IDPrefixExternalBinding   = "sbd"
+	IDPrefixExternalLocator   = "elc"
+	// Compatibility aliases for callers that use the requirements vocabulary.
+	IDPrefixProtection    = IDPrefixProtectionRecord
+	IDPrefixRecovery      = IDPrefixRecoveryReference
+	IDPrefixSourceBinding = IDPrefixExternalBinding
+	IDPrefixSourceLocator = IDPrefixExternalLocator
 )
 
 var (
@@ -495,6 +507,7 @@ type CaptureRootBinding struct {
 type Publication struct {
 	ID               string
 	WorkspaceID      string
+	PlanDigest       string
 	SnapshotRef      string
 	ScanGenerationID string
 	BindingID        string
@@ -528,13 +541,33 @@ type Annotation struct {
 	UpdatedAt           time.Time
 }
 
-// IndexGeneration is a catalog pointer to one disposable FTS5 database file.
+// AnnotationRevision is an immutable portable revision. Annotation remains the
+// current operational projection; this record preserves every admitted body
+// and tombstone transition for recovery export.
+type AnnotationRevision struct {
+	ID              string
+	AnnotationID    string
+	WorkspaceID     string
+	SubjectRef      string
+	Kind            AnnotationKind
+	Body            string
+	BodyDigest      string
+	Revision        int64
+	PredecessorID   string
+	Tombstoned      bool
+	HistoryComplete bool
+	CreatedAt       time.Time
+}
+
+// IndexGeneration is a catalog pointer to one disposable index database file.
+// Dimension names the retrieval space; the file is never recovery authority.
 type IndexGeneration struct {
 	ID              string
 	WorkspaceID     string
 	SnapshotRef     string
 	NamespaceRootID string
 	DBPath          string
+	Dimension       string
 	CreatedAt       time.Time
 }
 
@@ -569,4 +602,259 @@ type ProcessorArtifact struct {
 	Envelope       json.RawMessage
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
+}
+
+// ProcessorAttempt is the append-only outcome of one host-routed processor
+// capability invocation. It remains durable even when no artifact is
+// admitted, so replay and audit can distinguish unavailable, inapplicable,
+// failed, and cancelled processing from an absent record.
+type ProcessorAttempt struct {
+	ID              string
+	WorkspaceID     string
+	SubjectRef      string
+	SnapshotRef     string
+	RouteDigest     string
+	Route           json.RawMessage
+	Stage           string
+	CapabilityID    string
+	Status          string
+	ReasonCode      string
+	Reason          string
+	Provenance      json.RawMessage
+	FenceToken      int64
+	ProcessorDigest string
+	CreatedAt       time.Time
+	FinishedAt      time.Time
+}
+
+// ProtectionMode is the explicit policy selected for a subject. In
+// particular, LINK_ONLY and METADATA_ONLY are deliberate outcomes and must
+// never be inferred from a missing representation row.
+type ProtectionMode string
+
+const (
+	ProtectionStoreExact                         ProtectionMode = "STORE_EXACT"
+	ProtectionStoreExactWithExternalFallback     ProtectionMode = "STORE_EXACT_WITH_EXTERNAL_FALLBACK"
+	ProtectionLinkOnly                           ProtectionMode = "LINK_ONLY"
+	ProtectionMetadataOnly                       ProtectionMode = "METADATA_ONLY"
+	ProtectionModeStoreExact                                    = ProtectionStoreExact
+	ProtectionModeStoreExactWithExternalFallback                = ProtectionStoreExactWithExternalFallback
+	ProtectionModeLinkOnly                                      = ProtectionLinkOnly
+	ProtectionModeMetadataOnly                                  = ProtectionMetadataOnly
+)
+
+// ProtectionOutcome is the user-visible recovery health claim. It is kept
+// separate from ProtectionMode because a selected policy and its current
+// validation state answer different questions.
+type ProtectionOutcome string
+
+const (
+	ProtectionExactProtected ProtectionOutcome = "EXACT_PROTECTED"
+	// ProtectionExact is the compact product name for the existing
+	// EXACT_PROTECTED value. Keep the persisted value stable for v8 records.
+	ProtectionExact                        ProtectionOutcome = ProtectionExactProtected
+	ProtectionExactFallback                ProtectionOutcome = "EXACT_FALLBACK"
+	ProtectionExternalReplayable           ProtectionOutcome = "EXTERNAL_REPLAYABLE"
+	ProtectionLinkOnlyUnprotected          ProtectionOutcome = "LINK_ONLY_UNPROTECTED"
+	ProtectionExplicitlyUnprotected        ProtectionOutcome = "EXPLICITLY_UNPROTECTED"
+	ProtectionBlocked                      ProtectionOutcome = "BLOCKED"
+	ProtectionUnavailable                  ProtectionOutcome = "UNAVAILABLE"
+	ProtectionOutcomeExactProtected                          = ProtectionExactProtected
+	ProtectionOutcomeExactFallback                           = ProtectionExactFallback
+	ProtectionOutcomeExternalReplayable                      = ProtectionExternalReplayable
+	ProtectionOutcomeLinkOnlyUnprotected                     = ProtectionLinkOnlyUnprotected
+	ProtectionOutcomeExplicitlyUnprotected                   = ProtectionExplicitlyUnprotected
+	ProtectionOutcomeBlocked                                 = ProtectionBlocked
+	ProtectionOutcomeUnavailable                             = ProtectionUnavailable
+)
+
+// ProtectionRecord is the durable policy and health fact for one subject.
+// SubjectRef is intentionally opaque: the catalog can attach protection to a
+// namespace entry, an imported subject, or a future subject implementation
+// without making the storage model depend on one presentation.
+type ProtectionRecord struct {
+	ID                    string
+	WorkspaceID           string
+	SubjectRef            string
+	Mode                  ProtectionMode
+	Outcome               ProtectionOutcome
+	ExpectedContentID     string
+	ExpectedLogicalLength *int64
+	LocalRepresentationID string
+	PolicyDecisionRef     string
+	LastVerificationRef   string
+	LastVerifiedAt        *time.Time
+	Revision              int64
+	Metadata              json.RawMessage
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
+}
+
+type RecoveryReferenceKind string
+
+const (
+	RecoveryExactRepresentation          RecoveryReferenceKind = "EXACT_REPRESENTATION"
+	RecoveryExactReversible              RecoveryReferenceKind = "EXACT_REVERSIBLE"
+	RecoveryExternalLocator              RecoveryReferenceKind = "EXTERNAL_LOCATOR"
+	RecoveryUserRecipe                   RecoveryReferenceKind = "USER_RECIPE"
+	RecoveryReferenceExactRepresentation                       = RecoveryExactRepresentation
+	RecoveryReferenceExactReversible                           = RecoveryExactReversible
+	RecoveryReferenceExternalLocator                           = RecoveryExternalLocator
+	RecoveryReferenceUserRecipe                                = RecoveryUserRecipe
+)
+
+type RecoveryClaim string
+
+const (
+	RecoveryClaimRestoreVerified     RecoveryClaim = "RESTORE_VERIFIED"
+	RecoveryClaimExternalReplayable  RecoveryClaim = "EXTERNAL_REPLAYABLE"
+	RecoveryClaimLinkOnlyUnprotected RecoveryClaim = "LINK_ONLY_UNPROTECTED"
+	RecoveryClaimUnavailable         RecoveryClaim = "UNAVAILABLE"
+)
+
+// RecoveryReference is one ordered, verifiable route to recover or reacquire
+// a subject. Exactly one route may be selected by kind: local representation,
+// external binding, or a user-supplied recipe. Recipe and verification JSON
+// are canonical portable records, not opaque backend state.
+type RecoveryReference struct {
+	ID                    string
+	WorkspaceID           string
+	ProtectionRecordID    string
+	SubjectRef            string
+	Kind                  RecoveryReferenceKind
+	Priority              int64
+	Claim                 RecoveryClaim
+	ExpectedContentID     string
+	ExpectedLogicalLength *int64
+	RepresentationID      string
+	ExternalBindingID     string
+	CodecProfileRef       string
+	Recipe                json.RawMessage
+	Verification          json.RawMessage
+	Status                string
+	LastValidatedAt       *time.Time
+	ExpiresAt             *time.Time
+	PolicyRef             string
+	RightsEvidenceRef     string
+	CredentialRef         string
+	OperatorDecisionRef   string
+	RecordDigest          string
+	Metadata              json.RawMessage
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
+}
+
+// SourceBinding is the immutable provider identity used to reacquire content.
+// ExternalBinding is the storage-facing name; the alias keeps the terminology
+// used by the requirements available to callers.
+type ExternalBinding struct {
+	ID                string
+	WorkspaceID       string
+	SubjectRef        string
+	ProviderKind      string
+	StableIdentity    string
+	Revision          int64
+	BindingDigest     string
+	CredentialRef     string
+	RightsEvidenceRef string
+	Metadata          json.RawMessage
+	CreatedAt         time.Time
+}
+
+type SourceBinding = ExternalBinding
+
+// ExternalLocator is one typed, ordered locator inside an ExternalBinding.
+// Locator is retained as supplied (credentials must be represented by
+// CredentialRef, never embedded in this field).
+type ExternalLocator struct {
+	ID                    string
+	WorkspaceID           string
+	BindingID             string
+	Revision              int64
+	Priority              int64
+	Kind                  string
+	Locator               string
+	DisplayLocator        string
+	ExpectedContentID     string
+	ExpectedLogicalLength *int64
+	CredentialRef         string
+	RightsEvidenceRef     string
+	Availability          string
+	ValidationStatus      string
+	ExpiresAt             *time.Time
+	LastValidatedAt       *time.Time
+	ValidationRef         string
+	Metadata              json.RawMessage
+	CreatedAt             time.Time
+}
+
+// MetadataFact is one namespaced, provenance-bearing fact about a subject.
+// Keeping facts as rows rather than flattening them into an index document
+// lets structured filters survive index rebuilds and provider replacement.
+type MetadataFact struct {
+	ID             string
+	WorkspaceID    string
+	SubjectRef     string
+	Namespace      string
+	Key            string
+	Value          json.RawMessage
+	ValueType      string
+	AuthorityClass string
+	SourceRef      string
+	Confidence     *float64
+	Revision       int64
+	CreatedAt      time.Time
+}
+
+// DescriptionKind identifies who or what authored a durable long-form
+// description. Generated text never overwrites user-authored revisions.
+type DescriptionKind string
+
+const (
+	DescriptionUser       DescriptionKind = "USER"
+	DescriptionImported   DescriptionKind = "IMPORTED"
+	DescriptionExtracted  DescriptionKind = "EXTRACTED"
+	DescriptionAISummary  DescriptionKind = "AI_SUMMARY"
+	DescriptionAIAnalysis DescriptionKind = "AI_ANALYSIS"
+)
+
+// DescriptionDocument is the durable source text used by lexical and
+// semantic discovery. Body remains authoritative; vectors are rebuildable.
+type DescriptionDocument struct {
+	ID              string
+	WorkspaceID     string
+	SubjectRef      string
+	Kind            DescriptionKind
+	Title           string
+	Language        string
+	Body            string
+	BodyDigest      string
+	SourceRef       string
+	ProducerProfile string
+	Confidence      *float64
+	Coverage        *float64
+	Visibility      string
+	Accepted        bool
+	Revision        int64
+	PredecessorID   string
+	Metadata        json.RawMessage
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
+// SemanticSegment is an ordered chunk of a document. Segment text and its
+// provenance are durable; an embedding generation may be deleted/rebuilt.
+type SemanticSegment struct {
+	ID          string
+	WorkspaceID string
+	DocumentID  string
+	SubjectRef  string
+	Ordinal     int64
+	Text        string
+	TextDigest  string
+	Language    string
+	Section     string
+	SourceSpan  json.RawMessage
+	Metadata    json.RawMessage
+	CreatedAt   time.Time
 }

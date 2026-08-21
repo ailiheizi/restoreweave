@@ -505,25 +505,76 @@ INSERT INTO plans(
 	return nil
 }
 
+func (s *Store) GetPlanByDigest(ctx context.Context, workspaceID, digest string) (Plan, error) {
+	if err := requireID("workspace id", workspaceID); err != nil {
+		return Plan{}, err
+	}
+	if err := requireText("plan digest", digest); err != nil {
+		return Plan{}, err
+	}
+	return scanPlan(s.db.QueryRowContext(ctx, `
+SELECT plan_id, workspace_id, scan_generation_id, kind, state,
+       policy_revision, plan_json, plan_digest, created_at_ns
+FROM plans WHERE workspace_id = ? AND plan_digest = ?`, workspaceID, digest))
+}
+
 func (s *Store) GetPlan(ctx context.Context, workspaceID, planID string) (Plan, error) {
+	return scanPlan(s.db.QueryRowContext(ctx, `
+SELECT plan_id, workspace_id, scan_generation_id, kind, state,
+       policy_revision, plan_json, plan_digest, created_at_ns
+FROM plans WHERE workspace_id = ? AND plan_id = ?`, workspaceID, planID))
+}
+
+func scanPlan(scanner rowScanner) (Plan, error) {
 	var record Plan
 	var scanID sql.NullString
 	var planJSON string
 	var created int64
-	err := s.db.QueryRowContext(ctx, `
-SELECT plan_id, workspace_id, scan_generation_id, kind, state,
-       policy_revision, plan_json, plan_digest, created_at_ns
-FROM plans WHERE workspace_id = ? AND plan_id = ?`, workspaceID, planID).Scan(
+	if err := scanner.Scan(
 		&record.ID, &record.WorkspaceID, &scanID, &record.Kind, &record.State,
 		&record.PolicyRevision, &planJSON, &record.PlanDigest, &created,
-	)
-	if err != nil {
+	); err != nil {
 		return record, rowError("plan", err)
 	}
 	record.ScanGenerationID = scanID.String
 	record.Plan = json.RawMessage(planJSON)
 	record.CreatedAt = time.Unix(0, created).UTC()
 	return record, nil
+}
+
+func (s *Store) ListPlans(ctx context.Context, workspaceID string) ([]Plan, error) {
+	if err := requireID("workspace id", workspaceID); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT plan_id, workspace_id, scan_generation_id, kind, state,
+       policy_revision, plan_json, plan_digest, created_at_ns
+FROM plans WHERE workspace_id = ? ORDER BY created_at_ns ASC, plan_id ASC`, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("list plans: %w", err)
+	}
+	defer rows.Close()
+	var plans []Plan
+	for rows.Next() {
+		var record Plan
+		var scanID sql.NullString
+		var planJSON string
+		var created int64
+		if err := rows.Scan(
+			&record.ID, &record.WorkspaceID, &scanID, &record.Kind, &record.State,
+			&record.PolicyRevision, &planJSON, &record.PlanDigest, &created,
+		); err != nil {
+			return nil, rowError("plan", err)
+		}
+		record.ScanGenerationID = scanID.String
+		record.Plan = json.RawMessage(planJSON)
+		record.CreatedAt = time.Unix(0, created).UTC()
+		plans = append(plans, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list plans: %w", err)
+	}
+	return plans, nil
 }
 
 func (tx *Tx) InsertJob(ctx context.Context, record *Job) error {
@@ -598,6 +649,76 @@ ON CONFLICT DO NOTHING`,
 	return nil
 }
 
+func (s *Store) CountPlans(ctx context.Context) (int, error) {
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM plans`).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count plans: %w", err)
+	}
+	return count, nil
+}
+
+func (s *Store) ListRecentPlans(ctx context.Context, limit int) ([]Plan, error) {
+	if limit <= 0 || limit > 100 {
+		return nil, errors.New("plan list limit must be between 1 and 100")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT plan_id, workspace_id, scan_generation_id, kind, state,
+       policy_revision, plan_json, plan_digest, created_at_ns
+FROM plans ORDER BY created_at_ns DESC, plan_id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list recent plans: %w", err)
+	}
+	defer rows.Close()
+	var plans []Plan
+	for rows.Next() {
+		record, err := scanPlan(rows)
+		if err != nil {
+			return nil, err
+		}
+		plans = append(plans, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list recent plans: %w", err)
+	}
+	return plans, nil
+}
+
+func (s *Store) CountJobs(ctx context.Context) (int, error) {
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs`).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count jobs: %w", err)
+	}
+	return count, nil
+}
+
+func (s *Store) ListRecentJobs(ctx context.Context, limit int) ([]Job, error) {
+	if limit <= 0 || limit > 100 {
+		return nil, errors.New("job list limit must be between 1 and 100")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT job_id, workspace_id, plan_id, kind, state, input_json, checkpoint_json,
+       result_json, error_code, attempt, max_attempts, lease_owner, lease_token,
+       fencing_token, lease_until_ns, cancellation_asked, revision,
+       created_at_ns, updated_at_ns
+FROM jobs ORDER BY updated_at_ns DESC, job_id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list recent jobs: %w", err)
+	}
+	defer rows.Close()
+	var jobs []Job
+	for rows.Next() {
+		record, err := scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list recent jobs: %w", err)
+	}
+	return jobs, nil
+}
+
 func (s *Store) GetJob(ctx context.Context, workspaceID, jobID string) (Job, error) {
 	return scanJob(s.db.QueryRowContext(ctx, `
 SELECT job_id, workspace_id, plan_id, kind, state, input_json, checkpoint_json,
@@ -605,6 +726,27 @@ SELECT job_id, workspace_id, plan_id, kind, state, input_json, checkpoint_json,
        fencing_token, lease_until_ns, cancellation_asked, revision,
        created_at_ns, updated_at_ns
 FROM jobs WHERE workspace_id = ? AND job_id = ?`, workspaceID, jobID))
+}
+
+// GetJobByPlanKind returns the single durable execution record for a plan and
+// job kind. A partial unique index prevents two controllers from creating
+// competing logical executions for the same immutable plan.
+func (s *Store) GetJobByPlanKind(ctx context.Context, workspaceID, planID, kind string) (Job, error) {
+	if err := requireID("workspace id", workspaceID); err != nil {
+		return Job{}, err
+	}
+	if err := requireID("plan id", planID); err != nil {
+		return Job{}, err
+	}
+	if err := requireText("job kind", kind); err != nil {
+		return Job{}, err
+	}
+	return scanJob(s.db.QueryRowContext(ctx, `
+SELECT job_id, workspace_id, plan_id, kind, state, input_json, checkpoint_json,
+       result_json, error_code, attempt, max_attempts, lease_owner, lease_token,
+       fencing_token, lease_until_ns, cancellation_asked, revision,
+       created_at_ns, updated_at_ns
+FROM jobs WHERE workspace_id = ? AND plan_id = ? AND kind = ?`, workspaceID, planID, kind))
 }
 
 func scanJob(scanner rowScanner) (Job, error) {
@@ -858,6 +1000,58 @@ LIMIT ?`, workspaceID, afterSequence, limit)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate audit events: %w", err)
+	}
+	return events, nil
+}
+
+func (s *Store) ListJobAuditEvents(
+	ctx context.Context,
+	workspaceID, jobID string,
+	afterSequence int64,
+	limit int,
+) ([]AuditEvent, error) {
+	if err := requireID("workspace id", workspaceID); err != nil {
+		return nil, err
+	}
+	if err := requireID("job id", jobID); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 10_000 {
+		return nil, errors.New("job event limit must be between 1 and 10000")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT audit_sequence, audit_event_id, workspace_id, actor, action,
+       target_type, target_id, request_id, attempt, source, policy_ref,
+       approval_ref, fencing_token, outcome, details_json,
+       previous_event_digest, event_digest, occurred_at_ns
+FROM audit_events
+WHERE workspace_id = ? AND target_type = 'JOB' AND target_id = ? AND audit_sequence > ?
+ORDER BY audit_sequence
+LIMIT ?`, workspaceID, jobID, afterSequence, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list job audit events: %w", err)
+	}
+	defer rows.Close()
+	var events []AuditEvent
+	for rows.Next() {
+		var event AuditEvent
+		var details string
+		var occurred int64
+		if err := rows.Scan(
+			&event.Sequence, &event.ID, &event.WorkspaceID, &event.Actor,
+			&event.Action, &event.TargetType, &event.TargetID, &event.RequestID,
+			&event.Attempt, &event.Source, &event.PolicyRef, &event.ApprovalRef,
+			&event.FencingToken, &event.Outcome, &details,
+			&event.PreviousEventDigest, &event.EventDigest, &occurred,
+		); err != nil {
+			return nil, fmt.Errorf("scan job audit event: %w", err)
+		}
+		event.Details = json.RawMessage(details)
+		event.OccurredAt = time.Unix(0, occurred).UTC()
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list job audit events: %w", err)
 	}
 	return events, nil
 }

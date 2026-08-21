@@ -2,6 +2,8 @@ package sqlite
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -42,6 +44,15 @@ func (tx *Tx) InsertProcessorArtifact(ctx context.Context, record *ProcessorArti
 	}
 	if record.ByteLength < 0 {
 		return errors.New("processor artifact byte length cannot be negative")
+	}
+	body := []byte(record.Body)
+	if record.ByteLength != int64(len(body)) {
+		return fmt.Errorf("processor artifact byte length is %d, want %d", record.ByteLength, len(body))
+	}
+	digest := sha256.Sum256(body)
+	expectedDigest := "sha256:" + hex.EncodeToString(digest[:])
+	if record.Digest != expectedDigest {
+		return fmt.Errorf("processor artifact digest is %q, want %q", record.Digest, expectedDigest)
 	}
 	if record.FenceToken < 1 {
 		return errors.New("processor artifact fence token must be positive")

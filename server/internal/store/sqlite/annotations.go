@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -37,8 +38,11 @@ func (tx *Tx) InsertAnnotation(ctx context.Context, record *Annotation) error {
 	if record.Revision < 1 {
 		return errors.New("annotation revision must be positive")
 	}
+	wantDigest := digestText(record.Body)
 	if record.BodyDigest == "" {
-		record.BodyDigest = digestText(record.Body)
+		record.BodyDigest = wantDigest
+	} else if record.BodyDigest != wantDigest {
+		return fmt.Errorf("annotation body digest is %q, want %q", record.BodyDigest, wantDigest)
 	}
 	record.CreatedAt = recordTime(record.CreatedAt, tx.now)
 	if record.UpdatedAt.IsZero() {
@@ -57,7 +61,17 @@ INSERT INTO annotations(
 	if err != nil {
 		return fmt.Errorf("insert annotation: %w", err)
 	}
-	return nil
+	revision := AnnotationRevision{
+		ID: annotationRevisionID(record.ID, record.Revision), AnnotationID: record.ID,
+		WorkspaceID: record.WorkspaceID, SubjectRef: record.SubjectRef, Kind: record.Kind,
+		Body: record.Body, BodyDigest: record.BodyDigest, Revision: record.Revision,
+		Tombstoned: record.Tombstoned, HistoryComplete: record.Revision == 1,
+		CreatedAt: record.UpdatedAt,
+	}
+	if record.PredecessorRevision > 0 {
+		revision.PredecessorID = annotationRevisionID(record.ID, record.PredecessorRevision)
+	}
+	return tx.insertAnnotationRevision(ctx, revision)
 }
 
 func (tx *Tx) UpdateAnnotationRevision(
@@ -73,6 +87,17 @@ func (tx *Tx) UpdateAnnotationRevision(
 	}
 	if err := requireID("annotation id", annotationID); err != nil {
 		return err
+	}
+	if !tombstone && strings.TrimSpace(body) == "" {
+		return errors.New("annotation body is required")
+	}
+	current, err := scanAnnotation(tx.tx.QueryRowContext(ctx, annotationSelect+`
+WHERE workspace_id = ? AND annotation_id = ?`, workspaceID, annotationID))
+	if err != nil {
+		return err
+	}
+	if current.Revision != expectedRevision || current.Tombstoned {
+		return ErrConflict
 	}
 	updatedAt = recordTime(updatedAt, tx.now)
 	digest := digestText(body)
@@ -93,7 +118,71 @@ WHERE workspace_id = ? AND annotation_id = ? AND revision = ? AND tombstoned = 0
 	if changed != 1 {
 		return ErrConflict
 	}
-	return nil
+	previous, err := tx.getAnnotationRevision(ctx, workspaceID, annotationRevisionID(annotationID, expectedRevision))
+	if err != nil {
+		return err
+	}
+	return tx.insertAnnotationRevision(ctx, AnnotationRevision{
+		ID: annotationRevisionID(annotationID, expectedRevision+1), AnnotationID: annotationID,
+		WorkspaceID: workspaceID, SubjectRef: current.SubjectRef, Kind: current.Kind,
+		Body: body, BodyDigest: digest, Revision: expectedRevision + 1,
+		PredecessorID: previous.ID, Tombstoned: tombstone,
+		HistoryComplete: previous.HistoryComplete, CreatedAt: updatedAt,
+	})
+}
+
+func annotationRevisionID(annotationID string, revision int64) string {
+	return fmt.Sprintf("%s@%d", annotationID, revision)
+}
+
+func (tx *Tx) insertAnnotationRevision(ctx context.Context, record AnnotationRevision) error {
+	var predecessor any
+	if record.PredecessorID != "" {
+		predecessor = record.PredecessorID
+	}
+	return insertOne(ctx, tx.tx, `
+INSERT INTO annotation_revisions(
+    annotation_revision_id, annotation_id, workspace_id, subject_ref, kind,
+    body, body_digest, revision, predecessor_revision_id, tombstoned,
+    history_complete, created_at_ns
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT DO NOTHING`,
+		record.ID, record.AnnotationID, record.WorkspaceID, record.SubjectRef,
+		record.Kind, record.Body, record.BodyDigest, record.Revision, predecessor,
+		boolInt(record.Tombstoned), boolInt(record.HistoryComplete),
+		record.CreatedAt.UTC().UnixNano())
+}
+
+func (tx *Tx) getAnnotationRevision(ctx context.Context, workspaceID, revisionID string) (AnnotationRevision, error) {
+	return scanAnnotationRevision(tx.tx.QueryRowContext(ctx, annotationRevisionSelect+`
+WHERE workspace_id = ? AND annotation_revision_id = ?`, workspaceID, revisionID))
+}
+
+func (s *Store) ListAnnotationRevisions(ctx context.Context, workspaceID, subjectRef string) ([]AnnotationRevision, error) {
+	query := annotationRevisionSelect + `WHERE workspace_id = ?`
+	args := []any{workspaceID}
+	if subjectRef != "" {
+		query += ` AND subject_ref = ?`
+		args = append(args, subjectRef)
+	}
+	query += ` ORDER BY subject_ref, annotation_id, revision`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list annotation revisions: %w", err)
+	}
+	defer rows.Close()
+	var records []AnnotationRevision
+	for rows.Next() {
+		record, err := scanAnnotationRevision(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate annotation revisions: %w", err)
+	}
+	return records, nil
 }
 
 func (s *Store) CreateAnnotation(ctx context.Context, record *Annotation) error {
@@ -184,29 +273,35 @@ func (s *Store) InsertIndexGeneration(ctx context.Context, record *IndexGenerati
 				return err
 			}
 		}
+		if strings.TrimSpace(record.Dimension) == "" {
+			record.Dimension = "lexical-metadata-fts"
+		}
 		record.CreatedAt = recordTime(record.CreatedAt, tx.now)
 		return insertOne(ctx, tx.tx, `
 INSERT INTO index_generations(
-    generation_id, workspace_id, snapshot_ref, namespace_root_id, db_path, created_at_ns
-) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`,
+    generation_id, workspace_id, snapshot_ref, namespace_root_id, db_path, dimension, created_at_ns
+) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`,
 			record.ID, record.WorkspaceID, record.SnapshotRef, record.NamespaceRootID,
-			record.DBPath, record.CreatedAt.UnixNano())
+			record.DBPath, record.Dimension, record.CreatedAt.UnixNano())
 	})
 }
 
 func (s *Store) GetIndexGeneration(ctx context.Context, generationID string) (IndexGeneration, error) {
 	return scanIndexGeneration(s.db.QueryRowContext(ctx, `
-SELECT generation_id, workspace_id, snapshot_ref, namespace_root_id, db_path, created_at_ns
+SELECT generation_id, workspace_id, snapshot_ref, namespace_root_id, db_path, dimension, created_at_ns
 FROM index_generations WHERE generation_id = ?`, generationID))
 }
 
-func (s *Store) LatestIndexGeneration(ctx context.Context, workspaceID string) (IndexGeneration, error) {
+func (s *Store) LatestIndexGeneration(ctx context.Context, workspaceID, dimension string) (IndexGeneration, error) {
+	if strings.TrimSpace(dimension) == "" {
+		dimension = "lexical-metadata-fts"
+	}
 	query := `
-SELECT generation_id, workspace_id, snapshot_ref, namespace_root_id, db_path, created_at_ns
-FROM index_generations`
-	args := []any{}
+SELECT generation_id, workspace_id, snapshot_ref, namespace_root_id, db_path, dimension, created_at_ns
+FROM index_generations WHERE dimension = ?`
+	args := []any{dimension}
 	if workspaceID != "" {
-		query += ` WHERE workspace_id = ?`
+		query += ` AND workspace_id = ?`
 		args = append(args, workspaceID)
 	}
 	query += ` ORDER BY created_at_ns DESC, generation_id DESC LIMIT 1`
@@ -216,7 +311,8 @@ FROM index_generations`
 func (s *Store) LatestPublication(ctx context.Context, workspaceID string) (Publication, error) {
 	query := `
 SELECT publication_id, workspace_id, snapshot_ref, scan_generation_id,
-       binding_id, namespace_root_id, manifest_digest, committed_at_ns, metadata_json
+       binding_id, namespace_root_id, manifest_digest, committed_at_ns, metadata_json,
+       plan_digest
 FROM publications`
 	args := []any{}
 	if workspaceID != "" {
@@ -231,6 +327,12 @@ const annotationSelect = `
 SELECT annotation_id, workspace_id, subject_ref, kind, body, body_digest,
        revision, predecessor_revision, tombstoned, created_at_ns, updated_at_ns
 FROM annotations `
+
+const annotationRevisionSelect = `
+SELECT annotation_revision_id, annotation_id, workspace_id, subject_ref, kind,
+       body, body_digest, revision, predecessor_revision_id, tombstoned,
+       history_complete, created_at_ns
+FROM annotation_revisions `
 
 func scanAnnotation(scanner rowScanner) (Annotation, error) {
 	var record Annotation
@@ -249,12 +351,33 @@ func scanAnnotation(scanner rowScanner) (Annotation, error) {
 	return record, nil
 }
 
+func scanAnnotationRevision(scanner rowScanner) (AnnotationRevision, error) {
+	var record AnnotationRevision
+	var predecessor sql.NullString
+	var tombstoned, historyComplete int
+	var created int64
+	if err := scanner.Scan(
+		&record.ID, &record.AnnotationID, &record.WorkspaceID, &record.SubjectRef,
+		&record.Kind, &record.Body, &record.BodyDigest, &record.Revision,
+		&predecessor, &tombstoned, &historyComplete, &created,
+	); err != nil {
+		return record, rowError("annotation revision", err)
+	}
+	if predecessor.Valid {
+		record.PredecessorID = predecessor.String
+	}
+	record.Tombstoned = tombstoned == 1
+	record.HistoryComplete = historyComplete == 1
+	record.CreatedAt = time.Unix(0, created).UTC()
+	return record, nil
+}
+
 func scanIndexGeneration(scanner rowScanner) (IndexGeneration, error) {
 	var record IndexGeneration
 	var created int64
 	if err := scanner.Scan(
 		&record.ID, &record.WorkspaceID, &record.SnapshotRef,
-		&record.NamespaceRootID, &record.DBPath, &created,
+		&record.NamespaceRootID, &record.DBPath, &record.Dimension, &created,
 	); err != nil {
 		return record, rowError("index generation", err)
 	}

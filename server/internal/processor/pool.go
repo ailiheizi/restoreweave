@@ -31,23 +31,28 @@ func (p *pool) run(ctx context.Context, fn func(context.Context) error) error {
 		return ctx.Err()
 	case <-p.slots:
 	}
-	defer func() { p.slots <- struct{}{} }()
 
 	runCtx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
+		var runErr error
 		defer func() {
 			if rec := recover(); rec != nil {
-				done <- fmt.Errorf("processor panic: %v", rec)
+				runErr = fmt.Errorf("processor panic: %v", rec)
 			}
+			done <- runErr
+			// A non-cooperative processor keeps its concurrency slot until it
+			// actually exits. This bounds leaked work after the caller's
+			// deadline without making the caller wait indefinitely.
+			p.slots <- struct{}{}
 		}()
-		done <- fn(runCtx)
+		runErr = fn(runCtx)
 	}()
 	select {
 	case err := <-done:
 		return err
 	case <-runCtx.Done():
-		return <-done
+		return runCtx.Err()
 	}
 }

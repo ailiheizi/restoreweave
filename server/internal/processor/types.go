@@ -19,15 +19,26 @@ import (
 )
 
 const (
-	CapabilityTextExtract = "extract.text.v1"
-	CapabilityAudioTags   = "extract.audio.tags.v1"
-	CapabilityBookMeta    = "extract.book.meta.v1"
-	SchemaExtractedTextV1 = "restoreweave.artifact.extracted-text.v1"
-	SchemaAudioTrackV1    = "restoreweave.domain.audio.track/v1"
-	SchemaBookWorkV1      = "restoreweave.domain.book.work/v1"
-	MediaTypeUTF8Text     = "text/plain; charset=utf-8"
-	MediaTypeAudioJSON    = "application/json"
-	MediaTypeBookJSON     = "application/json"
+	CapabilityTextExtract       = "extract.text.v1"
+	CapabilityAudioTags         = "extract.audio.tags.v1"
+	CapabilityBookMeta          = "extract.book.meta.v1"
+	CapabilityAudioFingerprint  = "fingerprint.audio.fixture.v1"
+	CapabilityTextEmbedding     = "embed.text.fixture.v1"
+	CapabilityClipEmbedding     = "embed.clip.fixture.v1"
+	SchemaExtractedTextV1       = "restoreweave.artifact.extracted-text.v1"
+	SchemaAudioTrackV1          = "restoreweave.domain.audio.track/v1"
+	SchemaBookWorkV1            = "restoreweave.domain.book.work/v1"
+	SchemaAcousticFingerprintV1 = "restoreweave.artifact.acoustic-fingerprint.v1"
+	SchemaTextEmbeddingV1       = "restoreweave.artifact.text-embedding.v1"
+	SchemaClipEmbeddingV1       = "restoreweave.artifact.clip-embedding.v1"
+	MediaTypeUTF8Text           = "text/plain; charset=utf-8"
+	MediaTypeAudioJSON          = "application/json"
+	MediaTypeBookJSON           = "application/json"
+	MediaTypeFingerprintJSON    = "application/json"
+	MediaTypeEmbeddingJSON      = "application/json"
+	FixtureFingerprintAlgorithm = "fixture-v1"
+	FixtureTextSpace            = "fixture-text-v1"
+	FixtureClipSpace            = "fixture-clip-v1"
 
 	AuthorityStagedArtifact = "STAGED_ARTIFACT"
 	LifecycleRebuildable    = "REBUILDABLE_DERIVATIVE"
@@ -128,6 +139,27 @@ func SchemaRefAudioTrack() string {
 func SchemaRefBookWork() string {
 	sum := sha256.Sum256([]byte(SchemaBookWorkV1))
 	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func SchemaRefAcousticFingerprint() string {
+	sum := sha256.Sum256([]byte(SchemaAcousticFingerprintV1))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func SchemaRefTextEmbedding() string {
+	sum := sha256.Sum256([]byte(SchemaTextEmbeddingV1))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func SchemaRefClipEmbedding() string {
+	sum := sha256.Sum256([]byte(SchemaClipEmbeddingV1))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// DefaultProcessors are the in-process EXTRACT pack. Fixture fingerprint
+// and embedding processors are opt-in and are not part of default ingest.
+func DefaultProcessors() []Processor {
+	return []Processor{TextExtract{}, AudioTags{}, BookMeta{}}
 }
 
 func ProducerDigest(capabilityID string) string {

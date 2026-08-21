@@ -716,6 +716,805 @@ CREATE INDEX annotations_subject_idx
 PRAGMA user_version = 6;
 `,
 	},
+	{
+		version: 7,
+		name:    "index_generation_dimension",
+		sql: `
+ALTER TABLE index_generations ADD COLUMN dimension TEXT NOT NULL DEFAULT 'lexical-metadata-fts';
+
+CREATE INDEX index_generations_dimension_idx
+    ON index_generations(workspace_id, dimension, created_at_ns);
+
+PRAGMA user_version = 7;
+`,
+	},
+	{
+		version: 8,
+		name:    "protection_recovery_external_bindings",
+		sql: `
+CREATE TABLE protection_records (
+    protection_record_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    subject_ref TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK (mode IN (
+        'STORE_EXACT', 'STORE_EXACT_WITH_EXTERNAL_FALLBACK',
+        'LINK_ONLY', 'METADATA_ONLY'
+    )),
+    outcome TEXT NOT NULL CHECK (outcome IN (
+        'EXACT_PROTECTED', 'EXTERNAL_REPLAYABLE',
+        'LINK_ONLY_UNPROTECTED', 'UNAVAILABLE'
+    )),
+    expected_content_id TEXT,
+    expected_logical_length INTEGER CHECK (
+        expected_logical_length IS NULL OR expected_logical_length >= 0
+    ),
+    local_representation_id TEXT,
+    policy_decision_ref TEXT NOT NULL,
+    last_verification_ref TEXT NOT NULL,
+    last_verified_at_ns INTEGER,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    metadata_json TEXT NOT NULL CHECK (json_valid(metadata_json)),
+    created_at_ns INTEGER NOT NULL,
+    updated_at_ns INTEGER NOT NULL,
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE RESTRICT,
+    FOREIGN KEY (workspace_id, local_representation_id)
+        REFERENCES representations(workspace_id, representation_id) ON DELETE RESTRICT,
+    UNIQUE (workspace_id, protection_record_id),
+    UNIQUE (workspace_id, subject_ref)
+) STRICT;
+
+CREATE INDEX protection_records_outcome_idx
+    ON protection_records(workspace_id, outcome, subject_ref);
+
+CREATE TABLE external_bindings (
+    external_binding_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    subject_ref TEXT NOT NULL,
+    provider_kind TEXT NOT NULL,
+    stable_identity TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    binding_digest TEXT NOT NULL,
+    credential_ref TEXT NOT NULL,
+    rights_evidence_ref TEXT NOT NULL,
+    metadata_json TEXT NOT NULL CHECK (json_valid(metadata_json)),
+    created_at_ns INTEGER NOT NULL,
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE RESTRICT,
+    UNIQUE (workspace_id, external_binding_id),
+    UNIQUE (workspace_id, subject_ref, stable_identity, revision)
+) STRICT;
+
+CREATE INDEX external_bindings_subject_idx
+    ON external_bindings(workspace_id, subject_ref, provider_kind);
+
+CREATE TABLE recovery_references (
+    recovery_reference_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    protection_record_id TEXT NOT NULL,
+    subject_ref TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN (
+        'EXACT_REPRESENTATION', 'EXACT_REVERSIBLE',
+        'EXTERNAL_LOCATOR', 'USER_RECIPE'
+    )),
+    priority INTEGER NOT NULL CHECK (priority >= 0),
+    claim TEXT NOT NULL CHECK (claim IN (
+        'RESTORE_VERIFIED', 'EXTERNAL_REPLAYABLE',
+        'LINK_ONLY_UNPROTECTED', 'UNAVAILABLE'
+    )),
+    expected_content_id TEXT,
+    expected_logical_length INTEGER CHECK (
+        expected_logical_length IS NULL OR expected_logical_length >= 0
+    ),
+    representation_id TEXT,
+    external_binding_id TEXT,
+    codec_profile_ref TEXT NOT NULL,
+    recipe_json TEXT NOT NULL CHECK (json_valid(recipe_json)),
+    verification_json TEXT NOT NULL CHECK (json_valid(verification_json)),
+    status TEXT NOT NULL,
+    last_validated_at_ns INTEGER,
+    expires_at_ns INTEGER,
+    policy_ref TEXT NOT NULL,
+    rights_evidence_ref TEXT NOT NULL,
+    credential_ref TEXT NOT NULL,
+    operator_decision_ref TEXT NOT NULL,
+    record_digest TEXT NOT NULL,
+    metadata_json TEXT NOT NULL CHECK (json_valid(metadata_json)),
+    created_at_ns INTEGER NOT NULL,
+    updated_at_ns INTEGER NOT NULL,
+    FOREIGN KEY (workspace_id, protection_record_id)
+        REFERENCES protection_records(workspace_id, protection_record_id) ON DELETE RESTRICT,
+    FOREIGN KEY (workspace_id, representation_id)
+        REFERENCES representations(workspace_id, representation_id) ON DELETE RESTRICT,
+    FOREIGN KEY (workspace_id, external_binding_id)
+        REFERENCES external_bindings(workspace_id, external_binding_id) ON DELETE RESTRICT,
+    UNIQUE (workspace_id, recovery_reference_id),
+    UNIQUE (workspace_id, protection_record_id, priority, recovery_reference_id),
+    CHECK (
+        (kind IN ('EXACT_REPRESENTATION', 'EXACT_REVERSIBLE') AND representation_id IS NOT NULL)
+        OR (kind = 'EXTERNAL_LOCATOR' AND external_binding_id IS NOT NULL)
+        OR (kind = 'USER_RECIPE')
+    )
+) STRICT;
+
+CREATE INDEX recovery_references_subject_idx
+    ON recovery_references(workspace_id, subject_ref, priority, recovery_reference_id);
+
+CREATE INDEX recovery_references_binding_idx
+    ON recovery_references(workspace_id, external_binding_id, priority);
+
+CREATE TRIGGER recovery_references_no_update
+BEFORE UPDATE ON recovery_references BEGIN
+    SELECT RAISE(ABORT, 'recovery references are immutable; publish a new revision');
+END;
+
+CREATE TRIGGER recovery_references_no_delete
+BEFORE DELETE ON recovery_references BEGIN
+    SELECT RAISE(ABORT, 'recovery references are immutable');
+END;
+
+CREATE TABLE external_locators (
+    external_locator_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    binding_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    priority INTEGER NOT NULL CHECK (priority >= 0),
+    kind TEXT NOT NULL,
+    locator TEXT NOT NULL,
+    display_locator TEXT NOT NULL,
+    expected_content_id TEXT,
+    expected_logical_length INTEGER CHECK (
+        expected_logical_length IS NULL OR expected_logical_length >= 0
+    ),
+    credential_ref TEXT NOT NULL,
+    rights_evidence_ref TEXT NOT NULL,
+    availability TEXT NOT NULL,
+    validation_status TEXT NOT NULL,
+    expires_at_ns INTEGER,
+    last_validated_at_ns INTEGER,
+    validation_ref TEXT NOT NULL,
+    metadata_json TEXT NOT NULL CHECK (json_valid(metadata_json)),
+    created_at_ns INTEGER NOT NULL,
+    FOREIGN KEY (workspace_id, binding_id)
+        REFERENCES external_bindings(workspace_id, external_binding_id) ON DELETE RESTRICT,
+    UNIQUE (workspace_id, external_locator_id),
+    UNIQUE (workspace_id, binding_id, revision, priority, external_locator_id)
+) STRICT;
+
+CREATE INDEX external_locators_binding_idx
+    ON external_locators(workspace_id, binding_id, priority, external_locator_id);
+
+CREATE TRIGGER external_bindings_no_update
+BEFORE UPDATE ON external_bindings BEGIN
+    SELECT RAISE(ABORT, 'external bindings are immutable; publish a new revision');
+END;
+
+CREATE TRIGGER external_bindings_no_delete
+BEFORE DELETE ON external_bindings BEGIN
+    SELECT RAISE(ABORT, 'external bindings are immutable');
+END;
+
+CREATE TRIGGER external_locators_no_update
+BEFORE UPDATE ON external_locators BEGIN
+    SELECT RAISE(ABORT, 'external locators are immutable; publish a new revision');
+END;
+
+CREATE TRIGGER external_locators_no_delete
+BEFORE DELETE ON external_locators BEGIN
+    SELECT RAISE(ABORT, 'external locators are immutable');
+END;
+
+PRAGMA user_version = 8;
+`,
+	},
+	{
+		version: 9,
+		name:    "metadata_facts_and_description_segments",
+		sql: `
+CREATE TABLE metadata_facts (
+    metadata_fact_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    subject_ref TEXT NOT NULL,
+    namespace TEXT NOT NULL,
+    fact_key TEXT NOT NULL,
+    value_json TEXT NOT NULL CHECK (json_valid(value_json)),
+    value_type TEXT NOT NULL,
+    authority_class TEXT NOT NULL,
+    source_ref TEXT NOT NULL,
+    confidence REAL CHECK (confidence IS NULL OR (confidence >= 0.0 AND confidence <= 1.0)),
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    created_at_ns INTEGER NOT NULL,
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE RESTRICT,
+    UNIQUE (workspace_id, metadata_fact_id),
+    UNIQUE (workspace_id, subject_ref, namespace, fact_key, revision)
+) STRICT;
+
+CREATE INDEX metadata_facts_subject_idx
+    ON metadata_facts(workspace_id, subject_ref, namespace, fact_key, revision);
+
+CREATE TABLE description_documents (
+    description_document_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    subject_ref TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN (
+        'USER', 'IMPORTED', 'EXTRACTED', 'AI_SUMMARY', 'AI_ANALYSIS'
+    )),
+    title TEXT NOT NULL,
+    language TEXT NOT NULL,
+    body TEXT NOT NULL,
+    body_digest TEXT NOT NULL,
+    source_ref TEXT NOT NULL,
+    producer_profile TEXT NOT NULL,
+    confidence REAL CHECK (confidence IS NULL OR (confidence >= 0.0 AND confidence <= 1.0)),
+    coverage REAL CHECK (coverage IS NULL OR (coverage >= 0.0 AND coverage <= 1.0)),
+    visibility TEXT NOT NULL,
+    accepted INTEGER NOT NULL CHECK (accepted IN (0, 1)),
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    predecessor_id TEXT,
+    metadata_json TEXT NOT NULL CHECK (json_valid(metadata_json)),
+    created_at_ns INTEGER NOT NULL,
+    updated_at_ns INTEGER NOT NULL,
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE RESTRICT,
+    FOREIGN KEY (workspace_id, predecessor_id)
+        REFERENCES description_documents(workspace_id, description_document_id) ON DELETE RESTRICT,
+    UNIQUE (workspace_id, description_document_id),
+    UNIQUE (workspace_id, subject_ref, revision, description_document_id)
+) STRICT;
+
+CREATE INDEX description_documents_subject_idx
+    ON description_documents(workspace_id, subject_ref, kind, revision);
+
+CREATE TABLE semantic_segments (
+    semantic_segment_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    description_document_id TEXT NOT NULL,
+    subject_ref TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    text TEXT NOT NULL,
+    text_digest TEXT NOT NULL,
+    language TEXT NOT NULL,
+    section TEXT NOT NULL,
+    source_span_json TEXT NOT NULL CHECK (json_valid(source_span_json)),
+    metadata_json TEXT NOT NULL CHECK (json_valid(metadata_json)),
+    created_at_ns INTEGER NOT NULL,
+    FOREIGN KEY (workspace_id, description_document_id)
+        REFERENCES description_documents(workspace_id, description_document_id) ON DELETE RESTRICT,
+    UNIQUE (workspace_id, semantic_segment_id),
+    UNIQUE (description_document_id, ordinal)
+) STRICT;
+
+CREATE INDEX semantic_segments_subject_idx
+    ON semantic_segments(workspace_id, subject_ref, description_document_id, ordinal);
+
+CREATE TRIGGER metadata_facts_no_update
+BEFORE UPDATE ON metadata_facts BEGIN
+    SELECT RAISE(ABORT, 'metadata facts are immutable; publish a new revision');
+END;
+
+CREATE TRIGGER metadata_facts_no_delete
+BEFORE DELETE ON metadata_facts BEGIN
+    SELECT RAISE(ABORT, 'metadata facts are immutable');
+END;
+
+CREATE TRIGGER description_documents_no_update
+BEFORE UPDATE ON description_documents BEGIN
+    SELECT RAISE(ABORT, 'description documents are immutable; publish a new revision');
+END;
+
+CREATE TRIGGER description_documents_no_delete
+BEFORE DELETE ON description_documents BEGIN
+    SELECT RAISE(ABORT, 'description documents are immutable');
+END;
+
+CREATE TRIGGER semantic_segments_no_update
+BEFORE UPDATE ON semantic_segments BEGIN
+    SELECT RAISE(ABORT, 'semantic segments are immutable');
+END;
+
+CREATE TRIGGER semantic_segments_no_delete
+BEFORE DELETE ON semantic_segments BEGIN
+    SELECT RAISE(ABORT, 'semantic segments are immutable');
+END;
+
+PRAGMA user_version = 9;
+`,
+	},
+	{
+		version: 10,
+		name:    "protection_outcomes",
+		sql: `
+-- SQLite cannot alter a CHECK constraint in place. Rebuild the two tables
+-- which are coupled by the protection-record foreign key, preserving all
+-- v8/v9 rows while widening the visible outcome vocabulary.
+DROP INDEX recovery_references_subject_idx;
+DROP INDEX recovery_references_binding_idx;
+DROP TRIGGER recovery_references_no_update;
+DROP TRIGGER recovery_references_no_delete;
+ALTER TABLE recovery_references RENAME TO recovery_references_v8;
+
+DROP INDEX protection_records_outcome_idx;
+ALTER TABLE protection_records RENAME TO protection_records_v8;
+
+CREATE TABLE protection_records (
+    protection_record_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    subject_ref TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK (mode IN (
+        'STORE_EXACT', 'STORE_EXACT_WITH_EXTERNAL_FALLBACK',
+        'LINK_ONLY', 'METADATA_ONLY'
+    )),
+    outcome TEXT NOT NULL CHECK (outcome IN (
+        'EXACT_PROTECTED', 'EXACT_FALLBACK', 'EXTERNAL_REPLAYABLE',
+        'LINK_ONLY_UNPROTECTED', 'EXPLICITLY_UNPROTECTED', 'BLOCKED',
+        'UNAVAILABLE'
+    )),
+    expected_content_id TEXT,
+    expected_logical_length INTEGER CHECK (
+        expected_logical_length IS NULL OR expected_logical_length >= 0
+    ),
+    local_representation_id TEXT,
+    policy_decision_ref TEXT NOT NULL,
+    last_verification_ref TEXT NOT NULL,
+    last_verified_at_ns INTEGER,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    metadata_json TEXT NOT NULL CHECK (json_valid(metadata_json)),
+    created_at_ns INTEGER NOT NULL,
+    updated_at_ns INTEGER NOT NULL,
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE RESTRICT,
+    FOREIGN KEY (workspace_id, local_representation_id)
+        REFERENCES representations(workspace_id, representation_id) ON DELETE RESTRICT,
+    UNIQUE (workspace_id, protection_record_id),
+    UNIQUE (workspace_id, subject_ref)
+) STRICT;
+
+INSERT INTO protection_records(
+    protection_record_id, workspace_id, subject_ref, mode, outcome,
+    expected_content_id, expected_logical_length, local_representation_id,
+    policy_decision_ref, last_verification_ref, last_verified_at_ns,
+    revision, metadata_json, created_at_ns, updated_at_ns
+)
+SELECT protection_record_id, workspace_id, subject_ref, mode, outcome,
+       expected_content_id, expected_logical_length, local_representation_id,
+       policy_decision_ref, last_verification_ref, last_verified_at_ns,
+       revision, metadata_json, created_at_ns, updated_at_ns
+FROM protection_records_v8;
+
+CREATE INDEX protection_records_outcome_idx
+    ON protection_records(workspace_id, outcome, subject_ref);
+
+CREATE TABLE recovery_references (
+    recovery_reference_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    protection_record_id TEXT NOT NULL,
+    subject_ref TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN (
+        'EXACT_REPRESENTATION', 'EXACT_REVERSIBLE',
+        'EXTERNAL_LOCATOR', 'USER_RECIPE'
+    )),
+    priority INTEGER NOT NULL CHECK (priority >= 0),
+    claim TEXT NOT NULL CHECK (claim IN (
+        'RESTORE_VERIFIED', 'EXTERNAL_REPLAYABLE',
+        'LINK_ONLY_UNPROTECTED', 'UNAVAILABLE'
+    )),
+    expected_content_id TEXT,
+    expected_logical_length INTEGER CHECK (
+        expected_logical_length IS NULL OR expected_logical_length >= 0
+    ),
+    representation_id TEXT,
+    external_binding_id TEXT,
+    codec_profile_ref TEXT NOT NULL,
+    recipe_json TEXT NOT NULL CHECK (json_valid(recipe_json)),
+    verification_json TEXT NOT NULL CHECK (json_valid(verification_json)),
+    status TEXT NOT NULL,
+    last_validated_at_ns INTEGER,
+    expires_at_ns INTEGER,
+    policy_ref TEXT NOT NULL,
+    rights_evidence_ref TEXT NOT NULL,
+    credential_ref TEXT NOT NULL,
+    operator_decision_ref TEXT NOT NULL,
+    record_digest TEXT NOT NULL,
+    metadata_json TEXT NOT NULL CHECK (json_valid(metadata_json)),
+    created_at_ns INTEGER NOT NULL,
+    updated_at_ns INTEGER NOT NULL,
+    FOREIGN KEY (workspace_id, protection_record_id)
+        REFERENCES protection_records(workspace_id, protection_record_id) ON DELETE RESTRICT,
+    FOREIGN KEY (workspace_id, representation_id)
+        REFERENCES representations(workspace_id, representation_id) ON DELETE RESTRICT,
+    FOREIGN KEY (workspace_id, external_binding_id)
+        REFERENCES external_bindings(workspace_id, external_binding_id) ON DELETE RESTRICT,
+    UNIQUE (workspace_id, recovery_reference_id),
+    UNIQUE (workspace_id, protection_record_id, priority, recovery_reference_id),
+    CHECK (
+        (kind IN ('EXACT_REPRESENTATION', 'EXACT_REVERSIBLE') AND representation_id IS NOT NULL)
+        OR (kind = 'EXTERNAL_LOCATOR' AND external_binding_id IS NOT NULL)
+        OR (kind = 'USER_RECIPE')
+    )
+) STRICT;
+
+INSERT INTO recovery_references(
+    recovery_reference_id, workspace_id, protection_record_id, subject_ref,
+    kind, priority, claim, expected_content_id, expected_logical_length,
+    representation_id, external_binding_id, codec_profile_ref, recipe_json,
+    verification_json, status, last_validated_at_ns, expires_at_ns,
+    policy_ref, rights_evidence_ref, credential_ref, operator_decision_ref,
+    record_digest, metadata_json, created_at_ns, updated_at_ns
+)
+SELECT recovery_reference_id, workspace_id, protection_record_id, subject_ref,
+       kind, priority, claim, expected_content_id, expected_logical_length,
+       representation_id, external_binding_id, codec_profile_ref, recipe_json,
+       verification_json, status, last_validated_at_ns, expires_at_ns,
+       policy_ref, rights_evidence_ref, credential_ref, operator_decision_ref,
+       record_digest, metadata_json, created_at_ns, updated_at_ns
+FROM recovery_references_v8;
+
+CREATE INDEX recovery_references_subject_idx
+    ON recovery_references(workspace_id, subject_ref, priority, recovery_reference_id);
+
+CREATE INDEX recovery_references_binding_idx
+    ON recovery_references(workspace_id, external_binding_id, priority);
+
+CREATE TRIGGER recovery_references_no_update
+BEFORE UPDATE ON recovery_references BEGIN
+    SELECT RAISE(ABORT, 'recovery references are immutable; publish a new revision');
+END;
+
+CREATE TRIGGER recovery_references_no_delete
+BEFORE DELETE ON recovery_references BEGIN
+    SELECT RAISE(ABORT, 'recovery references are immutable');
+END;
+
+DROP TABLE recovery_references_v8;
+DROP TABLE protection_records_v8;
+
+PRAGMA user_version = 10;
+`,
+	},
+	{
+		version: 11,
+		name:    "description_single_successor",
+		sql: `
+CREATE UNIQUE INDEX description_documents_predecessor_idx
+    ON description_documents(workspace_id, predecessor_id)
+    WHERE predecessor_id IS NOT NULL;
+
+PRAGMA user_version = 11;
+`,
+	},
+	{
+		version: 12,
+		name:    "single_job_per_plan_kind",
+		sql: `
+CREATE UNIQUE INDEX jobs_plan_kind_idx
+    ON jobs(workspace_id, plan_id, kind)
+    WHERE plan_id IS NOT NULL;
+
+PRAGMA user_version = 12;
+`,
+	},
+	{
+		version: 13,
+		name:    "publication_execution_key",
+		sql: `
+-- Publications created before Phase 2 have no execution key. Keep those
+-- rows readable while making new plan-bound publications workspace-unique.
+ALTER TABLE publications ADD COLUMN plan_digest TEXT NOT NULL DEFAULT '';
+
+CREATE UNIQUE INDEX publications_plan_digest_idx
+    ON publications(workspace_id, plan_digest)
+    WHERE plan_digest <> '';
+
+PRAGMA user_version = 13;
+`,
+	},
+	{
+		version: 14,
+		name:    "processor_attempts",
+		sql: `
+CREATE TABLE processor_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    subject_ref TEXT NOT NULL,
+    snapshot_ref TEXT NOT NULL,
+    route_digest TEXT NOT NULL,
+    route_json TEXT NOT NULL CHECK (json_valid(route_json)),
+    stage TEXT NOT NULL CHECK (stage IN (
+        'CLASSIFY_LEARNED', 'PARSE', 'EXTRACT', 'ENRICH',
+        'FINGERPRINT', 'TRANSFORM', 'VALIDATE', 'INDEX_PREPARE'
+    )),
+    capability_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('SUCCEEDED', 'INAPPLICABLE', 'FAILED', 'CANCELLED')),
+    reason_code TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    provenance_json TEXT NOT NULL CHECK (json_valid(provenance_json)),
+    fence_token INTEGER NOT NULL CHECK (fence_token >= 1),
+    processor_digest TEXT NOT NULL,
+    created_at_ns INTEGER NOT NULL,
+    finished_at_ns INTEGER NOT NULL CHECK (finished_at_ns >= created_at_ns),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE RESTRICT,
+    UNIQUE (workspace_id, attempt_id)
+) STRICT;
+
+CREATE INDEX processor_attempts_subject_idx
+    ON processor_attempts(workspace_id, snapshot_ref, subject_ref, created_at_ns, attempt_id);
+
+CREATE INDEX processor_attempts_capability_idx
+    ON processor_attempts(workspace_id, snapshot_ref, capability_id, status, created_at_ns);
+
+CREATE TRIGGER processor_attempts_no_update
+BEFORE UPDATE ON processor_attempts BEGIN
+    SELECT RAISE(ABORT, 'processor attempts are append-only');
+END;
+
+CREATE TRIGGER processor_attempts_no_delete
+BEFORE DELETE ON processor_attempts BEGIN
+    SELECT RAISE(ABORT, 'processor attempts are append-only');
+END;
+
+PRAGMA user_version = 14;
+`,
+	},
+	{
+		version: 15,
+		name:    "metadata_only_namespace_entries",
+		sql: `
+-- A metadata-only resolution has an authenticated namespace observation but
+-- no content identity or file version. Keep the entry in the published
+-- namespace while allowing its file-version projection to be absent.
+DROP INDEX namespace_entries_parent_idx;
+DROP TRIGGER namespace_entries_parent_is_directory;
+DROP TRIGGER namespace_entries_no_update;
+DROP TRIGGER namespace_entries_no_delete;
+ALTER TABLE namespace_entries RENAME TO namespace_entries_v14;
+
+CREATE TABLE namespace_entries (
+    namespace_entry_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    namespace_root_id TEXT NOT NULL,
+    parent_entry_id TEXT,
+    observation_id TEXT,
+    raw_name BLOB NOT NULL,
+    display_name TEXT NOT NULL,
+    full_path_key BLOB NOT NULL,
+    entry_type TEXT NOT NULL CHECK (entry_type IN ('REGULAR_FILE', 'DIRECTORY', 'SYMLINK', 'FIFO', 'SOCKET', 'DEVICE', 'SPECIAL')),
+    metadata_json TEXT NOT NULL CHECK (json_valid(metadata_json)),
+    content_id TEXT NOT NULL,
+    file_version_id TEXT,
+    symlink_target_raw BLOB,
+    symlink_target_display TEXT NOT NULL,
+    hardlink_group_id TEXT NOT NULL,
+    logical_size INTEGER CHECK (logical_size IS NULL OR logical_size >= 0),
+    allocated_size INTEGER CHECK (allocated_size IS NULL OR allocated_size >= 0),
+    created_at_ns INTEGER NOT NULL,
+    FOREIGN KEY (workspace_id, namespace_root_id)
+        REFERENCES namespace_roots(workspace_id, namespace_root_id) ON DELETE RESTRICT,
+    FOREIGN KEY (workspace_id, namespace_root_id, parent_entry_id)
+        REFERENCES namespace_entries(workspace_id, namespace_root_id, namespace_entry_id) ON DELETE RESTRICT,
+    FOREIGN KEY (workspace_id, observation_id)
+        REFERENCES observations(workspace_id, observation_id) ON DELETE RESTRICT,
+    FOREIGN KEY (workspace_id, file_version_id)
+        REFERENCES file_versions(workspace_id, file_version_id) ON DELETE RESTRICT,
+    UNIQUE (workspace_id, namespace_entry_id),
+    UNIQUE (workspace_id, namespace_root_id, namespace_entry_id),
+    UNIQUE (namespace_root_id, full_path_key),
+    CHECK (parent_entry_id IS NULL OR parent_entry_id <> namespace_entry_id),
+    CHECK ((entry_type = 'SYMLINK' AND symlink_target_raw IS NOT NULL) OR
+           (entry_type <> 'SYMLINK' AND symlink_target_raw IS NULL)),
+    CHECK (
+        (entry_type = 'REGULAR_FILE' AND (
+            (file_version_id IS NULL AND content_id = '') OR
+            (file_version_id IS NOT NULL AND content_id <> '')
+        )) OR
+        (entry_type <> 'REGULAR_FILE' AND file_version_id IS NULL)
+    )
+) STRICT;
+
+INSERT INTO namespace_entries(
+    namespace_entry_id, workspace_id, namespace_root_id, parent_entry_id,
+    observation_id, raw_name, display_name, full_path_key, entry_type,
+    metadata_json, content_id, file_version_id, symlink_target_raw,
+    symlink_target_display, hardlink_group_id, logical_size,
+    allocated_size, created_at_ns
+)
+SELECT namespace_entry_id, workspace_id, namespace_root_id, parent_entry_id,
+       observation_id, raw_name, display_name, full_path_key, entry_type,
+       metadata_json, content_id, file_version_id, symlink_target_raw,
+       symlink_target_display, hardlink_group_id, logical_size,
+       allocated_size, created_at_ns
+FROM namespace_entries_v14;
+
+DROP TABLE namespace_entries_v14;
+
+CREATE INDEX namespace_entries_parent_idx
+    ON namespace_entries(workspace_id, namespace_root_id, parent_entry_id, raw_name);
+
+CREATE TRIGGER namespace_entries_parent_is_directory
+BEFORE INSERT ON namespace_entries
+WHEN NEW.parent_entry_id IS NOT NULL
+ AND (SELECT entry_type FROM namespace_entries
+      WHERE workspace_id = NEW.workspace_id
+        AND namespace_root_id = NEW.namespace_root_id
+        AND namespace_entry_id = NEW.parent_entry_id) <> 'DIRECTORY'
+BEGIN
+    SELECT RAISE(ABORT, 'namespace parent must be a directory');
+END;
+
+CREATE TRIGGER namespace_entries_no_update
+BEFORE UPDATE ON namespace_entries BEGIN
+    SELECT RAISE(ABORT, 'namespace entries are immutable; publish a new snapshot');
+END;
+
+CREATE TRIGGER namespace_entries_no_delete
+BEFORE DELETE ON namespace_entries BEGIN
+    SELECT RAISE(ABORT, 'namespace entries are immutable');
+END;
+
+PRAGMA user_version = 15;
+`,
+	},
+	{
+		version: 16,
+		name:    "qualified_recovery_claim_guards",
+		sql: `
+CREATE TRIGGER protection_records_exact_requires_local_representation
+BEFORE INSERT ON protection_records
+WHEN NEW.outcome IN ('EXACT_PROTECTED', 'EXACT_FALLBACK')
+ AND (NEW.local_representation_id IS NULL OR NEW.last_verification_ref = '')
+BEGIN
+    SELECT RAISE(ABORT, 'exact protection requires local representation and verification evidence');
+END;
+
+CREATE TRIGGER protection_records_external_replay_requires_bundle
+BEFORE INSERT ON protection_records
+WHEN NEW.outcome = 'EXTERNAL_REPLAYABLE'
+BEGIN
+    SELECT RAISE(ABORT, 'external replayable protection requires an atomic qualified recovery closure');
+END;
+
+CREATE TRIGGER recovery_references_route_exclusive
+BEFORE INSERT ON recovery_references
+WHEN (NEW.kind IN ('EXACT_REPRESENTATION', 'EXACT_REVERSIBLE') AND NEW.external_binding_id IS NOT NULL)
+  OR (NEW.kind = 'EXTERNAL_LOCATOR' AND NEW.representation_id IS NOT NULL)
+  OR (NEW.kind = 'USER_RECIPE' AND NEW.representation_id IS NOT NULL AND NEW.external_binding_id IS NOT NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'recovery reference routes must be unambiguous');
+END;
+
+CREATE TRIGGER recovery_references_external_replay_verified
+BEFORE INSERT ON recovery_references
+WHEN NEW.claim = 'EXTERNAL_REPLAYABLE'
+ AND (
+      NEW.kind <> 'EXTERNAL_LOCATOR'
+      OR NEW.status <> 'VERIFIED'
+      OR COALESCE(json_extract(NEW.verification_json, '$.verified'), 0) <> 1
+      OR NOT EXISTS (
+          SELECT 1 FROM external_locators locator
+          WHERE locator.workspace_id = NEW.workspace_id
+            AND locator.binding_id = NEW.external_binding_id
+            AND locator.availability = 'AVAILABLE'
+            AND locator.validation_status = 'VERIFIED'
+      )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'external replay claim lacks verified reacquisition evidence');
+END;
+
+CREATE TRIGGER processor_artifacts_require_terminal_attempt
+BEFORE INSERT ON processor_artifacts
+WHEN NOT EXISTS (
+    SELECT 1 FROM processor_attempts attempt
+    WHERE attempt.workspace_id = NEW.workspace_id
+      AND attempt.attempt_id = NEW.attempt_id
+      AND attempt.subject_ref = NEW.subject_ref
+      AND attempt.snapshot_ref = NEW.snapshot_ref
+      AND attempt.route_digest = NEW.route_digest
+      AND attempt.stage = NEW.stage
+      AND attempt.capability_id = NEW.capability_id
+      AND attempt.fence_token = NEW.fence_token
+      AND attempt.status = 'SUCCEEDED'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'processor artifact requires its succeeded terminal attempt');
+END;
+
+PRAGMA user_version = 16;
+`,
+	},
+	{
+		version: 17,
+		name:    "immutable_annotation_revisions",
+		sql: `
+CREATE TABLE annotation_revisions (
+    annotation_revision_id TEXT PRIMARY KEY,
+    annotation_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    subject_ref TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('TAG', 'NOTE', 'PROGRESS')),
+    body TEXT NOT NULL,
+    body_digest TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    predecessor_revision_id TEXT,
+    tombstoned INTEGER NOT NULL CHECK (tombstoned IN (0, 1)),
+    history_complete INTEGER NOT NULL CHECK (history_complete IN (0, 1)),
+    created_at_ns INTEGER NOT NULL,
+    FOREIGN KEY (workspace_id, annotation_id)
+        REFERENCES annotations(workspace_id, annotation_id) ON DELETE RESTRICT,
+    UNIQUE (workspace_id, annotation_id, revision),
+    UNIQUE (workspace_id, annotation_revision_id)
+) STRICT;
+
+INSERT INTO annotation_revisions(
+    annotation_revision_id, annotation_id, workspace_id, subject_ref, kind,
+    body, body_digest, revision, predecessor_revision_id, tombstoned,
+    history_complete, created_at_ns
+)
+SELECT annotation_id || '@' || revision, annotation_id, workspace_id,
+       subject_ref, kind, body, body_digest, revision, NULL, tombstoned,
+       CASE WHEN revision = 1 THEN 1 ELSE 0 END, updated_at_ns
+FROM annotations;
+
+CREATE INDEX annotation_revisions_subject_idx
+    ON annotation_revisions(workspace_id, subject_ref, annotation_id, revision);
+
+CREATE TRIGGER annotation_revisions_no_update
+BEFORE UPDATE ON annotation_revisions BEGIN
+    SELECT RAISE(ABORT, 'annotation revisions are immutable');
+END;
+
+CREATE TRIGGER annotation_revisions_no_delete
+BEFORE DELETE ON annotation_revisions BEGIN
+    SELECT RAISE(ABORT, 'annotation revisions are immutable');
+END;
+
+PRAGMA user_version = 17;
+`,
+	},
+	{
+		version: 18,
+		name:    "publication_fences",
+		sql: `
+CREATE TABLE publication_fences (
+    publication_domain TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    lease_token TEXT NOT NULL,
+    fencing_token INTEGER NOT NULL CHECK (fencing_token >= 1),
+    lease_until_ns INTEGER NOT NULL,
+    updated_at_ns INTEGER NOT NULL
+) STRICT;
+
+PRAGMA user_version = 18;
+`,
+	},
+	{
+		version: 19,
+		name:    "saved_views_and_export_manifests",
+		sql: `
+CREATE TABLE saved_views (
+    view_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    query TEXT NOT NULL,
+    fields_json TEXT NOT NULL DEFAULT '[]',
+    scope TEXT NOT NULL DEFAULT '',
+    sort TEXT NOT NULL DEFAULT '',
+    output_names TEXT NOT NULL DEFAULT '',
+    required_json TEXT NOT NULL DEFAULT '[]',
+    when_missing TEXT NOT NULL DEFAULT '',
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_at_ns INTEGER NOT NULL,
+    updated_at_ns INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE export_manifests (
+    manifest_id TEXT PRIMARY KEY,
+    manifest_digest TEXT NOT NULL UNIQUE,
+    view_id TEXT NOT NULL DEFAULT '',
+    representation TEXT NOT NULL DEFAULT 'exact',
+    target TEXT NOT NULL DEFAULT '',
+    subject_count INTEGER NOT NULL,
+    created_at_ns INTEGER NOT NULL,
+    items_json TEXT NOT NULL
+) STRICT;
+
+PRAGMA user_version = 19;
+`,
+	},
 }
 
 func (s *Store) migrate(ctx context.Context) error {
