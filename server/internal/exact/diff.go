@@ -18,19 +18,19 @@ type DiffResult struct {
 }
 
 // DiffSnapshots compares two repository manifests. It does not read SQLite.
-func (s *Service) DiffSnapshots(_ context.Context, fromRef, toRef string) (DiffResult, error) {
+func (s *Service) DiffSnapshots(ctx context.Context, fromRef, toRef string) (DiffResult, error) {
 	var result DiffResult
-	if err := s.require(); err != nil {
+	if err := s.requireRepository(); err != nil {
 		return result, err
 	}
 	if strings.TrimSpace(fromRef) == "" || strings.TrimSpace(toRef) == "" {
 		return result, fmt.Errorf("from_snapshot_ref and to_snapshot_ref are required")
 	}
-	from, err := readManifest(s.Repo.Root(), fromRef)
+	from, err := s.loadManifest(ctx, fromRef)
 	if err != nil {
 		return result, err
 	}
-	to, err := readManifest(s.Repo.Root(), toRef)
+	to, err := s.loadManifest(ctx, toRef)
 	if err != nil {
 		return result, err
 	}

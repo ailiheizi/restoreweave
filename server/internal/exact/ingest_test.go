@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/ailiheizi/restoreweave/server/internal/repository"
@@ -62,6 +63,33 @@ func TestIngestPlacesAndRestoresAfterCatalogLoss(t *testing.T) {
 	if len(listed) == 0 {
 		t.Fatal("namespace is empty after ingest")
 	}
+	protections, err := store.ListProtectionRecords(ctx, ingested.WorkspaceID)
+	if err != nil {
+		t.Fatalf("list protection records: %v", err)
+	}
+	if len(protections) < 3 {
+		t.Fatalf("protection records = %d, want entries for files and directories", len(protections))
+	}
+	var exactProtection sqlite.ProtectionRecord
+	var fallbackProtection sqlite.ProtectionRecord
+	for _, record := range protections {
+		if record.Mode == sqlite.ProtectionStoreExact {
+			exactProtection = record
+			if record.Outcome == sqlite.ProtectionExactFallback {
+				fallbackProtection = record
+			}
+		}
+	}
+	if exactProtection.ID == "" || exactProtection.LocalRepresentationID == "" || exactProtection.ExpectedContentID == "" {
+		t.Fatalf("exact protection record = %+v", exactProtection)
+	}
+	if fallbackProtection.ID == "" || !bytes.Contains(fallbackProtection.Metadata, []byte(ProtectionReasonContentClassUnresolved)) {
+		t.Fatalf("unknown readable file did not record exact fallback: %+v", fallbackProtection)
+	}
+	references, err := store.ListRecoveryReferencesBySubject(ctx, ingested.WorkspaceID, exactProtection.SubjectRef)
+	if err != nil || len(references) != 1 || references[0].Claim != sqlite.RecoveryClaimRestoreVerified {
+		t.Fatalf("recovery references = %+v, err=%v", references, err)
+	}
 
 	if err := store.Close(); err != nil {
 		t.Fatalf("close catalog: %v", err)
@@ -112,5 +140,172 @@ func TestRequireQualifiedRejectsPathString(t *testing.T) {
 	err := requireQualified(scanner.CaptureModePathString, scanner.ScanResult{State: scanner.ScanComplete})
 	if !errors.Is(err, ErrNotQualified) {
 		t.Fatalf("error = %v, want ErrNotQualified", err)
+	}
+	for _, state := range []scanner.ScanState{scanner.ScanCancelled, scanner.ScanFailed} {
+		err = requireQualifiedWithEntries(scanner.CaptureModeRootedFD, scanner.ScanResult{State: state}, nil, ingestPolicy{})
+		if !errors.Is(err, ErrNotQualified) {
+			t.Fatalf("scan state %s error = %v, want ErrNotQualified", state, err)
+		}
+	}
+}
+
+func TestLinkOnlyIngestPersistsLocatorsWithoutPlacingPayload(t *testing.T) {
+	ctx := context.Background()
+	source := t.TempDir()
+	payload := []byte("downloadable-but-not-locally-retained")
+	if err := os.WriteFile(filepath.Join(source, "release.bin"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "catalog.sqlite"), sqlite.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	repo, err := repository.OpenDir(filepath.Join(t.TempDir(), "repository"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &Service{
+		Store: store, Repo: repo, AllowLinkOnly: true, LinkOnlyRequiresConfirmation: true,
+	}
+	ingested, err := service.IngestWithOptions(ctx, source, IngestOptions{
+		ProtectionMode:  sqlite.ProtectionLinkOnly,
+		ConfirmLinkOnly: true,
+		ExternalLocators: []IngestLocator{
+			{Locator: "https://downloads.example.test/release.bin"},
+			{Locator: "ipfs://bafy-example/release.bin"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("link-only ingest: %v", err)
+	}
+	if ingested.ProtectionMode != sqlite.ProtectionLinkOnly || ingested.Files != 1 ||
+		ingested.LocalFiles != 0 || ingested.LocalBytes != 0 || ingested.NewBytes != 0 ||
+		ingested.LinkOnlyFiles != 1 || ingested.LocatorCount != 2 {
+		t.Fatalf("link-only result = %+v", ingested)
+	}
+
+	sum := sha256.Sum256(payload)
+	contentID := "sha256:" + hex.EncodeToString(sum[:])
+	body, err := repo.Open(ctx, contentID)
+	if body != nil {
+		_ = body.Close()
+	}
+	if !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("payload unexpectedly present in CAS: %v", err)
+	}
+
+	protections, err := store.ListProtectionRecords(ctx, ingested.WorkspaceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fileProtection sqlite.ProtectionRecord
+	for _, protection := range protections {
+		if protection.Mode == sqlite.ProtectionLinkOnly {
+			fileProtection = protection
+		}
+	}
+	if fileProtection.ID == "" || fileProtection.Outcome != sqlite.ProtectionLinkOnlyUnprotected ||
+		fileProtection.LocalRepresentationID != "" || fileProtection.ExpectedContentID != contentID {
+		t.Fatalf("link-only protection = %+v", fileProtection)
+	}
+	references, err := store.ListRecoveryReferencesBySubject(ctx, ingested.WorkspaceID, fileProtection.SubjectRef)
+	if err != nil || len(references) != 1 || references[0].Kind != sqlite.RecoveryExternalLocator ||
+		references[0].Claim != sqlite.RecoveryClaimLinkOnlyUnprotected {
+		t.Fatalf("link-only references = %+v, err=%v", references, err)
+	}
+	locators, err := store.ListExternalLocators(ctx, ingested.WorkspaceID, references[0].ExternalBindingID)
+	if err != nil || len(locators) != 2 {
+		t.Fatalf("external locators = %+v, err=%v", locators, err)
+	}
+	for _, locator := range locators {
+		if locator.ValidationStatus != "UNVALIDATED" || locator.ExpectedContentID != contentID {
+			t.Fatalf("locator overclaims validation: %+v", locator)
+		}
+	}
+
+	manifest, err := readManifest(repo.Root(), ingested.SnapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fileEntry ManifestEntry
+	for _, entry := range manifest.Entries {
+		if entry.EntryType == string(sqlite.EntryFile) {
+			fileEntry = entry
+		}
+	}
+	if fileEntry.Protection.Outcome != string(sqlite.ProtectionLinkOnlyUnprotected) ||
+		len(fileEntry.Protection.RecoveryReferences) != 1 ||
+		len(fileEntry.Protection.RecoveryReferences[0].ExternalLocators) != 2 {
+		t.Fatalf("portable link-only entry = %+v", fileEntry)
+	}
+	if _, err := service.VerifyMode(ctx, ingested.SnapshotRef, VerifyAuthenticatedMetadata, ""); err != nil {
+		t.Fatalf("metadata verification: %v", err)
+	}
+	if _, err := service.Verify(ctx, ingested.SnapshotRef); !errors.Is(err, ErrBlocked) {
+		t.Fatalf("full verification error = %v, want ErrBlocked", err)
+	}
+	destination := filepath.Join(t.TempDir(), "must-not-exist")
+	if _, err := service.Restore(ctx, ingested.SnapshotRef, destination); !errors.Is(err, ErrBlocked) {
+		t.Fatalf("restore error = %v, want ErrBlocked", err)
+	}
+	if _, err := os.Lstat(destination); !os.IsNotExist(err) {
+		t.Fatalf("blocked restore created destination: %v", err)
+	}
+}
+
+func TestLinkOnlyRequiresPolicyAndConfirmation(t *testing.T) {
+	service := &Service{}
+	options := IngestOptions{
+		ProtectionMode:   sqlite.ProtectionLinkOnly,
+		ConfirmLinkOnly:  true,
+		ExternalLocators: []IngestLocator{{Locator: "https://example.test/file"}},
+	}
+	if _, err := service.resolveIngestOptions(options); !errors.Is(err, ErrBlocked) {
+		t.Fatalf("disabled LINK_ONLY error = %v", err)
+	}
+	service.AllowLinkOnly = true
+	service.LinkOnlyRequiresConfirmation = true
+	options.ConfirmLinkOnly = false
+	if _, err := service.resolveIngestOptions(options); !errors.Is(err, ErrBlocked) {
+		t.Fatalf("unconfirmed LINK_ONLY error = %v", err)
+	}
+}
+
+func TestRestoreUsesRawPathBytes(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("invalid UTF-8 path creation is only portable in the Linux qualification profile")
+	}
+	ctx := context.Background()
+	source := t.TempDir()
+	rawName := string([]byte{'b', 'a', 'd', '-', 0xff, '.', 'b', 'i', 'n'})
+	payload := []byte("raw-name")
+	if err := os.WriteFile(filepath.Join(source, rawName), payload, 0o600); err != nil {
+		t.Fatalf("write raw-name source: %v", err)
+	}
+	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "catalog.sqlite"), sqlite.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	repo, err := repository.OpenDir(filepath.Join(t.TempDir(), "repository"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &Service{Store: store, Repo: repo}
+	ingested, err := service.Ingest(ctx, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(t.TempDir(), "restore")
+	if _, err := service.Restore(ctx, ingested.SnapshotRef, destination); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(destination, rawName))
+	if err != nil {
+		t.Fatalf("read raw-name restore: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("restored payload = %q", got)
 	}
 }
