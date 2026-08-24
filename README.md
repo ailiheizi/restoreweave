@@ -36,9 +36,9 @@ RestoreWeave 不是网盘文件系统，也不是 OpenList、媒体服务器或�
 ### 配置和状态
 
 - 使用持久化 TOML 配置；兼容读取旧 YAML 配置。
-- 配置 catalog、repository、vectors、models 和 recovery records 的明确路径。
+- 配置 catalog、repository、vectors、models 和 publication signing material 的明确路径。
 - 相对路径按配置文件所在目录解析，不偷偷使用守护进程当前目录。
-- 支持 `rw config init`、`validate`、`show`、`--config` 和环境变量覆盖。
+- 配置 CLI 分别提供 `rw config init --path <file>`、`rw config validate --path <file>` 和 `rw config show --path <file>`；daemon 使用 `restoreweaved --config <file>`，并支持环境变量覆盖。
 - 对配置计算摘要，并把配置身份绑定到计划、快照、Description 和索引/语义 generation。
 - 查看 daemon、catalog、repository、索引、计划、任务和 provider 的状态或诊断结果。
 
@@ -67,17 +67,17 @@ RestoreWeave 不是网盘文件系统，也不是 OpenList、媒体服务器或�
 - Note 直接进入普通搜索和语义搜索，不需要复制成另一个隐藏字段。
 - 仍提供 durable tag 和 annotation import/export，方便脚本和兼容工作流；当前 WebUI 的日常语义入口以 Note 为主。
 - 保存版本化 Description，保留来源、语言、producer、前一修订和语义分段。
-- 保存用户、导入、提取或模型生成的 Description；模型生成必须由显式操作触发，不是 ingest 的隐式依赖。
+- 保存用户、导入、提取或标记为模型来源的 Description；当前不内置 Description 生成器，也不会在 ingest 时自动生成。
 - 内置基础提取器可处理 UTF-8 文本、ID3/FLAC/OGG 音频标签和 EPUB OPF 元数据。
 - Processor 结果带 provenance；失败、超时和不可用状态不会取得文件身份或恢复权限。
 
 ### 普通、结构化和语义搜索
 
 - 搜索文件名、原路径、后缀、类型、标签、Note、Description 和已提取文本。
-- 按 entry type、大小、mtime、SHA-256、duplicate group、protection status、language 和 suffix 过滤。
+- 按 entry type、大小、mtime、SHA-256、duplicate group、`protection_mode`、language 和 suffix 过滤。
 - 把 lexical、structured 和 semantic 结果映射回同一个稳定 subject。
 - 返回命中的 Description segment 或 Note 内容及其来源，而不只给一个不透明分数。
-- 使用真实的 `BAAI/bge-small-zh-v1.5`、ONNX Runtime 和进程内 zvec 完成本地语义向量生成和查询。
+- 显式提供并校验平台 bundle 后，使用真实的 `BAAI/bge-small-zh-v1.5`、ONNX Runtime 和进程内 zvec 完成本地语义向量生成和查询。
 - daemon 启动时执行真实推理探测，重启后可重新打开兼容的 zvec generation。
 - 模型、lease 或 generation 不健康时明确报告 semantic unavailable，并继续提供 lexical/structured search、精确保护和恢复。
 - 每个 semantic generation 都严格绑定 embedding profile 和配置；不兼容的 generation 会 fail closed，也不会改写旧 Note、Description 或 subject 身份。
@@ -107,7 +107,7 @@ RestoreWeave 不是网盘文件系统，也不是 OpenList、媒体服务器或�
 - 拒绝被修改、截断、缺失、签名不正确、trust anchor 不匹配或 reader dependency 不兼容的恢复记录和内容。
 - 支持仓库搬迁后的只读验证，并有 raw 与 zstd copy-forward 迁移、目标篡改拒绝和保留旧仓库回退的测试证据。
 - 跨进程 publication fence 防止两个 daemon 交叉发布；未知结果可根据已认证记录对账。
-- 对同一已签名 processor 计划有有界 retry、重启续跑和上限测试；通用异步 reprocessing 仍未开放。
+- daemon 会对同一已签名 processor 计划执行有界自动 retry，并具备 lease、fencing、幂等、重启续跑、unknown-outcome reconciliation 和上限测试；任意用户触发或换路线的通用 reprocessing 仍未开放。
 
 ### 接口
 
@@ -169,7 +169,8 @@ RestoreWeave 保持较少的物理实体，但它们职责不同：
 | 内容仓库 | 配置的 repository 目录 | 不能从索引重建 | 原始精确字节和认证记录 |
 | Lexical index | 独立 SQLite FTS generation | 可以 | 普通文本和结构化搜索 |
 | Semantic index | zvec generation | 可以 | BGE embedding 搜索 |
-| Recovery records | repository/recovery 配置路径 | 不能用空索引替代 | catalog-free 验证和恢复 |
+| Portable recovery records | repository 中的认证记录 + 显式导出的 recovery reference | 不能用空索引替代 | catalog-free 验证和恢复 |
+| Publication signing material | `paths.recovery_records` | 不能重建 | 发布签名私钥和本地 anchor 副本；不是 clean-reader artifact |
 | Trust anchor | 独立导出和保管 | 不能从不可信仓库推断 | 验证恢复记录签名 |
 
 逻辑上有 catalog、repository 和 index 三层，不代表必须引入三个数据库服务。当前个人配置只使用本地 SQLite、目录仓库和进程内 zvec，不依赖 Qdrant、Milvus 或 Docker Compose。
@@ -180,9 +181,10 @@ RestoreWeave 保持较少的物理实体，但它们职责不同：
 | --- | --- |
 | 删除 lexical/zvec 索引 | 搜索降级；文件、Note、Description 和恢复能力仍在，可重建索引 |
 | BGE/ONNX/zvec bundle 不可用 | 语义搜索不可用；普通搜索、保护、校验和恢复继续工作 |
-| SQLite catalog 不可用 | 日常搜索和编辑不可用；保留 repository、portable recovery records 与独立 trust anchor 时，clean reader 仍可验证和恢复 |
+| SQLite catalog 不可用 | 日常搜索和编辑不可用；保留 repository、导出的 recovery reference 与独立 trust anchor 时，clean reader 仍可验证和恢复 |
 | repository payload 丢失 | 恢复记录不能凭空重建原始字节；相应内容无法恢复 |
-| catalog 与 recovery records 同时丢失 | 仅有无上下文 blob 不足以安全重建原始目录和恢复含义 |
+| catalog 与 portable recovery records 同时丢失 | 仅有无上下文 blob 不足以安全重建原始目录和恢复含义 |
+| publication signing material 丢失 | 已导出的 recovery reference 仍可由 clean reader 验证；普通 daemon 不能继续原有签名发布链 |
 | 独立 trust anchor 丢失 | 无法按设计认证签名恢复记录；不要只把它放在同一个故障域中 |
 | 实验性加密仓库的 key 丢失 | 加密内容不可读；该 profile 当前不是默认配置或生产发行能力 |
 
@@ -196,7 +198,7 @@ RestoreWeave 保持较少的物理实体，但它们职责不同：
 | 签名恢复、clean reader、篡改拒绝、fencing、reconciliation | 已在 admitted development profile 实现并测试 |
 | SavedView、ExportManifest、materialize/verify | 本地范围实现并测试；未完成发行资格 |
 | React WebUI 与 loopback API | 可用的核心便利界面；尚非远程管理平台 |
-| `directory-cas-dev-v1` | 开发仓库，不是生产默认 |
+| `directory-cas-dev-v1` | 当前生成配置的开发默认；不是 release default |
 | `local-zstd-v1` | 可运行候选：整文件压缩、去重、校验、修复和迁移有测试，尚未资格认证 |
 | `local-zstd-encrypted-v1` | 实验候选：AES-256-GCM 与外部 KeyProvider 有测试，不是默认配置 |
 | GC | 只有 `NON_DESTRUCTIVE_ONLY` reachability 计划，没有删除执行器 |
@@ -223,11 +225,15 @@ enabled = true
 listen = "127.0.0.1:4534"
 ```
 
-然后启动 daemon 和前端：
+在终端 1 启动 daemon：
 
 ```bash
 bin/restoreweaved --config ./restoreweave.toml --socket /tmp/restoreweaved.sock
+```
 
+在终端 2 启动前端：
+
+```bash
 cd web
 npm ci
 npm run dev
@@ -250,6 +256,8 @@ Darwin ARM64 的默认位置示例：
 ```
 
 也可以用 `--semantic-bundle` 显式指定。缺少 bundle 时 daemon 会诚实报告 semantic unavailable，不会使用 fixture vector 冒充真实模型。
+
+模型、ONNX Runtime、zvec 和 Go binding 各自的许可证、NOTICE/SBOM 与再分发条件必须随未来安装 bundle 单独保留和资格化；它们不由本仓库尚未选择的项目许可证自动覆盖。
 
 ## 接下来做什么
 

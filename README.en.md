@@ -36,9 +36,9 @@ The list below is organized around user-visible work. Except where marked as a c
 ### Configuration and status
 
 - Persisted TOML configuration, with read compatibility for older YAML profiles.
-- Explicit catalog, repository, vector, model, and recovery-record locations.
+- Explicit catalog, repository, vector, model, and publication-signing-material locations.
 - Relative paths resolve against the config file, never an accidental daemon working directory.
-- `rw config init`, `validate`, and `show`, plus `--config` and environment overrides.
+- The config CLI provides separate `rw config init --path <file>`, `rw config validate --path <file>`, and `rw config show --path <file>` commands; the daemon uses `restoreweaved --config <file>`, with environment overrides also available.
 - A configuration digest bound to plans, snapshots, Descriptions, and index/semantic generations.
 - Status and diagnostics for the daemon, catalog, repository, indexes, plans, jobs, and providers.
 
@@ -67,17 +67,17 @@ The list below is organized around user-visible work. Except where marked as a c
 - Notes feed both ordinary and semantic search directly, without copying them into a hidden second record.
 - Durable tags and annotation import/export remain available for scripts and compatibility flows; the daily WebUI centers semantic information on Notes.
 - Versioned Descriptions retain source, language, producer, predecessor revision, and semantic segments.
-- User, imported, extracted, and model-produced Descriptions can be retained. Model generation is an explicit operation, never an implicit ingest dependency.
+- User, imported, extracted, and model-attributed Descriptions can be retained. No Description generator is built in, and ingest never generates one automatically.
 - Basic built-in extraction covers UTF-8 text, ID3/FLAC/OGG audio tags, and EPUB OPF metadata.
 - Processor results carry provenance. Failure, timeout, or unavailability never grants content-identity or recovery authority.
 
 ### Lexical, structured, and semantic search
 
 - Search filename, original path, suffix, type, tags, Notes, Descriptions, and extracted text.
-- Filter by entry type, size, mtime, SHA-256, duplicate group, protection status, language, and suffix.
+- Filter by entry type, size, mtime, SHA-256, duplicate group, `protection_mode`, language, and suffix.
 - Lexical, structured, and semantic results resolve to the same stable subject.
 - Results preserve the matched Description segment or Note content and its source, not just an opaque score.
-- Real local semantic vector generation and query using `BAAI/bge-small-zh-v1.5`, ONNX Runtime, and in-process zvec.
+- With an explicitly provisioned and verified platform bundle, real local semantic vector generation and query using `BAAI/bge-small-zh-v1.5`, ONNX Runtime, and in-process zvec.
 - A real inference probe runs at daemon startup, and a compatible zvec generation can reopen after restart.
 - An unhealthy model, lease, or generation reports semantic search unavailable while lexical/structured search, exact protection, and recovery continue.
 - Every semantic generation is strictly bound to its embedding profile and configuration. Incompatible generations fail closed without rewriting old Notes, Descriptions, or subject identity.
@@ -107,7 +107,7 @@ The list below is organized around user-visible work. Except where marked as a c
 - Reject modified, truncated, missing, incorrectly signed, wrong-anchor, or reader-incompatible recovery records and content.
 - Read-only verification after repository relocation, plus tested raw/zstd copy-forward migration, target-tamper rejection, and preservation of the old repository as rollback authority.
 - Cross-process publication fencing prevents two daemons from interleaving publication. Authenticated records reconcile unknown outcomes.
-- Bounded retry of the same signed processor plan has retry-limit and restart-resume evidence. General asynchronous reprocessing remains unavailable.
+- The daemon automatically performs bounded retries of the same signed processor plan with lease, fencing, idempotency, restart-resume, unknown-outcome reconciliation, and retry-limit evidence. Arbitrary user-triggered or rerouted reprocessing remains unavailable.
 
 ### Interfaces
 
@@ -169,7 +169,8 @@ RestoreWeave keeps the number of physical entities small, while giving each one 
 | Content repository | Configured repository directory | Not rebuildable from indexes | Original exact bytes and authenticated records |
 | Lexical index | Separate SQLite FTS generation | Yes | Text and structured search |
 | Semantic index | zvec generation | Yes | BGE embedding search |
-| Recovery records | Configured repository/recovery path | Not replaceable by an empty index | Catalog-free verification and restore |
+| Portable recovery records | Authenticated records in the repository plus an explicitly exported recovery reference | Not replaceable by an empty index | Catalog-free verification and restore |
+| Publication signing material | `paths.recovery_records` | No | Publication private key and local anchor copy; not a clean-reader artifact |
 | Trust anchor | Exported and retained independently | Not inferable from an untrusted repository | Signature verification for recovery records |
 
 Catalog, repository, and index are separate logical layers; they do not require three database services. The personal profile uses local SQLite, a directory repository, and in-process zvec, with no Qdrant, Milvus, or Docker Compose dependency.
@@ -180,9 +181,10 @@ Catalog, repository, and index are separate logical layers; they do not require 
 | --- | --- |
 | Lexical/zvec indexes removed | Search degrades; files, Notes, Descriptions, and recovery remain, and indexes can rebuild |
 | BGE/ONNX/zvec bundle unavailable | Semantic search is unavailable; lexical search, protection, verification, and restore continue |
-| SQLite catalog unavailable | Daily search and editing are unavailable; a clean reader can still verify and restore when the repository, portable recovery records, and independent trust anchor remain |
+| SQLite catalog unavailable | Daily search and editing are unavailable; a clean reader can still verify and restore when the repository, exported recovery reference, and independent trust anchor remain |
 | Repository payload missing | Recovery records cannot recreate source bytes from nothing; the affected content is not restorable |
-| Catalog and recovery records both missing | Context-free blobs are insufficient to safely reconstruct the original namespace and recovery meaning |
+| Catalog and portable recovery records both missing | Context-free blobs are insufficient to safely reconstruct the original namespace and recovery meaning |
+| Publication signing material missing | Existing exported recovery references remain clean-reader verifiable; the ordinary daemon cannot continue the original signed publication lineage |
 | Independent trust anchor missing | Signed recovery records cannot be authenticated as designed; do not keep the only copy in the same failure domain |
 | Experimental encrypted-repository key missing | Encrypted content is unreadable; this profile is neither the generated default nor a production capability |
 
@@ -196,7 +198,7 @@ Catalog, repository, and index are separate logical layers; they do not require 
 | Signed recovery, clean reader, tamper rejection, fencing, reconciliation | Implemented and tested for the admitted development profile |
 | SavedView, ExportManifest, materialize/verify | Implemented and tested for local scope; not release-qualified |
 | React WebUI and loopback API | Usable core convenience surface; not a remote administration platform |
-| `directory-cas-dev-v1` | Development repository, never the production default |
+| `directory-cas-dev-v1` | Current generated development default; not a release default |
 | `local-zstd-v1` | Runnable candidate with tested whole-file compression, dedup, verification, repair, and migration; not qualified |
 | `local-zstd-encrypted-v1` | Experimental candidate with tested AES-256-GCM and external KeyProvider behavior; not a config default |
 | GC | `NON_DESTRUCTIVE_ONLY` reachability planning; no deletion executor |
@@ -223,11 +225,15 @@ enabled = true
 listen = "127.0.0.1:4534"
 ```
 
-Start the daemon and frontend:
+Start the daemon in terminal 1:
 
 ```bash
 bin/restoreweaved --config ./restoreweave.toml --socket /tmp/restoreweaved.sock
+```
 
+Start the frontend in terminal 2:
+
+```bash
 cd web
 npm ci
 npm run dev
@@ -250,6 +256,8 @@ Example default location for Darwin ARM64:
 ```
 
 You can also pass `--semantic-bundle`. Without the bundle, the daemon honestly reports semantic search unavailable; it never substitutes fixture vectors for a real model.
+
+The model, ONNX Runtime, zvec, and Go binding each retain their own license, NOTICE/SBOM, and redistribution obligations. A future install bundle must preserve and qualify them separately; they are not covered automatically by this repository's still-unselected project license.
 
 ## What comes next
 

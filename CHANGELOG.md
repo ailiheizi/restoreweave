@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Added complete Chinese and English public README guides.
+- Added detailed Chinese and English public README guides.
 - Reconciled public capability and roadmap wording with the tested core preview.
 - Marked the removed Inbox, OpenSubsonic, and OPDS adapters as historical.
 
