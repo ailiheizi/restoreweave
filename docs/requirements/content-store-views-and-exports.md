@@ -98,6 +98,23 @@ A `Subject` MAY have many source paths, many annotations, many representations, 
 
 `NamespaceEntry` preserves the original name and source facts; it does not imply that local bytes are retained. A subject may have a local exact representation, only external recovery references, or both. The absence of a local payload is a visible protection state, never an empty or successful exact representation.
 
+### 3.1 Physical storage simplicity
+
+The logical layers above do not require one physical database per layer. The
+personal-use layout SHOULD use one configured SQLite catalog for subjects,
+namespace entries, content identities, representations, protection records,
+annotations, descriptions, recovery references, GC references, and ordinary
+rebuildable search tables. File bytes and admitted representations remain in
+the configured content repository because they need streaming, placement,
+compression, and verification independent of SQLite row size.
+
+The semantic provider MAY keep provider-owned generation files such as zvec
+collections, but they are disposable search projections, never a second
+metadata authority. A signed portable recovery export or publication bundle
+is an independently retained backup artifact derived from the catalog and
+publication records; it is not a second live catalog that ordinary operations
+must keep in sync.
+
 ## 4. Identity and exactness
 
 ### 4.1 Default identity
@@ -214,12 +231,15 @@ The qualified platform profile defines which optional filesystem facts it can ob
 
 ### 5.1 Logical stores
 
-A deployment has three separate storage concerns:
+A deployment has one operational metadata database and one content repository.
+Search projections may be tables in the database or provider-owned cache files;
+they are never a second metadata authority. There is no separate live recovery
+database.
 
 | Store | Contains | Recovery authority |
 | --- | --- | --- |
-| Operational catalog | Subjects, source observations, plans, annotations, placements, and caches used by the running controller | No; it is an operational projection |
-| Content repository | Exact and admitted derived representations plus portable recovery records | Yes, subject to receipts and verification |
+| Operational catalog | One SQLite database containing subjects, source observations, plans, annotations, placements, recovery references, and rebuildable search tables | Daily source of metadata; signed publication/recovery artifacts remain the independent recovery proof |
+| Content repository | Exact and admitted derived representations plus signed portable recovery/backup artifacts | Yes, subject to receipts and verification |
 | Index stores | Lexical, vector, acoustic, graph, and multimodal generations | No; they are disposable and rebuildable |
 
 An export destination is not a fourth authoritative store unless it is admitted as a repository placement. It is normally a materialized output that can be deleted and reproduced from its `ExportManifest`.
@@ -235,7 +255,7 @@ Source paths and storage paths are never inferred from each other.
 
 The current development daemon loads the strict persisted profile from `RESTOREWEAVE_CONFIG` or the platform config path. One-shot flags override environment path variables, which override persisted values, which override platform XDG defaults. `--catalog` and `--repository` remain one-shot overrides. This behavior is implementation status, not qualification of the in-tree directory CAS as a release repository.
 
-An installer MAY ask for one convenience `data_root`, but `restoreweave.config.v1` has no ambiguous catch-all path. The installer expands that choice into the four explicit `paths.*` values below. Runtime-only directories may be placed beneath an implementation-owned state root, but they do not become recovery authority.
+An installer MAY ask for one convenience `data_root`, but `restoreweave.config.v1` has no ambiguous catch-all path. The installer expands that choice into the explicit `paths.*` values below. `paths.recovery_records` is the destination for signed backup/export artifacts, not a second live metadata database. Runtime-only directories may be placed beneath an implementation-owned state root, but they do not become recovery authority.
 
 | Location | Contents | Authority, backup, and deletion rule |
 | --- | --- | --- |
@@ -255,7 +275,7 @@ The release default MUST be one qualified, lossless `RepositoryDriver` profile t
 
 The in-tree `directory-cas-dev-v1` profile is a development and test driver. It stores raw whole-file blobs addressed by SHA-256 and does not qualify as the release default merely because exact restore tests pass.
 
-The in-tree `local-zstd-v1` + `zstd-v1` profile is a personal-use candidate, not the release profile. It is embedded in the daemon, needs no Compose stack or separate service, preserves logical SHA-256 identity, eliminates duplicate whole-file objects, and stores payloads as checksummed zstd frames. Portable recovery records remain uncompressed JSON. It currently provides neither repository encryption, content-defined chunk deduplication, destructive GC, repair, nor a user-visible net-savings report; those omissions prevent a production qualification claim.
+The in-tree `local-zstd-v1` + `zstd-v1` profile is a personal-use candidate, not the release profile. It is embedded in the daemon, needs no Compose stack or separate service, preserves logical SHA-256 identity, eliminates duplicate whole-file objects, and stores payloads as checksummed zstd frames. Portable recovery records remain uncompressed JSON. A separate `local-zstd-encrypted-v1` experimental profile adds an injected host-owned key provider, non-secret key references, AES-256-GCM payload protection, authenticated decode-and-hash readback, missing/wrong-key fail-closed health, clean-install reader dependency, relocation, corruption, and key-rotation copy-forward evidence without placing secrets in plans or portable records. Neither in-tree profile is release-qualified: content-defined chunk deduplication, destructive GC, broader crash/migration rollback, representative corpus measurements, packaging, and complete reader closure remain open. An explicit host-owned repair seam, copy-forward profile migration helper, and mechanism-separated savings measurement are implemented and tested, but these do not establish a production qualification claim.
 
 No repository product or engine name is normative until a dated qualification record binds its version, configuration, corpus, failure tests, readback results, migration path, and license obligations.
 
@@ -295,57 +315,67 @@ The named local semantic profile manifest, not additional ad hoc config keys, pi
 
 First-run onboarding SHOULD require only three operator choices: the data location (expanded to `paths.*`), repository profile, and embedding profile. Protection, description, and recovery settings have conservative defaults but remain visible and editable. Export destinations and per-item `LINK_ONLY` decisions are operation inputs, not hidden global paths.
 
-The first user-facing configuration MUST be a persisted, versioned file. It SHOULD use a human-editable format with a strict schema; the reference implementation uses `config.yaml` and emits a redacted canonical JSON view for diagnostics. The default file is `$XDG_CONFIG_HOME/restoreweave/config.yaml` (or the platform equivalent), while data paths remain independently configurable. A minimal profile is:
+The first user-facing configuration MUST be a persisted, versioned file. It SHOULD use a human-editable format with a strict schema; the reference implementation uses `config.toml` and emits a redacted canonical JSON view for diagnostics. The default file is `$XDG_CONFIG_HOME/restoreweave/config.toml` (or the platform equivalent), while data paths remain independently configurable. Older `.yaml` profiles remain readable for migration, but new files are written as TOML. A minimal profile is:
 
-~~~yaml
-schema: restoreweave.config.v1
-paths:
-  catalog: /data/restoreweave/catalog.sqlite
-  repository: /data/restoreweave/repository
-  vectors: /data/restoreweave/vectors
-  recovery_records: /data/restoreweave/recovery
-storage:
-  repository_profile: directory-cas-dev-v1
-  default_protection: STORE_EXACT
-  allow_link_only: true
-  link_only_requires_confirmation: true
-  compression_profile: identity-v1
-  neural_codec: disabled
-semantic:
-  embedding_mode: local       # local | online | hybrid
-  local_profile: bge-small-zh-v1.5
-  online_profile: ""
-  online_credential_ref: ""
-  vector_backend: zvec
-  send_content_without_confirmation: false
-descriptions:
-  enabled: true
-  generate: on_demand          # on_ingest | on_demand | disabled
-  provider_profile: ""         # select a separate local or online generator explicitly
-  credential_ref: ""
-  retain_full_text: true
-recovery:
-  require_exact_fallback: true
-  allow_external_reacquisition: false
-  publication_signing: local-ed25519-v1
-  publication_domain: workspace:default
+~~~toml
+schema = "restoreweave.config.v1"
+[paths]
+catalog = "/data/restoreweave/catalog.sqlite"
+repository = "/data/restoreweave/repository"
+vectors = "/data/restoreweave/vectors"
+recovery_records = "/data/restoreweave/recovery"
+[storage]
+repository_profile = "directory-cas-dev-v1"
+default_protection = "STORE_EXACT"
+allow_link_only = true
+link_only_requires_confirmation = true
+compression_profile = "identity-v1"
+neural_codec = "disabled"
+[semantic]
+embedding_mode = "local"       # local | online | hybrid
+local_profile = "bge-small-zh-v1.5"
+online_profile = ""
+online_credential_ref = ""
+vector_backend = "zvec"
+send_content_without_confirmation = false
+[descriptions]
+enabled = true
+generate = "on_demand"          # on_ingest | on_demand | disabled
+provider_profile = ""            # select a separate local or online generator explicitly
+credential_ref = ""
+retain_full_text = true
+[recovery]
+require_exact_fallback = true
+allow_external_reacquisition = false
+publication_signing = "local-ed25519-v1"
+publication_domain = "workspace:default"
+[api]
+enabled = false
+listen = "127.0.0.1:4534"
 ~~~
 
 To opt into the local compression candidate, change the storage tuple together:
 
-~~~yaml
-storage:
-  repository_profile: local-zstd-v1
-  default_protection: STORE_EXACT
-  allow_link_only: true
-  link_only_requires_confirmation: true
-  compression_profile: zstd-v1
-  neural_codec: disabled
+~~~toml
+[storage]
+repository_profile = "local-zstd-v1"
+default_protection = "STORE_EXACT"
+allow_link_only = true
+link_only_requires_confirmation = true
+compression_profile = "zstd-v1"
+neural_codec = "disabled"
 ~~~
 
 Secrets MUST be referenced by `credential_ref` or the host secret store, never placed in this file. `rw config init`, `rw config validate`, and `rw config show --effective` are part of the core operator surface. CLI flags and environment variables (`RESTOREWEAVE_CONFIG`, `RESTOREWEAVE_CATALOG`, `RESTOREWEAVE_REPOSITORY`) may override paths for one invocation. An override is reported and included in the effective config digest; it does not silently rewrite the persisted file.
 
-`descriptions.enabled: true` enables durable user, imported, and extracted descriptions even when `provider_profile` is empty. With `generate: on_demand`, no model runs during ingest. A generation request without a selected healthy profile returns `DESCRIPTION_PROVIDER_UNAVAILABLE` and does not alter the document or semantic-index state. `on_ingest` is accepted only with a pinned, installed profile and an explicit resource/egress policy; its failure degrades description coverage but never exact protection or the required embedding generation. The current checkout still emits the placeholder `local-or-configured-online`; replacing that placeholder with the empty canonical value and enforcing these states is an implementation gap, not permission to guess a provider.
+The HTTP adapter is disabled by default. Setting `api.enabled = true` binds the
+same typed command dispatcher at `/api/v1/command`; `restoreweaved --api-listen`
+is a one-shot listener override. Keep it on loopback unless an outer proxy
+provides authentication and transport policy. `RESTOREWEAVE_API_TOKEN` (or
+`--api-token`) supplies an optional bearer token and is never written to TOML,
+SQLite, plans, or recovery records.
+
+`descriptions.enabled: true` enables durable user, imported, and extracted descriptions even when `provider_profile` is empty. With `generate: on_demand`, no model runs during ingest. A generation request without a selected healthy profile returns `DESCRIPTION_PROVIDER_UNAVAILABLE` and does not alter the document or semantic-index state. `on_ingest` is accepted only with a pinned, installed profile and an explicit resource/egress policy; its failure degrades description coverage but never exact protection or the required embedding generation. The default checkout keeps `provider_profile` empty until an explicit `DESCRIBE_SUBJECT` profile is admitted; it never infers a provider from the embedding profile.
 
 The same rule applies to external locators. Portable snapshots, recovery exports, audit details, and index feeds MUST NOT contain URI userinfo, bearer or signed query parameters, secret fragments, or a credential-bearing display locator. Access material is resolved from `credential_ref` at execution time. Until a qualified `RetrieverDriver` defines and validates typed public query parameters, the reference recorder rejects all locator query strings and fragments rather than trying to recognize secrets with a denylist.
 
@@ -625,59 +655,60 @@ This is the canonical checkout-status matrix. Other plans may add evidence, but 
 
 | Capability | Status | Meaning |
 | --- | --- | --- |
-| Strict persisted configuration and path resolution | implemented and tested | Current schema is usable; complete profile binding remains open |
+| Strict persisted configuration and path resolution | implemented and tested | Current schema and host-injected description/index profile bindings are usable; release packaging/profile selection remains open |
 | SHA-256 identity and whole-file duplicate placement | implemented and tested | Exact whole-content reuse works in both in-tree profiles |
 | `directory-cas-dev-v1` | development only | Raw test driver, never the release default |
-| `local-zstd-v1` | candidate | Embedded compression, whole-file dedup, corruption rejection, relocation, profile isolation, and a mechanism-separated savings report exist; encryption, chunking, GC, repair, migration, and qualification remain |
-| Protection records and digest-bound plan/apply | implemented and tested for the stated local scope | External acquisition and the complete portable fact closure remain open |
-| Signed recovery publication | foundation only | Prepared/commit records, a signed post-commit processor-attempt child, catalog-free exact restore, a signed portable-fact child with content-addressed bodies and subject mapping, a catalog-free clean-install import/reader with an independently supplied trust anchor, deterministic recovery tokens, and cross-process publication fencing work; actual platform-qualified xattr/ACL/extent capture and per-field ownership/mode/time provenance remain open |
-| User/imported description revisions and segments | partially implemented | SQLite/CLI path exists and description revisions are bound into the signed portable-fact child; profile binding, lifecycle, and provider admission remain |
-| Lexical/structured discovery | implemented and tested for the stated field scope | Required fields, typed filters, segment provenance, coverage, and fused query are wired; semantic dimension remains honestly `SEMANTIC_INDEX_UNAVAILABLE` |
-| Local ONNX/BGE encoder | planned | Config selects it; no real runtime is wired |
-| In-process zvec generation/query | planned | Fixture dimensions do not count as zvec |
-| Fused default search | partial | Lexical + graph dimensions fuse with per-component provenance; real semantic generation is not wired, so the default fused experience remains honest-unavailable |
+| `local-zstd-v1` | candidate | Embedded compression, whole-file dedup, corruption rejection, relocation, profile isolation, explicit repair, copy-forward migration with independently reopened source/target clean readers and rollback preservation, mechanism-separated savings, and non-destructive verified root/inventory candidate planning exist and are tested; encryption admission, chunking, destructive GC, full migration rollback/reader closure, and qualification remain. The separate `local-zstd-encrypted-v1` experimental profile has host-owned AES-256-GCM/key-provider evidence but is not a release default |
+| Protection records and digest-bound plan/apply | implemented and tested for the admitted development profile | Exact/link-only/metadata-only decisions and portable recovery references are authenticated; external acquisition remains a later profile |
+| Signed recovery publication | implemented and tested for the admitted development profile | Prepared/commit records, signed processor-attempt and portable-fact successor children, portable subject mapping and body attachments, catalog-free exact restore, independent-anchor clean-install import/reader, deterministic recovery-token sets, independently hashed attachment readback, cross-process fencing, and unknown-outcome reconciliation work. Sparse extent maps, broader per-field provenance, production repository qualification, and release acceptance remain open |
+| User/imported description revisions and segments | implemented and tested for the admitted recovery profile | SQLite/CLI revisions, source-aligned segments, config/provider/segmentation bindings, and authenticated portable body bindings work; lifecycle and provider admission remain |
+| Lexical/structured discovery | implemented and tested for the stated field scope | Required fields, typed filters, segment provenance, coverage, and fused query are wired; semantic remains unavailable when no admitted real bundle is supplied |
+| Local ONNX/BGE encoder | implemented and tested for the opt-in worker/component profile | The supervised worker admits the pinned bundle and produces real vectors; the Linux arm64 daemon/CLI semantic E2E passed in the provisioned environment, while packaging and release qualification remain open |
+| In-process zvec generation/query | implemented and tested for the opt-in component profile | Real zvec build/open/query evidence and daemon generation-loss/rebuild evidence passed in the opt-in Linux arm64 environment; fixture dimensions do not count as zvec |
+| Fused default search | partial | Lexical + structured + real semantic fusion is wired and covered by the executed opt-in Linux arm64 daemon test; profile switching preserves old generations and durable descriptions, while the absence of a supported packaged bundle keeps the default experience honestly degraded |
 | Saved views and frozen export manifests | implemented and tested for the stated local scope | `rw view save/get/list/evaluate` and `rw export plan/apply/verify` work end-to-end with exact receipts; release qualification remains |
 | Inbox/OpenSubsonic/OPDS | optional compatibility experiments, maintenance-only | They cannot define or advance core completion |
 | FUSE/mount/network filesystem | closed non-goal | External tools consume exports or authorized reads |
 | OpenList fork/core dependency | closed non-goal | Interoperation may be considered only outside core authority |
 | RWKV/Transformer codec | deferred optional profile | Cannot start before simple storage and recovery qualification |
 
-As of 2026-08-21, the checkout has an exact whole-file SHA-256 development directory CAS, an opt-in embedded zstd candidate, SQLite operational catalog, strict persisted configuration, portable snapshot JSON, CLI/daemon control plane, lexical FTS foundations, annotations, exact verification/restore, explicit exact/link-only protection records, multiple credential-free external locators, append-only description revisions with bounded CLI/API and source-aligned segments, fixture discovery dimensions, narrow protocol facades, and the first signed publication-closure path. The signed path includes Ed25519 `PREPARED_CLOSURE` and `PUBLICATION_COMMIT` records, payload aggregate receipts, authenticated metadata evidence, commit discovery, generation/parent lineage, catalog-free list/verify/diff/restore, recovery export bundles, and reconciliation of a missing SQLite projection after a committed publication. A separate signed `PROCESSOR_ATTEMPT_CLOSURE` now binds the deterministic terminal-attempt bundle to its fully validated parent commit after optional processing; the catalog-free reader rejects tampering, missing parents, noncanonical bundles, and conflicting replay without making exact restore depend on the child. A catalog-free recovery-reader daemon validates v2 references against an independently retained trust anchor and read-only repository, and imports v1 recovery bundles without SQLite, indexes, or signing material. `snapshot.v2` adds typed hard-link, sparse-indication, boundary, and detection observations plus explicit unsupported declarations for xattrs, ACLs, sparse extents, alternate streams, resource forks, and flags. Per-fact provenance and a digest over the complete manifest projection are authenticated; the base prepared closure remains signed as `PARTIAL` with explicit omissions rather than reported as complete. The daemon enables this foundation by default, and the signed restore path passes with both in-tree repository profiles; this does not qualify either profile or close the full recovery contract.
+As of 2026-08-22, the admitted Phase 3 development profile has executable recovery closure. Ed25519 `PREPARED_CLOSURE` and `PUBLICATION_COMMIT` records bind payload receipts, authenticated metadata evidence, generation/parent lineage, and a separately retained trust anchor. Signed `PROCESSOR_ATTEMPT_CLOSURE` and complete-state `PORTABLE_FACT_CLOSURE` children bind terminal processor attempts, subject mappings, description and annotation revisions, semantic segments, processor-artifact descriptors, content-addressed bodies, and the admitted typed filesystem facts to the exact parent without changing exact publication identity. The catalog-free reader rejects tampering, missing parents, noncanonical/conflicting successors, unavailable dependencies, dishonest repository verification, and attachment digest or length drift while exact restore remains independent from derived children. The v2 recovery reference and legacy v1 import work without SQLite, indexes, or signing material; the non-destructive v1-to-v2 migration preserves the authenticated publication identity and rejects tampered legacy input. Real daemon/CLI process tests pass on Darwin and Linux arm64. These are implementation tests for development/candidate repositories, not repository, platform, or release qualification.
 
 The recovery closure is further hardened by cross-process publication fencing. Publication now acquires a lease on the `publication_fences` projection through the SQLite store, stamps the returned monotonic fencing token into the signed `PREPARED_CLOSURE`, `PUBLICATION_COMMIT`, processor-attempt, and portable-fact records, validates the lease immediately before every signed-record placement, and releases it on success or failure. An explicit `PublicationFencer` seam keeps the catalog-free reader path (no store) on the legacy `FenceToken: 1` behavior, so existing no-fence tests and readers are unchanged. The fence table plus an opaque per-attempt lease token prevents two processes from interleaving publications in one domain; the fencing token is monotonic across restarts and stale-lease reuse is rejected.
 
 `recovery.import` and `recovery.token.export` are now wired. `recovery.import` verifies a `recovery.export` bundle against an independently retained trust anchor, cross-checks the commit/prepared binding and generation lineage, and admits the closure either catalog-free (clean-install reader over `OpenProfileReadOnly`) or by reconciling the SQLite projection when a store is available. `recovery.token.export` emits the deterministic `org.restoreweave.recovery-token.v1` proof envelope over one subject's recovery reference: schema, snapshot, subject, reference id, expected identity/length, recipe digest, publication commit ref, trust-anchor ref, optional expiry, and a digest over the canonical JSON of all other fields. A metadata-only or explicitly-unprotected subject has no recovery path and fails closed with `ErrNoRecoveryPath`.
 
-Saved views and export manifests are implemented for the stated local scope. `rw view save/get/list/evaluate` manages revisioned dynamic queries (`SavedView`), and `view.evaluate` runs the query through the search engine with the view's structured fields as typed filters. `rw export plan/apply/verify` freezes one view evaluation (or explicit subject set) into an immutable `ExportManifest` with a canonical digest, then materializes exact bytes to an explicit destination via no-follow restore and verifies the destination path-set, lengths, and SHA-256 values against the manifest. `export.apply`/`verify` reference the frozen manifest, never the live view; re-applying the same manifest is idempotent, and unsafe (non-empty or symlink) destinations fail closed. A mechanism-separated savings report (`MeasureSavings`) reports logical, duplicate, compression, physical, overhead, and net-savings bytes independently for both in-tree profiles.
+Saved views and export manifests are implemented for the stated local scope. `rw view save/get/list/evaluate` manages revisioned dynamic queries (`SavedView`), and `view.evaluate` runs the query through the search engine with the view's structured fields as typed filters. `rw export plan/apply/verify` freezes one view evaluation (or explicit subject set) into an immutable `ExportManifest` with a canonical digest, then materializes exact bytes to an explicit destination via no-follow restore and verifies the destination path-set, lengths, and SHA-256 values against the manifest. `export.apply`/`verify` reference the frozen manifest, never the live view; re-applying the same manifest is idempotent, and unsafe (non-empty or symlink) destinations fail closed. One real daemon/CLI process test now covers configured exact ingest, durable description and annotation writes, typed lexical search with segment provenance, SavedView evaluation, manifest freeze, materialization and verification, recovery-reference/trust-anchor export, catalog/signing-material removal, and clean-install exact restore. This is integration evidence for the current development/candidate profiles, not Phase 6 or release qualification. A mechanism-separated savings report (`MeasureSavings`) reports logical, duplicate, compression, physical, overhead, and net-savings bytes independently for both in-tree profiles.
 
-The lexical/structured search feed now covers the complete baseline fields with typed structured filters, per-description segment provenance, and an honest per-field coverage report. `search.query` accepts `entry_type`, `size`/`mtime` facets, `content_id`, `duplicate_group`, `protection_mode`, `language`, and `suffix` constraints and returns matched segment provenance for description hits. Coverage is measured from an actually built generation; absent fields are reported as absent. The real local ONNX/BGE encoder and in-process zvec generation remain unqualified `planned` capabilities: without a real runtime wired, the semantic dimension reports `SEMANTIC_INDEX_UNAVAILABLE` and is never advertised as a fixture-derived default. Fixture dimensions require the explicit qualification-harness option and remain non-default.
+The lexical/structured search feed now covers the complete baseline fields with typed structured filters, per-description segment provenance, and an honest per-field coverage report. `search.query` accepts `entry_type`, `size`/`mtime` facets, `content_id`, `duplicate_group`, `protection_mode`, `language`, and `suffix` constraints and returns matched segment provenance for description hits. Coverage is measured from an actually built generation; absent fields are reported as absent. Disposable generations bind the resolved config, provider profile, semantic space, snapshot, namespace root, and workspace; mismatches and legacy unbound generations fail closed. The embedding-generation manifest contract binds runtime, model, tokenizer, preprocessing, pooling, normalization, element type, dimension, vector schema, semantic space, distance, index/query configuration, provider, and config digests, and rejects incomplete manifests. With an explicitly admitted local BGE bundle, the daemon now constructs the real semantic binding, publishes and queries zvec generations from durable segments, reports the real capability only after worker/index evidence, and degrades after generation loss until a later rebuild restores it; the opt-in Linux arm64 daemon test for publication, semantic query, generation loss, degraded capability, and rebuild passed in the provisioned environment. This is not release qualification or a packaged default; without the bundle, the semantic dimension reports `SEMANTIC_INDEX_UNAVAILABLE` and fixtures remain non-default.
 
 The portable-fact child is now validated against its parent manifest on the catalog-free read path: every `SUBJECT_MAPPING` record must match the exact parent's raw path, entry type, content identity, logical length, raw name, and protection decision; the record count must cover the manifest entries. Inner records are strictly validated (duplicate logical keys with conflicting bytes, cross-workspace payloads, subject mismatches, and unknown kinds are rejected) before any bundle is admitted.
 
-The Phase 3 gate remains open until actual platform-qualified xattr/ACL/sparse-extent capture and per-field name/ownership/mode/time provenance are implemented; the current profile explicitly declares those capabilities `UNSUPPORTED` with reason codes rather than pretending they are captured. No repository engine is selected; `local-zstd-v1` remains a single-machine measurement candidate.
+The admitted Phase 3 file-fact profile captures xattr bytes and the xattr-carried ACL encodings admitted by the current Darwin/Linux adapters when the filesystem exposes them, and otherwise retains explicit `UNOBSERVED`, `UNSUPPORTED`, or `INCONSISTENT` states with reason codes. It authenticates `st_blocks`-based sparse indication but explicitly records the sparse extent map as unsupported; it does not claim hole-by-hole restoration. Broader platform qualification and per-field name/ownership/mode/time provenance require a separately reviewed successor shape. No repository engine is selected; `local-zstd-v1` remains a single-machine measurement candidate.
 
 The current `LINK_ONLY` path is deliberately limited. It hashes readable local source bytes, preserves names/metadata and expected identity, writes no payload to CAS, records locators as `UNVALIDATED`, and blocks full-byte verification and restore before a destination is created. It does not perform external retrieval. A tree default plus exact-path per-file protection overrides are implemented; their effective modes, planned outcomes, reason codes, identities, lengths, and locator bindings are digest-bound. Unresolved readable content is retained exactly as `EXACT_FALLBACK`. Failed or unstable scan entries are retained with requested mode, `BLOCKED` or `UNAVAILABLE` planned outcome, path, scanner state, reason code, and message in a non-executable plan; apply refuses that plan before creating an apply job or mutating the repository.
 
 The narrow operator-resolution path is successor-only. An explicit `METADATA_ONLY` decision may resolve a retained regular-file read/open failure only when a fresh rooted-FD scan proves the same before/after metadata and an included checked boundary. It never resolves an unstable path, lstat/boundary/post-stat/stability failure, directory or symlink failure, special file, path-string capture, cancelled scan, or failed scan. The published namespace retains the raw name, path, metadata, scanner issue, and `EXPLICITLY_UNPROTECTED` outcome without inventing a content identity, file version, representation, or recovery reference. Its scan generation remains `INCOMPLETE` with `full_traversal=false`; authenticated-metadata verification reports the coverage gap and exact restore fails before creating a destination.
 
-Processor capability invocations produce immutable SQLite terminal-attempt rows and a deterministic `restoreweave.processor-attempts/v1` JSON projection linked to admitted artifact references. Success, inapplicability, failure, cancellation, and an unconfigured routed capability are distinguishable. After exact commitment, a signed `PROCESSOR_ATTEMPT_CLOSURE` authenticates that projection and its parent publication without changing exact publication identity. A reader with the repository and independent trust anchor can validate it without SQLite. The child authenticates attempt provenance and artifact references only: artifact bodies, portable subject mapping, descriptions/annotations, and explicit retry/successor lineage remain open.
+Processor capability invocations produce immutable SQLite terminal-attempt rows and a deterministic `restoreweave.processor-attempts/v1` JSON projection linked to admitted artifact references. Success, inapplicability, failure, cancellation, and an unconfigured routed capability are distinguishable. After exact commitment, a signed `PROCESSOR_ATTEMPT_CLOSURE` authenticates that projection and its parent publication without changing exact publication identity. Its v2 complete-state successor chain preserves earlier attempts byte-for-byte, appends later terminal outcomes, and rejects gaps, forks, and historical rewrites. The portable-fact child separately authenticates the corresponding artifact descriptors and content-addressed bodies together with subject mappings and description/annotation records. A reader with the repository and independent trust anchor validates both children without SQLite. Automatic retry or reprocessing remains disabled until the async worker binds retry intent, idempotency, fencing, unknown-outcome reconciliation, and retry ceilings to this lineage.
 
 The remaining durable records use the frozen `PORTABLE_FACT_CLOSURE` shape in
 the Restore Manifest contract. It is a signed, complete-state successor chain
 over one exact parent. It carries portable subject mappings and immutable fact
 descriptors; large description or artifact bodies are SHA-256-addressed
 repository attachments rather than SQLite-only bodies or oversized tokens.
-This schema decision is documented but not implemented in the current status:
-the signed-recovery capability remains `foundation only` until catalog-free
-round-trip, attachment, conflict, clean-import, and corruption tests pass.
+This frozen v1 shape is implemented and tested for the admitted development
+profile. Catalog-free round-trip, attachment, conflict, clean-import,
+corruption, relocation, and reader-dependency tests cover it; expanded fact
+profiles require a reviewed successor rather than reinterpretation.
 
 Release blockers follow one dependency graph, not a priority list that optional work may interrupt:
 
-1. Complete the portable authenticated fact and recovery closure. The first typed fact projection and signed terminal processor-attempt child are implemented, but artifact bodies and portable subject mapping, descriptions/annotations, per-field name/ownership/mode/time provenance, and actual platform-qualified extended-metadata/extent capture remain open; explicit unsupported states must remain visible until each capability is qualified.
-2. Qualify the clean-install reader/import workflow across supported platforms and independently retained trust-anchor handling; the catalog-free daemon foundation and Unix-socket acceptance test now exist and do not depend on SQLite, indexes, the source host, or private signing material.
-3. Add cross-process fencing, unknown-outcome reconciliation, and repository corruption/relocation/recovery qualification.
+1. The admitted portable authenticated fact and recovery closure is implemented and tested. It includes artifact bodies, portable subject mapping, descriptions/annotations, terminal processor attempts, xattr/ACL observed-or-degraded states, sparse indication, and explicit unsupported extent-map state. Broader per-field provenance or platform profiles require a reviewed successor shape.
+2. The admitted clean-install reader/import and independently retained trust-anchor workflow is implemented and tested with real daemon/CLI processes on Darwin and Linux arm64. This does not constitute packaging, independent-failure-domain, or release qualification.
+3. Cross-process fencing/lease, typed unknown-outcome reconciliation, and raw/zstd corruption and relocation behavior are implemented and tested for the admitted development profile. Production repository qualification remains Phase 5.
 4. After items 1-3, run two gates in parallel: qualify one lossless production repository with complete logical/duplicate/compression/physical/index/model/net-savings measurements; and package the real local ONNX/BGE worker plus zvec while completing lexical/structured fields, typed filters, segment provenance, coverage, model-provider admission, online-egress controls, and host-owned fusion.
-5. After both parallel gates pass, implement saved views, frozen export manifests, materialize/verify, and the ordinary user loop without internal IDs.
+5. After both parallel gates pass, complete and qualify saved views, frozen export manifests, materialize/verify, and the ordinary user loop without internal IDs.
 6. Run native install, migration, upgrade, backup, performance, and complete `RW-MVP-1` acceptance.
 
 New facades, protocol methods, media applications, mount work, OpenList integration, multimodal dimensions, and neural codecs do not enter this queue. They cannot be used as substitutes for any blocker above.

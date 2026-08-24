@@ -4,10 +4,33 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+type dishonestSavingsReadbackDriver struct {
+	*Dir
+	contentID string
+	payload   []byte
+}
+
+func (d *dishonestSavingsReadbackDriver) Open(ctx context.Context, contentID string) (io.ReadCloser, error) {
+	if contentID == d.contentID {
+		return io.NopCloser(bytes.NewReader(d.payload)), nil
+	}
+	return d.Dir.Open(ctx, contentID)
+}
+
+func (*dishonestSavingsReadbackDriver) Verify(context.Context, string) error { return nil }
+
+func (d *dishonestSavingsReadbackDriver) savingsRoot() *Dir { return d.Dir }
+
+func (d *dishonestSavingsReadbackDriver) RepositoryProfile() ProfileDescription {
+	return d.Dir.RepositoryProfile()
+}
 
 // TestMeasureSavingsSeparatesMechanisms places identical files (whole-file
 // deduplication) and compressible files (compression) into a fresh zstd
@@ -104,6 +127,21 @@ func TestMeasureSavingsSeparatesMechanisms(t *testing.T) {
 	if report.OverheadBytes <= 0 {
 		t.Fatalf("OverheadBytes = %d, want measurable repository metadata", report.OverheadBytes)
 	}
+	if report.Overhead.RepositoryMetadata.Status != SavingsCategoryMeasured || report.Overhead.RecoveryRecords.Status != SavingsCategoryMeasured {
+		t.Fatalf("measured overhead categories = %+v", report.Overhead)
+	}
+	for name, category := range map[string]SavingsOverheadCategory{
+		"index":     report.Overhead.Index,
+		"model":     report.Overhead.Model,
+		"temporary": report.Overhead.Temporary,
+	} {
+		if category.Status != SavingsCategoryUnmeasured {
+			t.Errorf("%s overhead status = %q, want %q", name, category.Status, SavingsCategoryUnmeasured)
+		}
+	}
+	if wantGrowth := report.PhysicalStoredBytes + report.OverheadBytes; report.RepositoryGrowthBytes != wantGrowth {
+		t.Fatalf("RepositoryGrowthBytes = %d, want %d", report.RepositoryGrowthBytes, wantGrowth)
+	}
 
 	// Both layers must be reported separately, never merged.
 	if !containsMechanism(report.Mechanisms, SavingsMechanismWholeFileDedup) {
@@ -164,6 +202,79 @@ func TestMeasureSavingsRawProfilePhysicalEqualsLogical(t *testing.T) {
 	}
 	if len(report.Mechanisms) != 1 || report.Mechanisms[0] != SavingsMechanismWholeFileDedup {
 		t.Fatalf("raw profile Mechanisms = %v, want exactly [whole-file-deduplication]", report.Mechanisms)
+	}
+}
+
+// TestMeasureSavingsAcceptsEmptyObject preserves the valid zero-length member
+// of the SHA-256-plus-length identity tuple. Empty files must be measurable in
+// both in-tree profiles rather than being mistaken for malformed receipts.
+func TestMeasureSavingsAcceptsEmptyObject(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name       string
+		open       func(string) (Driver, error)
+		wantStored int64
+	}{
+		{
+			name: "raw",
+			open: func(path string) (Driver, error) {
+				return OpenDir(path)
+			},
+			wantStored: 0,
+		},
+		{
+			name: "zstd",
+			open: func(path string) (Driver, error) {
+				return OpenZstdDir(path)
+			},
+			wantStored: -1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			repo, err := test.open(filepath.Join(t.TempDir(), "repo"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			receipt, err := repo.Place(ctx, bytes.NewReader(nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if receipt.Bytes != 0 {
+				t.Fatalf("empty receipt logical bytes = %d, want 0", receipt.Bytes)
+			}
+			report, err := MeasureSavings(ctx, repo, []Receipt{receipt})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if report.LogicalBytes != 0 {
+				t.Fatalf("LogicalBytes = %d, want 0", report.LogicalBytes)
+			}
+			if report.PhysicalStoredBytes < 0 {
+				t.Fatalf("PhysicalStoredBytes = %d, want non-negative", report.PhysicalStoredBytes)
+			}
+			if test.wantStored >= 0 && report.PhysicalStoredBytes != test.wantStored {
+				t.Fatalf("PhysicalStoredBytes = %d, want %d", report.PhysicalStoredBytes, test.wantStored)
+			}
+			if test.name == "zstd" && report.PhysicalStoredBytes == 0 {
+				t.Fatal("zstd empty frame has no physical bytes")
+			}
+		})
+	}
+}
+
+// TestMeasureSavingsRejectsNegativeReceiptLength keeps malformed logical
+// lengths out of savings accounting while still permitting the valid zero
+// length covered above.
+func TestMeasureSavingsRejectsNegativeReceiptLength(t *testing.T) {
+	ctx := context.Background()
+	repo, err := OpenDir(filepath.Join(t.TempDir(), "repo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	contentID := AlgorithmSHA256 + ":" + "0000000000000000000000000000000000000000000000000000000000000000"
+	if report, err := MeasureSavings(ctx, repo, []Receipt{{ContentID: contentID, Bytes: -1}}); err == nil {
+		t.Fatalf("measurement accepted negative logical length: %+v", report)
 	}
 }
 
@@ -238,6 +349,135 @@ func TestMeasureSavingsFailsClosedOnCorruptRepository(t *testing.T) {
 	report, err := MeasureSavings(ctx, repo, []Receipt{receipt})
 	if err == nil {
 		t.Fatalf("measurement succeeded on a corrupt repository: %+v", report)
+	}
+}
+
+// TestMeasureSavingsRejectsDishonestVerify proves a backend cannot make a
+// savings claim by returning success from Verify while exposing wrong bytes
+// through Open. The host-owned logical readback must fail closed.
+func TestMeasureSavingsRejectsDishonestVerify(t *testing.T) {
+	ctx := context.Background()
+	repo, err := OpenDir(filepath.Join(t.TempDir(), "repo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte("authoritative placement bytes")
+	receipt, err := repo.Place(ctx, bytes.NewReader(want))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dishonest := &dishonestSavingsReadbackDriver{
+		Dir: repo, contentID: receipt.ContentID, payload: []byte("wrong readback bytes"),
+	}
+	if report, err := MeasureSavings(ctx, dishonest, []Receipt{receipt}); err == nil {
+		t.Fatalf("measurement accepted dishonest readback: %+v", report)
+	}
+}
+
+// TestMeasureSavingsRejectsPartiallyTrackedRepository ensures every physical
+// object is covered by the placement ledger before it contributes to savings.
+func TestMeasureSavingsRejectsPartiallyTrackedRepository(t *testing.T) {
+	ctx := context.Background()
+	repo, err := OpenDir(filepath.Join(t.TempDir(), "repo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := repo.Place(ctx, bytes.NewReader([]byte("tracked object")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Place(ctx, bytes.NewReader([]byte("untracked object"))); err != nil {
+		t.Fatal(err)
+	}
+	if report, err := MeasureSavings(ctx, repo, []Receipt{first}); err == nil {
+		t.Fatalf("measurement accepted a partially tracked repository: %+v", report)
+	}
+}
+
+// TestMeasureSavingsRejectsBlobNamespaceAnomaly ensures malformed physical
+// entries cannot be silently omitted from the measured footprint.
+func TestMeasureSavingsRejectsBlobNamespaceAnomaly(t *testing.T) {
+	ctx := context.Background()
+	repo, err := OpenDir(filepath.Join(t.TempDir(), "repo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := repo.Place(ctx, bytes.NewReader([]byte("tracked object")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	anomaly := filepath.Join(repo.Root(), blobDirName, AlgorithmSHA256, "aa", "malformed")
+	if err := os.MkdirAll(filepath.Dir(anomaly), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(anomaly, []byte("untracked bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if report, err := MeasureSavings(ctx, repo, []Receipt{receipt}); err == nil {
+		t.Fatalf("measurement accepted a malformed blob namespace entry: %+v", report)
+	}
+}
+
+// TestMeasureOverheadFailsClosedOnWalkError ensures an overhead traversal
+// failure is returned instead of being converted to a zero-byte estimate.
+func TestMeasureOverheadFailsClosedOnWalkError(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "missing-repository")
+	if overhead, err := measureOverhead(&Dir{root: root}); err == nil {
+		t.Fatalf("measureOverhead succeeded for an unreadable root: overhead=%+v", overhead)
+	}
+}
+
+// TestMeasureSavingsRejectsNonRegularOverhead ensures selected repository
+// metadata cannot be counted through a symlink or other non-regular entry.
+func TestMeasureSavingsRejectsNonRegularOverhead(t *testing.T) {
+	ctx := context.Background()
+	repo, err := OpenDir(filepath.Join(t.TempDir(), "repo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := repo.Place(ctx, bytes.NewReader([]byte("tracked object")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovery := filepath.Join(repo.Root(), recoveryDirName)
+	if err := os.MkdirAll(recovery, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("missing-record", filepath.Join(recovery, "record")); err != nil {
+		t.Fatal(err)
+	}
+	if report, err := MeasureSavings(ctx, repo, []Receipt{receipt}); err == nil {
+		t.Fatalf("measurement accepted non-regular overhead entry: %+v", report)
+	}
+}
+
+// TestMeasureSavingsRejectsUnaccountedRepositoryFile prevents retained files
+// outside the measured payload/recovery layout from being omitted from the
+// physical footprint and inflating net savings.
+func TestMeasureSavingsRejectsUnaccountedRepositoryFile(t *testing.T) {
+	ctx := context.Background()
+	tests := []string{"unexpected.bin", filepath.Join("staging", "index.tmp"), filepath.Join(tmpDirName, "leftover.tmp")}
+	for _, relative := range tests {
+		t.Run(strings.ReplaceAll(relative, string(filepath.Separator), "_"), func(t *testing.T) {
+			repo, err := OpenDir(filepath.Join(t.TempDir(), "repo"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			receipt, err := repo.Place(ctx, bytes.NewReader([]byte("tracked object")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(repo.Root(), relative)
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("unaccounted bytes"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if report, err := MeasureSavings(ctx, repo, []Receipt{receipt}); err == nil {
+				t.Fatalf("measurement accepted unaccounted file %q: %+v", relative, report)
+			}
+		})
 	}
 }
 

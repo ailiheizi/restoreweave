@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -171,6 +172,180 @@ func TestProcessorTimeoutDoesNotBlockExactLane(t *testing.T) {
 	assertAttempt(t, attempts, CapabilityTextExtract, string(StatusCancelled), "PROCESSOR_STAGE_CANCELLED")
 }
 
+func TestHostRetryWorkerRerunsOnlyFailedNodeAndPublishesSignedSuccessor(t *testing.T) {
+	ctx := context.Background()
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "retry.txt"), []byte("semantic retry content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, repo := testLane(t)
+	flaky := &failOnceTextProc{}
+	host := NewHost(store, repo, Options{StagingDir: t.TempDir(), Processors: []Processor{flaky}})
+	identity, anchor, err := exact.OpenSigningMaterial(t.TempDir(), "workspace:retry-host", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &exact.Service{
+		Store: store, Repo: repo, Processor: host, SigningIdentity: &identity, TrustAnchor: &anchor,
+		PublicationDomain: "workspace:retry-host", RequireSignedPublication: true,
+		ConfigDigest: "sha256:retry-host-config",
+	}
+	plan, err := service.InspectIngest(ctx, source, exact.IngestOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.ApplyIngestPlanWithExecutionKey(ctx, plan, "sha256:host-retry-plan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- service.RunProcessorRetryWorker(workerCtx, exact.ProcessorRetryWorkerOptions{
+			Owner: "host-retry-worker", PollInterval: 5 * time.Millisecond, LeaseTTL: time.Minute,
+		})
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	var retryJob sqlite.Job
+	for time.Now().Before(deadline) {
+		jobs, listErr := store.ListRecentJobs(ctx, 10)
+		if listErr != nil {
+			t.Fatal(listErr)
+		}
+		if len(jobs) == 1 && jobs[0].State == sqlite.JobSucceeded {
+			retryJob = jobs[0]
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if retryJob.State != sqlite.JobSucceeded || retryJob.Attempt != 1 {
+		t.Fatalf("host retry job = %+v", retryJob)
+	}
+	attempts, err := store.ListProcessorAttempts(ctx, result.WorkspaceID, result.SnapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var extract []sqlite.ProcessorAttempt
+	for _, attempt := range attempts {
+		if attempt.CapabilityID == CapabilityTextExtract {
+			extract = append(extract, attempt)
+		}
+	}
+	if len(extract) != 2 || extract[0].Status != string(StatusFailed) || extract[1].Status != string(StatusSucceeded) || extract[1].FenceToken != retryJob.FencingToken {
+		t.Fatalf("host retry attempts = %+v", extract)
+	}
+	if flaky.calls != 2 {
+		t.Fatalf("processor calls = %d, want initial failure plus one retry", flaky.calls)
+	}
+	closures, err := service.ListProcessorAttemptClosures(ctx, result.SnapshotRef)
+	if err != nil || len(closures) != 2 || closures[1].Closure.AttemptCount != int64(len(attempts)) {
+		t.Fatalf("host retry signed closures = %+v, err=%v", closures, err)
+	}
+}
+
+func TestHostRetryRejectsStaleWorkerPublicationAfterLeaseTakeover(t *testing.T) {
+	ctx := context.Background()
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "retry.txt"), []byte("stale retry content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, repo := testLane(t)
+	proc := &takeoverTextProc{started: make(chan struct{}), release: make(chan struct{})}
+	clock := time.Now().UTC()
+	var clockMu sync.Mutex
+	now := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return clock
+	}
+	host := NewHost(store, repo, Options{StagingDir: t.TempDir(), Processors: []Processor{proc}, Now: now})
+	identity, anchor, err := exact.OpenSigningMaterial(t.TempDir(), "workspace:stale-retry", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &exact.Service{
+		Store: store, Repo: repo, Processor: host, SigningIdentity: &identity, TrustAnchor: &anchor,
+		PublicationDomain: "workspace:stale-retry", RequireSignedPublication: true,
+		ConfigDigest: "sha256:stale-retry-config",
+	}
+	plan, err := service.InspectIngest(ctx, source, exact.IngestOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.ApplyIngestPlanWithExecutionKey(ctx, plan, "sha256:stale-retry-plan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := store.ListRecentJobs(ctx, 10)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("retry jobs = %+v, err=%v", jobs, err)
+	}
+	oldLeaseUntil := clock.Add(time.Second)
+	var oldFence int64
+	if err := store.Update(ctx, func(tx *sqlite.Tx) error {
+		var acquireErr error
+		oldFence, acquireErr = tx.AcquireJobLease(ctx, result.WorkspaceID, jobs[0].ID, jobs[0].Revision,
+			"old-worker", "old-lease", clock, oldLeaseUntil)
+		return acquireErr
+	}); err != nil {
+		t.Fatal(err)
+	}
+	leasedJob, err := store.GetJob(ctx, result.WorkspaceID, jobs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempts, err := store.ListProcessorAttempts(ctx, result.WorkspaceID, result.SnapshotRef)
+	if err != nil {
+		t.Fatalf("initial attempts = %+v, err=%v", attempts, err)
+	}
+	initialAttemptCount := len(attempts)
+	var previous sqlite.ProcessorAttempt
+	for _, attempt := range attempts {
+		if attempt.CapabilityID == CapabilityTextExtract && attempt.Status == string(StatusFailed) {
+			previous = attempt
+			break
+		}
+	}
+	if previous.ID == "" {
+		t.Fatalf("missing failed extract attempt in %+v", attempts)
+	}
+	retryDone := make(chan error, 1)
+	go func() {
+		retryDone <- host.RetryPublication(ctx, result.WorkspaceID, result.SnapshotRef, result.RootID, exact.ProcessorRetryInvocation{
+			JobID: jobs[0].ID, Owner: "old-worker", Attempt: leasedJob.Attempt,
+			IdempotencyKey: "processor-retry:sha256:stale-retry-plan", LeaseToken: "old-lease", FenceToken: oldFence,
+			Targets: []exact.ProcessorRetryTarget{{
+				SubjectRef: previous.SubjectRef, RouteDigest: previous.RouteDigest, Stage: previous.Stage,
+				CapabilityID: previous.CapabilityID, PredecessorAttemptID: previous.ID, ReasonCode: previous.ReasonCode,
+			}},
+		})
+	}()
+	<-proc.started
+	clockMu.Lock()
+	clock = oldLeaseUntil.Add(time.Second)
+	takeoverNow := clock
+	clockMu.Unlock()
+	if err := store.Update(ctx, func(tx *sqlite.Tx) error {
+		_, acquireErr := tx.AcquireJobLease(ctx, result.WorkspaceID, jobs[0].ID, leasedJob.Revision,
+			"new-worker", "new-lease", takeoverNow, takeoverNow.Add(time.Minute))
+		return acquireErr
+	}); err != nil {
+		t.Fatal(err)
+	}
+	close(proc.release)
+	if err := <-retryDone; err == nil {
+		t.Fatalf("stale retry publication error = %v", err)
+	}
+	attempts, err = store.ListProcessorAttempts(ctx, result.WorkspaceID, result.SnapshotRef)
+	if err != nil || len(attempts) != initialAttemptCount {
+		t.Fatalf("stale worker changed attempts = %+v, err=%v", attempts, err)
+	}
+}
+
 func assertAttempt(t *testing.T, attempts []sqlite.ProcessorAttempt, capabilityID, status, reasonCode string) {
 	t.Helper()
 	for _, attempt := range attempts {
@@ -237,5 +412,63 @@ func (unsealedProc) RunStage(_ context.Context, inv Invocation) (StageResult, er
 		SchemaRef: SchemaRefExtractedText(),
 		MediaType: MediaTypeUTF8Text,
 		Sealed:    false,
+	}, nil
+}
+
+type failOnceTextProc struct {
+	mu    sync.Mutex
+	calls int
+}
+
+type takeoverTextProc struct {
+	mu      sync.Mutex
+	calls   int
+	started chan struct{}
+	release chan struct{}
+}
+
+func (*takeoverTextProc) CapabilityID() string { return CapabilityTextExtract }
+func (*takeoverTextProc) Stage() Stage         { return StageExtract }
+func (p *takeoverTextProc) RunStage(_ context.Context, inv Invocation) (StageResult, error) {
+	p.mu.Lock()
+	p.calls++
+	call := p.calls
+	p.mu.Unlock()
+	if call == 1 {
+		return StageResult{Status: StatusFailed, Reason: "temporary processor failure"}, nil
+	}
+	close(p.started)
+	<-p.release
+	if _, err := inv.Staging.Write([]byte("stale retry content")); err != nil {
+		return StageResult{Status: StatusFailed, Reason: err.Error()}, err
+	}
+	if err := inv.Staging.Seal(); err != nil {
+		return StageResult{Status: StatusFailed, Reason: err.Error()}, err
+	}
+	return StageResult{
+		Status: StatusSucceeded, DeterminismClass: DeterminismByteExact,
+		SchemaRef: SchemaRefExtractedText(), MediaType: MediaTypeUTF8Text, Sealed: true,
+	}, nil
+}
+
+func (*failOnceTextProc) CapabilityID() string { return CapabilityTextExtract }
+func (*failOnceTextProc) Stage() Stage         { return StageExtract }
+func (p *failOnceTextProc) RunStage(_ context.Context, inv Invocation) (StageResult, error) {
+	p.mu.Lock()
+	p.calls++
+	call := p.calls
+	p.mu.Unlock()
+	if call == 1 {
+		return StageResult{Status: StatusFailed, Reason: "temporary processor failure"}, nil
+	}
+	if _, err := inv.Staging.Write([]byte("semantic retry content")); err != nil {
+		return StageResult{Status: StatusFailed, Reason: err.Error()}, err
+	}
+	if err := inv.Staging.Seal(); err != nil {
+		return StageResult{Status: StatusFailed, Reason: err.Error()}, err
+	}
+	return StageResult{
+		Status: StatusSucceeded, DeterminismClass: DeterminismByteExact,
+		SchemaRef: SchemaRefExtractedText(), MediaType: MediaTypeUTF8Text, Sealed: true,
 	}, nil
 }

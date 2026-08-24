@@ -5,5 +5,10 @@
 .DS_Store
 /bin/
 dist/
+node_modules/
+*.tsbuildinfo
+coverage/
+.coverage/
+/models/
 *.test
 *.out

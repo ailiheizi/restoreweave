@@ -208,15 +208,18 @@ func TestResolveBeneathRejectsMagicLink(t *testing.T) {
 	if _, err := os.Stat("/proc/self/fd"); err != nil {
 		t.Skipf("/proc is unavailable: %v", err)
 	}
-	capture, err := OpenCaptureRoot("/proc/self")
+	// Keep the retained root itself a real directory. /proc/self is a
+	// procfs magic link and must be rejected by OpenCaptureRoot's no-follow
+	// root check; the traversal check below targets the magic-link component.
+	capture, err := OpenCaptureRoot("/proc")
 	if err != nil {
-		t.Fatalf("OpenCaptureRoot(/proc/self) error = %v", err)
+		t.Fatalf("OpenCaptureRoot(/proc) error = %v", err)
 	}
 	defer capture.Close()
 
 	// /proc/self/fd/N entries are magic links; RESOLVE_NO_MAGICLINKS must
 	// refuse to traverse one even though the path stays beneath the root.
-	fd, err := resolveBeneath(capture.fd, "fd/0", rootedRegularOpenFlags)
+	fd, err := resolveBeneath(capture.fd, "self/fd/0", rootedRegularOpenFlags)
 	if err == nil {
 		_ = closeFd(fd)
 		t.Fatalf("resolveBeneath traversed a magic link")

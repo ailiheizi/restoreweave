@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/ailiheizi/restoreweave/server/internal/repository"
@@ -30,11 +31,19 @@ type processorAttemptBundle struct {
 	Attempts    []sqlite.ProcessorAttemptExport `json:"attempts"`
 }
 
+type processorAttemptClosureEntry struct {
+	ObjectDigest  string
+	ClosureDigest string
+	Envelope      ProcessorAttemptClosureEnvelope
+	Bundle        processorAttemptBundle
+	Sequence      uint64
+}
+
 // publishProcessorAttemptClosure publishes one signed child after the exact
 // commit and after all in-process terminal attempt rows have been recorded.
 // Failure is returned to the caller as a warning; it never rolls back exact
 // publication.
-func (s *Service) publishProcessorAttemptClosure(ctx context.Context, workspaceID, snapshotRef, parentDigest string) error {
+func (s *Service) publishProcessorAttemptClosure(ctx context.Context, workspaceID, snapshotRef, parentDigest string) (retErr error) {
 	if !s.signedPublicationEnabled() {
 		return nil
 	}
@@ -54,7 +63,12 @@ func (s *Service) publishProcessorAttemptClosure(ctx context.Context, workspaceI
 	if err != nil {
 		return err
 	}
-	defer func() { _ = lease.release() }()
+	ctx = lease.context()
+	defer func() {
+		if releaseErr := lease.release(); releaseErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("%w: %w: release processor publication lease: %v", ErrNeedsReconciliation, ErrPublicationLeaseRelease, releaseErr))
+		}
+	}()
 	parentBytes, err := readRecord(ctx, driver, repository.RecordPublicationCommit, parentDigest)
 	if err != nil {
 		return fmt.Errorf("read processor closure parent: %w", err)
@@ -82,25 +96,34 @@ func (s *Service) publishProcessorAttemptClosure(ctx context.Context, workspaceI
 		return err
 	}
 	bundleDigest := DigestBytes(bundle)
-	if existing, err := s.processorAttemptClosures(ctx, snapshotRef); err != nil {
+	existing, err := s.processorAttemptClosureEntries(ctx, snapshotRef)
+	if err != nil {
 		return err
-	} else {
-		for _, candidate := range existing {
-			if candidate.Closure.ParentCommitDigest != parentDigest {
-				continue
-			}
-			if candidate.Closure.AttemptBundleDigest != bundleDigest {
-				return errors.New("conflicting processor attempt closure for parent publication")
-			}
+	}
+	sequence := uint64(1)
+	predecessor := ""
+	for i := len(existing) - 1; i >= 0; i-- {
+		candidate := existing[i]
+		if candidate.Envelope.Closure.ParentCommitDigest != parentDigest {
+			continue
+		}
+		if candidate.Envelope.Closure.AttemptBundleDigest == bundleDigest {
 			return nil
 		}
+		if err := validateProcessorAttemptBundleSuccessor(candidate.Bundle, parsed); err != nil {
+			return err
+		}
+		sequence = candidate.Sequence + 1
+		predecessor = candidate.ClosureDigest
+		break
 	}
 	closure, err := SignProcessorAttemptClosure(*s.SigningIdentity, ProcessorAttemptClosureRecord{
-		Schema: ProcessorAttemptClosureSchemaV1, SignatureDomain: RecoverySignatureDomainV1,
+		Schema: ProcessorAttemptClosureSchemaV2, SignatureDomain: RecoverySignatureDomainV1,
 		RecordKind: ProcessorAttemptClosureKind, WorkspaceID: workspaceID,
 		PublicationID: parent.PublicationID, PublicationDomain: s.PublicationDomain,
 		SnapshotRef: snapshotRef, ManifestDigest: parent.ManifestDigest,
-		ParentCommitDigest: parentDigest, AttemptBundleSchema: parsed.Schema,
+		ParentCommitDigest: parentDigest, ClosureSequence: sequence, PredecessorClosureDigest: predecessor,
+		AttemptBundleSchema: parsed.Schema,
 		AttemptBundleDigest: bundleDigest, AttemptBundleLength: int64(len(bundle)),
 		AttemptCount: int64(len(parsed.Attempts)), TargetIdentity: driver.RepositoryIdentity(),
 		WriterIdentity: s.SigningIdentity.WriterIdentity, KeyID: s.SigningIdentity.KeyID,
@@ -123,12 +146,21 @@ func (s *Service) publishProcessorAttemptClosure(ctx context.Context, workspaceI
 	}
 	receipt, err := driver.PlaceRecord(ctx, repository.RecordProcessorAttemptClosure, bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("place processor attempt closure: %w", err)
+		return s.reconcileUnknownChildOutcome(ctx, driver, repository.RecordProcessorAttemptClosure, payload, parent.PublicationID, snapshotRef, parentDigest, parent.PlanDigest, fmt.Errorf("place processor attempt closure: %w", err))
 	}
 	if err := driver.VerifyRecord(ctx, receipt); err != nil {
-		return fmt.Errorf("verify processor attempt closure: %w", err)
+		return s.reconcileUnknownChildOutcome(ctx, driver, repository.RecordProcessorAttemptClosure, payload, parent.PublicationID, snapshotRef, parentDigest, parent.PlanDigest, fmt.Errorf("verify processor attempt closure: %w", err))
+	}
+	if err := s.validatePublicationFence(ctx, lease); err != nil {
+		return s.reconcileUnknownChildOutcome(ctx, driver, repository.RecordProcessorAttemptClosure, payload, parent.PublicationID, snapshotRef, parentDigest, parent.PlanDigest, err)
 	}
 	return nil
+}
+
+// PublishProcessorAttemptClosure signs the current complete terminal-attempt
+// state as an idempotent successor. It does not schedule or execute a retry.
+func (s *Service) PublishProcessorAttemptClosure(ctx context.Context, workspaceID, snapshotRef, parentDigest string) error {
+	return s.publishProcessorAttemptClosure(ctx, workspaceID, snapshotRef, parentDigest)
 }
 
 func validateProcessorAttemptBundle(payload []byte, workspaceID, snapshotRef string) (processorAttemptBundle, error) {
@@ -190,6 +222,29 @@ func validateProcessorAttemptBundle(payload []byte, workspaceID, snapshotRef str
 	return bundle, nil
 }
 
+func validateProcessorAttemptBundleSuccessor(previous, next processorAttemptBundle) error {
+	if previous.Schema != next.Schema || previous.WorkspaceID != next.WorkspaceID || previous.SnapshotRef != next.SnapshotRef {
+		return errors.New("processor attempt successor bundle binding mismatch")
+	}
+	if len(next.Attempts) <= len(previous.Attempts) {
+		return errors.New("processor attempt successor must append at least one terminal attempt")
+	}
+	for index := range previous.Attempts {
+		before, err := json.Marshal(previous.Attempts[index])
+		if err != nil {
+			return err
+		}
+		after, err := json.Marshal(next.Attempts[index])
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(before, after) {
+			return errors.New("processor attempt successor rewrites authenticated history")
+		}
+	}
+	return nil
+}
+
 // ListProcessorAttemptClosures returns authenticated post-publication attempt
 // bundles without consulting SQLite. Exact restore does not depend on these
 // supplemental records.
@@ -200,6 +255,18 @@ func (s *Service) ListProcessorAttemptClosures(ctx context.Context, snapshotRef 
 // processorAttemptClosures validates supplemental records independently of
 // SQLite. Exact publication discovery deliberately does not call this method.
 func (s *Service) processorAttemptClosures(ctx context.Context, snapshotRef string) ([]ProcessorAttemptClosureEnvelope, error) {
+	entries, err := s.processorAttemptClosureEntries(ctx, snapshotRef)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]ProcessorAttemptClosureEnvelope, 0, len(entries))
+	for _, entry := range entries {
+		result = append(result, entry.Envelope)
+	}
+	return result, nil
+}
+
+func (s *Service) processorAttemptClosureEntries(ctx context.Context, snapshotRef string) ([]processorAttemptClosureEntry, error) {
 	if s.TrustAnchor == nil || strings.TrimSpace(s.PublicationDomain) == "" {
 		return nil, errors.New("processor closure discovery requires trust anchor and publication domain")
 	}
@@ -219,8 +286,7 @@ func (s *Service) processorAttemptClosures(ctx context.Context, snapshotRef stri
 	if err != nil {
 		return nil, err
 	}
-	var result []ProcessorAttemptClosureEnvelope
-	byParent := make(map[string]string)
+	var result []processorAttemptClosureEntry
 	for _, digest := range digests {
 		payload, err := readRecord(ctx, driver, repository.RecordProcessorAttemptClosure, digest)
 		if err != nil {
@@ -264,16 +330,64 @@ func (s *Service) processorAttemptClosures(ctx context.Context, snapshotRef stri
 			parent.FenceToken != closure.FenceToken || closure.SignedAt.Before(parent.SignedAt) {
 			return nil, errors.New("processor attempt closure parent binding mismatch")
 		}
-		if previous, ok := byParent[closure.ParentCommitDigest]; ok && previous != closure.AttemptBundleDigest {
-			return nil, errors.New("conflicting processor attempt closure bundles for parent")
-		} else if ok {
-			continue
-		}
-		byParent[closure.ParentCommitDigest] = closure.AttemptBundleDigest
 		if snapshotRef != "" && closure.SnapshotRef != snapshotRef {
 			continue
 		}
-		result = append(result, envelope)
+		sequence := closure.ClosureSequence
+		if closure.Schema == ProcessorAttemptClosureSchemaV1 {
+			sequence = 1
+		}
+		closureDigest, err := closure.Digest()
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, processorAttemptClosureEntry{ObjectDigest: digest, ClosureDigest: closureDigest, Envelope: envelope, Bundle: bundle, Sequence: sequence})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		a, b := result[i], result[j]
+		if a.Envelope.Closure.ParentCommitDigest != b.Envelope.Closure.ParentCommitDigest {
+			return a.Envelope.Closure.ParentCommitDigest < b.Envelope.Closure.ParentCommitDigest
+		}
+		if a.Sequence != b.Sequence {
+			return a.Sequence < b.Sequence
+		}
+		return a.ObjectDigest < b.ObjectDigest
+	})
+	for start := 0; start < len(result); {
+		end := start + 1
+		for end < len(result) && result[end].Envelope.Closure.ParentCommitDigest == result[start].Envelope.Closure.ParentCommitDigest {
+			end++
+		}
+		if err := validateProcessorAttemptClosureLineage(result[start:end]); err != nil {
+			return nil, err
+		}
+		start = end
 	}
 	return result, nil
+}
+
+func validateProcessorAttemptClosureLineage(entries []processorAttemptClosureEntry) error {
+	for index, entry := range entries {
+		wantSequence := uint64(index + 1)
+		if entry.Sequence != wantSequence {
+			return errors.New("processor attempt closure successor sequence is missing or conflicting")
+		}
+		if index == 0 {
+			if entry.Envelope.Closure.PredecessorClosureDigest != "" {
+				return errors.New("processor attempt closure root has a predecessor")
+			}
+			continue
+		}
+		if entry.Envelope.Closure.Schema != ProcessorAttemptClosureSchemaV2 ||
+			entry.Envelope.Closure.PredecessorClosureDigest != entries[index-1].ClosureDigest {
+			return errors.New("processor attempt closure successor lineage is invalid")
+		}
+		if entry.Envelope.Closure.SignedAt.Before(entries[index-1].Envelope.Closure.SignedAt) {
+			return errors.New("processor attempt closure signed time is not monotonic")
+		}
+		if err := validateProcessorAttemptBundleSuccessor(entries[index-1].Bundle, entry.Bundle); err != nil {
+			return err
+		}
+	}
+	return nil
 }

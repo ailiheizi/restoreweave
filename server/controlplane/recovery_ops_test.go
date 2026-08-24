@@ -11,6 +11,7 @@ import (
 	"github.com/ailiheizi/restoreweave/client/command"
 	"github.com/ailiheizi/restoreweave/server/internal/exact"
 	"github.com/ailiheizi/restoreweave/server/internal/repository"
+	"github.com/ailiheizi/restoreweave/server/internal/store/sqlite"
 	"github.com/ailiheizi/restoreweave/server/testutil"
 )
 
@@ -133,6 +134,8 @@ func TestDispatcherRecoveryTokenExportDerivesEnvelope(t *testing.T) {
 		t.Fatal(err)
 	}
 	if data.TokenSchema != exact.RecoveryTokenSchemaV1 || data.SnapshotRef != snapshotRef ||
+		data.PublicationDomain != exact.DefaultPublicationDomain || len(data.Tokens) != 1 ||
+		data.Tokens[0].PublicationDomain != exact.DefaultPublicationDomain ||
 		data.SubjectRef == "" || data.RecoveryReferenceID == "" || data.PublicationCommitRef == "" ||
 		data.TrustAnchorRef == "" || data.TokenDigest == "" {
 		t.Fatalf("recovery.token.export data = %+v", data)
@@ -165,5 +168,54 @@ func TestDispatcherRecoveryTokenExportMissingSubjectFails(t *testing.T) {
 	}), dispatcher.now().UTC())
 	if result.Status != command.StatusFailed {
 		t.Fatalf("missing subject token = %q: %+v", result.Status, result.Reasons)
+	}
+}
+
+func TestDispatcherRecoveryTokenExportMetadataOnlyProjectsEmptySet(t *testing.T) {
+	ctx := context.Background()
+	store := testutil.OpenStore(t, filepath.Join(t.TempDir(), "catalog.sqlite"))
+	repo, err := repository.OpenDir(filepath.Join(t.TempDir(), "repository"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, anchor, err := exact.OpenSigningMaterial(filepath.Join(t.TempDir(), "recovery"), exact.DefaultPublicationDomain, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &exact.Service{Store: store, Repo: repo, SigningIdentity: &identity, TrustAnchor: &anchor,
+		PublicationDomain: exact.DefaultPublicationDomain, RequireSignedPublication: true}
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "metadata.bin"), []byte("metadata only"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := service.InspectIngest(ctx, root, exact.IngestOptions{
+		FileProtection:          map[string]sqlite.ProtectionMode{"metadata.bin": sqlite.ProtectionMetadataOnly},
+		MetadataOnlyResolutions: []string{"metadata.bin"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.ApplyIngestPlanWithExecutionKey(ctx, plan, "sha256:controlplane-metadata-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatcher := NewDispatcher(store, "catalog.sqlite", "/tmp/rw.sock", WithExact(service))
+	response := dispatcher.handleRecoveryTokenExport(ctx, mustEnvelope(t, command.OpRecoveryTokenExport, map[string]any{
+		"snapshot_ref": result.SnapshotRef,
+		"subject_path": "metadata.bin",
+	}), dispatcher.now().UTC())
+	if response.Status != command.StatusSucceeded {
+		t.Fatalf("metadata-only token export = %q: %+v", response.Status, response.Reasons)
+	}
+	var data command.RecoveryTokenData
+	if err := json.Unmarshal(response.Data, &data); err != nil {
+		t.Fatal(err)
+	}
+	if data.PublicationDomain != exact.DefaultPublicationDomain || data.Tokens == nil || len(data.Tokens) != 0 || data.Unprotected == nil ||
+		data.Unprotected.ProtectionOutcome != string(sqlite.ProtectionExplicitlyUnprotected) || data.TokenSetDigest == "" {
+		t.Fatalf("metadata-only token projection = %+v", data)
+	}
+	if !strings.Contains(string(response.Data), `"tokens":[]`) {
+		t.Fatalf("metadata-only projection omitted explicit empty token set: %s", response.Data)
 	}
 }

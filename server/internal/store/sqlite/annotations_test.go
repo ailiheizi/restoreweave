@@ -112,20 +112,27 @@ func TestAnnotationsSurviveIndependentOfIndexPointers(t *testing.T) {
 	}
 
 	generation := &IndexGeneration{
-		ID:              testID(t, IDPrefixIndexGeneration),
-		WorkspaceID:     workspace.ID,
-		SnapshotRef:     "snap:test",
-		NamespaceRootID: testID(t, IDPrefixNamespaceRoot),
-		DBPath:          "/tmp/missing.sqlite",
+		ID:                    testID(t, IDPrefixIndexGeneration),
+		WorkspaceID:           workspace.ID,
+		SnapshotRef:           "snap:test",
+		NamespaceRootID:       testID(t, IDPrefixNamespaceRoot),
+		DBPath:                "/tmp/missing.sqlite",
+		Dimension:             "semantic-embedding",
+		ConfigDigest:          "sha256:config-a",
+		ProviderProfileDigest: "sha256:provider-a",
+		SemanticSpace:         "space-a",
 	}
 	if err := store.InsertIndexGeneration(ctx, generation); err != nil {
 		t.Fatalf("insert generation: %v", err)
 	}
-	got, err := store.LatestIndexGeneration(ctx, workspace.ID, "")
+	got, err := store.LatestIndexGeneration(ctx, workspace.ID, generation.Dimension)
 	if err != nil {
 		t.Fatalf("latest generation: %v", err)
 	}
-	if got.ID != generation.ID {
+	if got.ID != generation.ID || got.Dimension != generation.Dimension ||
+		got.ConfigDigest != generation.ConfigDigest ||
+		got.ProviderProfileDigest != generation.ProviderProfileDigest ||
+		got.SemanticSpace != generation.SemanticSpace {
 		t.Fatalf("latest = %+v", got)
 	}
 }

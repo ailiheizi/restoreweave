@@ -125,7 +125,7 @@ func (s *Service) verifyEntries(ctx context.Context, result *VerifyResult, entri
 		result.AttemptedFiles++
 		result.AttemptedBytes += size
 		if hashBytes {
-			if err := s.Repo.Verify(ctx, entry.ContentID); err != nil {
+			if err := verifyExactObjectReadback(ctx, s.Repo, entry.ContentID, size); err != nil {
 				return fmt.Errorf("verify %s: %w", entry.RelativePath, err)
 			}
 		} else {

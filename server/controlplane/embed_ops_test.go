@@ -3,22 +3,19 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
-	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/ailiheizi/restoreweave/client/command"
 	"github.com/ailiheizi/restoreweave/server/internal/exact"
-	"github.com/ailiheizi/restoreweave/server/internal/gateway/protocol"
 	"github.com/ailiheizi/restoreweave/server/internal/processor"
 	"github.com/ailiheizi/restoreweave/server/internal/repository"
 	"github.com/ailiheizi/restoreweave/server/internal/search"
 	"github.com/ailiheizi/restoreweave/server/testutil"
-	"net/http/httptest"
 )
 
-func TestSemanticMultimodalFuseAndInboxIdentify(t *testing.T) {
+func TestSemanticMultimodalFuse(t *testing.T) {
 	ctx := context.Background()
 	store := testutil.OpenStore(t, filepath.Join(t.TempDir(), "catalog.sqlite"))
 	repo, err := repository.OpenDir(filepath.Join(t.TempDir(), "repository"))
@@ -165,30 +162,4 @@ func TestSemanticMultimodalFuseAndInboxIdentify(t *testing.T) {
 		t.Fatalf("verify after semantic index loss = %q: %+v", verified.Status, verified.Reasons)
 	}
 
-	facade, err := protocol.New(dispatcher.Handle, protocol.Options{
-		WorkspaceID: ingestData.WorkspaceID,
-		SnapshotRef: ingestData.SnapshotRef,
-		Token:       "facade-token",
-		Listen:      "127.0.0.1:0",
-	})
-	if err != nil {
-		t.Fatalf("new facade: %v", err)
-	}
-	server := httptest.NewServer(facade.Handler())
-	defer server.Close()
-
-	fingerprint := processor.FixtureFingerprint(mp3)
-	inbox := getPlainJSON(t, server.URL+"/inbox/api/search?token=facade-token&dimension="+search.DimensionAcoustic+"&q="+url.QueryEscape(fingerprint))
-	hits, _ := inbox["hits"].([]any)
-	if len(hits) != 1 {
-		t.Fatalf("inbox acoustic identify = %#v", inbox)
-	}
-	identify := getJSON(t, server.URL+"/rest/identify.view?f=json&p=facade-token&query="+fingerprint)
-	if statusOf(identify) != "failed" {
-		t.Fatalf("invented identify.view succeeded: %#v", identify)
-	}
-	search3 := getJSON(t, server.URL+"/rest/search3.view?f=json&p=facade-token&query=Nightfall")
-	if statusOf(search3) != "ok" {
-		t.Fatalf("search3 = %#v", search3)
-	}
 }

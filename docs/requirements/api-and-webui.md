@@ -11,7 +11,12 @@ The initial qualified interaction surfaces are:
 
 A REST service and WebUI are valuable optional adapters for remote administration, multi-user access, job monitoring, search, and everyday NAS use. They MUST sit over the same typed operations and MUST NOT introduce a second source of truth, policy model, scheduler, job lifecycle, plan format, index authority, or recovery meaning.
 
-This profile is deferred from the smallest core release unless another release document explicitly promotes it. The underlying product MUST remain fully operable without an HTTP server, browser, JavaScript runtime, or distributed vector service. The reference local semantic profile is embedded in the core distribution, but exact recovery does not depend on it.
+The full remote profile remains deferred from the smallest core release. The
+checkout includes a deliberately small loopback adapter and browser client as
+an optional convenience surface. The underlying product MUST remain fully
+operable without an HTTP server, browser, JavaScript runtime, or distributed
+vector service. The reference local semantic profile is embedded in the core
+distribution, but exact recovery does not depend on it.
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are normative.
 
@@ -35,6 +40,21 @@ flowchart TB
 The WebUI SHOULD use the REST adapter when remote browser access is needed. A local desktop or server-rendered UI MAY bind the command dispatcher directly, but it must preserve the same serialized operation semantics and conformance tests.
 
 HTTP resources and status codes are transport concerns. The structured RestoreWeave result is the domain outcome. A `200`, successful upload, completed browser request, or rendered search result is not proof of durable placement, publication, verification, or recoverability.
+
+### 2.1 Current local adapter
+
+The current bounded implementation exposes:
+
+- `GET /api/v1/healthz` for a transport-only liveness check;
+- `POST /api/v1/command` with a strict `org.restoreweave.command.v1`
+  envelope, returning the unchanged `org.restoreweave.result.v1` envelope;
+- optional `Authorization: Bearer <token>` validation when the host supplies
+  `RESTOREWEAVE_API_TOKEN` or `--api-token`.
+
+The listener is disabled by default. `api.enabled` and `api.listen` in the
+persisted TOML profile enable it; `--api-listen` is a one-shot override. The
+adapter has no database, repository, filesystem, job, or recovery state of its
+own. The React/Vite client under `web/` uses only these endpoints.
 
 ## 3. Canonical-operation mapping
 

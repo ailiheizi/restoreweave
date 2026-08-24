@@ -1,6 +1,6 @@
 # Repository Engine Qualification Spike — Kopia / Restic / Plakar
 
-**Status:** First CLI run, macOS-only. Numbers are real measurements, not conclusions. An in-tree Driver harness now lives in `server/internal/repository/qualify` and does not select a release engine.
+**Status:** Candidate evidence only, macOS-only. Numbers are real measurements, not conclusions. An in-tree Driver harness now lives in `server/internal/repository/qualify` and does not select a release engine. On 2026-08-24 the installed Restic control harness also passed independent hash/readback, wrong-credential rejection, crash-retry, relocation, and corruption checks; this still does not qualify or select Restic for release.
 **Date:** 2026-08-12
 **Scope:** Install three backup engines, back up one fixed corpus, measure repo size, backup/restore time, verification result, and dedup/compression ratio. Re-run required on Linux/NAS before any engine decision.
 
@@ -128,7 +128,7 @@ Notes:
 - Run as a regular user: Kopia and Plakar need no privileges; `restic restore` may need `root` or `--allow-root` if the snapshot contains root-owned files (and `restic check` is fully offline). The openat2/`O_BENEATH`-style hardening topics are Linux implementation details and are not exercised by this script.
 - Plakar's first-backup cold-start cost (~50 s+ on this host) is expected; FUSE is only needed for `plakar mount` (requires libfuse on Linux) and is not part of this qualification. Note for Plakar v1.1.x: `plakar -disable-security-check create` exits 0 but creates nothing — the script uses plain `plakar create`.
 
-## local-zstd-v1 candidate measurement (2026-08-21)
+## local-zstd-v1 candidate measurement (2026-08-24)
 
 **This is candidate measurement, not qualification.** It measures the in-tree
 profiles with the mechanism-separated report implemented by
@@ -139,7 +139,7 @@ GC, repair, migration, reader-closure, and representative-corpus gates.
 
 ### Method
 
-Deterministic 11-file corpus (5,601,451 logical bytes / 5.3 MiB) covering the
+Deterministic 14-file corpus (5,601,451 logical bytes / 5.3 MiB) covering the
 behaviors the report must keep separate:
 
 - `texts/` — 3 near-identical text files (dedup-friendly, ~3 KB each)
@@ -150,7 +150,9 @@ behaviors the report must keep separate:
 Placement recorded every `Receipt` (logical + physical bytes, dedup reuse),
 then `MeasureSavings` re-verified every stored object (decompressing for zstd)
 before reporting. Run on the same host as the engine spike above (macOS 26.5.2,
-Apple Silicon, APFS).
+Apple Silicon, APFS). The deterministic report was re-executed on 2026-08-24
+with `scripts/savings-report.sh --profile both`; the values below were
+reproduced unchanged.
 
 ### Measured report
 
@@ -161,7 +163,10 @@ Apple Silicon, APFS).
 | Duplicate bytes saved | 2,337,152 | 2,337,152 |
 | Compression saved bytes | 0 | 2,363,637 |
 | Physical stored bytes | 3,264,299 | 900,719 |
-| Overhead bytes (profile + identity) | 59 | 52 |
+| Repository growth bytes | 3,264,358 | 900,771 |
+| Measured overhead (profile + identity) | 59 | 52 |
+| Recovery-record overhead | 0 | 0 |
+| Index/model/temporary overhead | `UNMEASURED` | `UNMEASURED` |
 | Net physical savings | 2,337,093 | 4,700,680 |
 | Physical / logical ratio | 0.583 | 0.161 |
 | Mechanisms reported | whole-file-deduplication | whole-file-deduplication, compression |
@@ -174,6 +179,17 @@ column, and this table must not be compared against the Kopia/Restic/Plakar
 rows above as if they shared one measurement method: those engines were
 measured with `du -sk` on their own repositories on a different corpus and
 date.
+
+### Larger candidate probe (2026-08-24)
+
+The same harness was also run with `--size-mb 1`, producing a 108-file,
+22,886,778-byte corpus with nested paths, repeated text, exact duplicates,
+seeded-random binaries, and zero-filled files. This remains a candidate probe,
+not a representative release corpus. On this host Restic 0.19.1 completed
+backup, restore, offline check, and byte-tree diff (`repo=6,220 KiB`, ratio
+`0.269`, backup `0.879 s`, restore `1.078 s`, verify `0.794 s`); Kopia and
+Plakar were absent and were recorded as failed binary checks. No engine
+selection or release claim follows from this run.
 
 ### Honesty constraints enforced by the measurement
 

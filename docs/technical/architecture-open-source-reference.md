@@ -16,7 +16,7 @@ Introduce experience software as **separate processes** that read a RestoreWeave
 Core command ABI and FileAccess
   -> thin Inbox shell over that ABI (product proof; not an RW-MVP-1 restore dependency)
   -> optional in-page FileAccess preview on the item page (not a media server)
-  -> OpenSubsonic / OPDS facades when progress must return to SubjectRef
+  -> bounded HTTP/API clients when a browser or remote operator is needed
   -> existing clients as interoperability demos
   -> file-shaped bytes via restore or FileAccess; other tools may mount that
 ```
@@ -34,11 +34,11 @@ A process or container boundary is an engineering control, not a licensing or co
 Observed on 2026-08-14 in this tree:
 
 - Direct `go.mod` dependencies currently include `modernc.org/sqlite`, `google.golang.org/grpc`, `modelcontextprotocol/go-sdk`, `spf13/cobra`, `golang.org/x/sys`, and `klauspost/compress` for the local-zstd candidate; the target local semantic profile later adds pinned ONNX and zvec packaging.
-- One embedded Inbox page (`server/internal/gateway/protocol/inbox.html`). No Vue/React app, no File Browser, no player product.
+- A small React/Vite browser client lives under `web/` and calls only the bounded HTTP adapter; it is not a second catalog or recovery authority.
 - In-process EXTRACT for UTF-8 text, ID3/FLAC/OGG tags, and EPUB OPF. Exact ingest ignores processor failure.
 - The in-tree `RepositoryDriver` has a raw development profile and an embedded local-zstd measurement candidate. Darwin/Unix CLI probes for Restic and Kopia can pass when those binaries are present; none of these facts is an engine selection.
 - Linux bubblewrap execution remains open where isolated heavy parsers are wanted. Kernel mounting is not a RestoreWeave product surface.
-- An optional loopback OpenSubsonic/OPDS/Inbox facade can bind `127.0.0.1` and call the command ABI. It is not a player and not enabled unless `--facade-listen` is set.
+- An optional loopback `/api/v1/command` adapter can bind `127.0.0.1` and call the command ABI. It is disabled unless `api.enabled` or `--api-listen` is set.
 
 Tika, libarchive, ffprobe, libmagic, Siegfried, pathrs-lite, and a release repository engine are planned or qualified elsewhere. They are not present as Go module dependencies today.
 
@@ -53,7 +53,7 @@ Use the least-coupled mode that still preserves recovery meaning. Do not collaps
 | **Isolated sidecar** | Parsers and probes that must not hold ambient authority | Tika, libarchive, ffprobe after bubblewrap |
 | **CLI / process driver** | Engines whose supported surface is a product CLI | Restic after remaining Driver gates. Kopia qualification currently uses the binary; the adoption note still prefers the Go repository API if those gates pass. Do not treat “process boundary” as the Kopia decision. |
 | **Foreign tools** | Operator wants a folder or protocol view | Restore or export a snapshot (or read via `FileAccess`) and let external tools provide any mount/share behavior. Do not grow a RestoreWeave mount daemon. |
-| **Protocol facade** | Progress, bookmarks, and library identity must return to `SubjectRef` | Narrow OpenSubsonic / OPDS adapters. Still not a player. |
+| **HTTP adapter** | Browser and remote clients need a transport boundary | `/api/v1/command` delegates to the typed dispatcher; it does not open SQLite or repository paths. |
 | **Thin command-ABI shell** | Universal Inbox browse/search/restore as the `RW-CATALOG-1` visible proof | A small read-only WebUI over commands; File Browser patterns only, never its writable job |
 | **Design reference only** | Useful UX or routing lessons, incompatible license or job | sist2, Paperless-ngx, Immich, Lutris. This is not a license to copy UI, CSS, icons, or a recognizable flow. |
 
@@ -70,10 +70,10 @@ GPL/AGPL projects may run beside RestoreWeave. Linking them into a permissively 
 | Search | SQLite FTS5 plus in-process zvec generations | Keep both schemas private; later Qdrant/Milvus only as separately qualified service profiles | Publish index tables or vector rows as ABI |
 | Namespace / file egress | `SnapshotTree` / `FileAccess` / `plan.restore` / `ExportManifest` | Keep exact bytes and namespace facts. Let foreign tools consume a restored tree, export, or read handle. | Own a mount service; leak backend types; treat a foreign client scan as catalog proof |
 | Control plane | Cobra, read-only MCP, private gRPC | Stabilize the command ABI before any WebUI | Use MCP as an internal bus or mutation surface |
-| Inbox / generic UI | Optional shell in tree, maintenance-only | Keep as a disposable adapter over the command ABI after core gates. Do not use it as release completion | Adopt File Browser as a writable manager, grow a second catalog, or prioritize shell features over the core loop |
+| Browser UI | Small React/Vite client over the HTTP adapter | Keep it disposable and read-only with respect to source content; do not use it as release completion or grow a second catalog |
 | Mixed indexer analogue | sist2 | External Processor or design reference | Let a second index become recovery authority |
-| Music | Navidrome and Subsonic clients | Prefer an OpenSubsonic facade or in-page `FileAccess` preview. | Embed a media server or library scanner in `restoreweaved`; treat Navidrome’s database as portable progress |
-| Books / comics | Komga (MIT), Kavita/calibre (GPL) | Prefer OPDS. Disable Komga options that rewrite the library (extension repair, convert-to-CBZ, hardlink import). | Make a custom renderer the identity of a book |
+| Music | Navidrome and Subsonic clients | Consume an explicit restore/export or a later approved adapter. | Embed a media server or library scanner in `restoreweaved` |
+| Books / comics | Komga (MIT), Kavita/calibre (GPL) | Consume an explicit restore/export or a later approved adapter. | Make a custom renderer the identity of a book |
 | Video | Jellyfin server and jellyfin-web | Later than music/books. Keep NFO-next-to-file and adjacent artwork off; transcode only in a qualified sandbox. | Let Jellyfin own storage, exact bytes, or the daily catalog |
 | Photos | Immich | Do not embed; at most consume an export/mount | Create a second photo catalog and identity |
 | Apps / games | Lutris, RomM, Pegasus (see adapter catalog) | Read-only inventory first | Become a launcher or downloader |
@@ -97,7 +97,7 @@ Keep engineering gates and product proof on separate tracks.
 
 3. Add a thin read-only Inbox shell: triage, search, item detail, verify, restore. It calls the command ABI. It does not open repository packs or SQLite files. This is the `RW-CATALOG-1` visible acceptance, not a later optional adapter.
 4. The same item page may play or read through an existing `FileAccess` / `content.open` handle and write progress as an annotation. That is catalog proof, not `RW-AUDIO-1` and not a media server.
-5. If a specialized client must return play/read progress to `SubjectRef`, add a narrow OpenSubsonic or OPDS adapter before pointing that client at a mount. `PROGRESS` annotations exist; the remaining work is client-viable methods and live qualification, recorded in [Experience Completion Plan](experience-completion-plan.md).
+5. If a specialized client later needs progress tied to `SubjectRef`, add a narrow adapter over `/api/v1/command`; do not make the client or its database a recovery authority.
 6. If an operator wants a folder, restore or export the snapshot (or expose `FileAccess` bytes) and let an existing external tool attach it. Do not qualify RestoreWeave by pointing a foreign catalog at an internal service. Jellyfin stays later than music/books.
 
 Do not start a full custom music, reader, or photo application in this repository to “have a frontend.” Use a protocol facade or an external tool over an explicit export; RestoreWeave does not manage mount principals or kernel permissions.

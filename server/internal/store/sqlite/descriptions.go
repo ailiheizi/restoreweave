@@ -10,6 +10,22 @@ import (
 	"time"
 )
 
+// DescriptionSegmentationProfileDigestV1 identifies the source-span algorithm
+// used by the reference writer. Historical segments retain this identity so
+// rebuilds cannot reinterpret their byte ranges.
+const DescriptionSegmentationProfileDigestV1 = "sha256:6234b18c290a6aa3ecd73419b2039693b9f2961143d8a4d4d9ba1491bf1a8ad9"
+
+// DescriptionProducerProfileDigest derives a stable identity for a named
+// producer profile. An admitted model provider may replace this with its
+// immutable byte/profile digest at the host boundary.
+func DescriptionProducerProfileDigest(profile string) string {
+	profile = strings.TrimSpace(profile)
+	if profile == "" {
+		profile = "unspecified"
+	}
+	return digestText("restoreweave.description-producer-profile.v1:" + profile)
+}
+
 func validDescriptionKind(value DescriptionKind) bool {
 	switch value {
 	case DescriptionUser, DescriptionImported, DescriptionExtracted,
@@ -197,6 +213,9 @@ func (tx *Tx) InsertDescriptionDocument(ctx context.Context, record *Description
 	if record.BodyDigest == "" {
 		record.BodyDigest = digestText(record.Body)
 	}
+	if record.ProducerProfileDigest == "" {
+		record.ProducerProfileDigest = DescriptionProducerProfileDigest(record.ProducerProfile)
+	}
 	if strings.TrimSpace(record.Visibility) == "" {
 		record.Visibility = "private"
 	}
@@ -215,13 +234,14 @@ func (tx *Tx) InsertDescriptionDocument(ctx context.Context, record *Description
 INSERT INTO description_documents(
     description_document_id, workspace_id, subject_ref, kind, title,
     language, body, body_digest, source_ref, producer_profile, confidence,
-    coverage, visibility, accepted, revision, predecessor_id, metadata_json,
-    created_at_ns, updated_at_ns
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    config_digest, producer_profile_digest, coverage, visibility, accepted,
+    revision, predecessor_id, metadata_json, created_at_ns, updated_at_ns
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT DO NOTHING`,
 		record.ID, record.WorkspaceID, record.SubjectRef, record.Kind, record.Title,
 		record.Language, record.Body, record.BodyDigest, record.SourceRef,
-		record.ProducerProfile, record.Confidence, record.Coverage, record.Visibility,
+		record.ProducerProfile, record.Confidence, record.ConfigDigest,
+		record.ProducerProfileDigest, record.Coverage, record.Visibility,
 		boolInt(record.Accepted), record.Revision, nullableString(record.PredecessorID),
 		string(metadata), record.CreatedAt.UnixNano(), record.UpdatedAt.UnixNano()); err != nil {
 		return fmt.Errorf("insert description document: %w", err)
@@ -236,8 +256,8 @@ func (s *Store) InsertDescriptionDocument(ctx context.Context, record *Descripti
 const descriptionDocumentSelect = `
 SELECT description_document_id, workspace_id, subject_ref, kind, title,
        language, body, body_digest, source_ref, producer_profile, confidence,
-       coverage, visibility, accepted, revision, predecessor_id, metadata_json,
-       created_at_ns, updated_at_ns
+       config_digest, producer_profile_digest, coverage, visibility, accepted,
+       revision, predecessor_id, metadata_json, created_at_ns, updated_at_ns
 FROM description_documents `
 
 func scanDescriptionDocument(scanner rowScanner) (DescriptionDocument, error) {
@@ -250,7 +270,8 @@ func scanDescriptionDocument(scanner rowScanner) (DescriptionDocument, error) {
 	if err := scanner.Scan(
 		&record.ID, &record.WorkspaceID, &record.SubjectRef, &record.Kind,
 		&record.Title, &record.Language, &record.Body, &record.BodyDigest,
-		&record.SourceRef, &record.ProducerProfile, &confidence, &coverage,
+		&record.SourceRef, &record.ProducerProfile, &confidence,
+		&record.ConfigDigest, &record.ProducerProfileDigest, &coverage,
 		&record.Visibility, &accepted, &record.Revision, &predecessor, &metadata,
 		&created, &updated,
 	); err != nil {
@@ -319,8 +340,8 @@ func (s *Store) ListDescriptionDocuments(ctx context.Context, workspaceID, subje
 const descriptionSummarySelect = `
 SELECT description_document_id, workspace_id, subject_ref, kind, title,
        language, body_digest, source_ref, producer_profile, confidence,
-       coverage, visibility, accepted, revision, predecessor_id,
-       created_at_ns, updated_at_ns
+       config_digest, producer_profile_digest, coverage, visibility, accepted,
+       revision, predecessor_id, created_at_ns, updated_at_ns
 FROM description_documents `
 
 func scanDescriptionSummary(scanner rowScanner) (DescriptionDocument, error) {
@@ -332,7 +353,8 @@ func scanDescriptionSummary(scanner rowScanner) (DescriptionDocument, error) {
 	if err := scanner.Scan(
 		&record.ID, &record.WorkspaceID, &record.SubjectRef, &record.Kind,
 		&record.Title, &record.Language, &record.BodyDigest, &record.SourceRef,
-		&record.ProducerProfile, &confidence, &coverage, &record.Visibility,
+		&record.ProducerProfile, &confidence, &record.ConfigDigest,
+		&record.ProducerProfileDigest, &coverage, &record.Visibility,
 		&accepted, &record.Revision, &predecessor, &created, &updated,
 	); err != nil {
 		return record, rowError("description summary", err)
@@ -409,6 +431,20 @@ func (tx *Tx) InsertSemanticSegment(ctx context.Context, record *SemanticSegment
 	if record.Ordinal < 0 {
 		return errors.New("semantic segment ordinal cannot be negative")
 	}
+	var documentRevision int64
+	if err := tx.tx.QueryRowContext(ctx,
+		`SELECT revision FROM description_documents WHERE workspace_id = ? AND description_document_id = ?`,
+		record.WorkspaceID, record.DocumentID).Scan(&documentRevision); err != nil {
+		return fmt.Errorf("resolve semantic segment document revision: %w", err)
+	}
+	if record.DocumentRevision == 0 {
+		record.DocumentRevision = documentRevision
+	} else if record.DocumentRevision != documentRevision {
+		return fmt.Errorf("semantic segment document revision %d does not match description revision %d", record.DocumentRevision, documentRevision)
+	}
+	if record.DocumentRevision < 1 {
+		return errors.New("semantic segment document revision must be positive")
+	}
 	if strings.TrimSpace(record.Text) == "" {
 		return errors.New("semantic segment text is required")
 	}
@@ -417,6 +453,9 @@ func (tx *Tx) InsertSemanticSegment(ctx context.Context, record *SemanticSegment
 	}
 	if record.TextDigest == "" {
 		record.TextDigest = digestText(record.Text)
+	}
+	if record.SegmentationProfileDigest == "" {
+		record.SegmentationProfileDigest = DescriptionSegmentationProfileDigestV1
 	}
 	sourceSpan, err := normalizeJSON(record.SourceSpan)
 	if err != nil {
@@ -431,13 +470,14 @@ func (tx *Tx) InsertSemanticSegment(ctx context.Context, record *SemanticSegment
 	if err := insertOne(ctx, tx.tx, `
 INSERT INTO semantic_segments(
     semantic_segment_id, workspace_id, description_document_id, subject_ref,
-    ordinal, text, text_digest, language, section, source_span_json,
-    metadata_json, created_at_ns
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    document_revision, ordinal, text, text_digest, language, section,
+    source_span_json, metadata_json, segmentation_profile_digest, created_at_ns
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT DO NOTHING`,
 		record.ID, record.WorkspaceID, record.DocumentID, record.SubjectRef,
-		record.Ordinal, record.Text, record.TextDigest, record.Language, record.Section,
-		string(sourceSpan), string(metadata), record.CreatedAt.UnixNano()); err != nil {
+		record.DocumentRevision, record.Ordinal, record.Text, record.TextDigest,
+		record.Language, record.Section, string(sourceSpan), string(metadata),
+		record.SegmentationProfileDigest, record.CreatedAt.UnixNano()); err != nil {
 		return fmt.Errorf("insert semantic segment: %w", err)
 	}
 	return nil
@@ -449,8 +489,8 @@ func (s *Store) InsertSemanticSegment(ctx context.Context, record *SemanticSegme
 
 const semanticSegmentSelect = `
 SELECT semantic_segment_id, workspace_id, description_document_id, subject_ref,
-       ordinal, text, text_digest, language, section, source_span_json,
-       metadata_json, created_at_ns
+       document_revision, ordinal, text, text_digest, language, section,
+       source_span_json, metadata_json, segmentation_profile_digest, created_at_ns
 FROM semantic_segments `
 
 func scanSemanticSegment(scanner rowScanner) (SemanticSegment, error) {
@@ -459,8 +499,9 @@ func scanSemanticSegment(scanner rowScanner) (SemanticSegment, error) {
 	var created int64
 	if err := scanner.Scan(
 		&record.ID, &record.WorkspaceID, &record.DocumentID, &record.SubjectRef,
-		&record.Ordinal, &record.Text, &record.TextDigest, &record.Language,
-		&record.Section, &sourceSpan, &metadata, &created,
+		&record.DocumentRevision, &record.Ordinal, &record.Text, &record.TextDigest,
+		&record.Language, &record.Section, &sourceSpan, &metadata,
+		&record.SegmentationProfileDigest, &created,
 	); err != nil {
 		return record, rowError("semantic segment", err)
 	}

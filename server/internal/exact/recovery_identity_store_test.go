@@ -103,3 +103,57 @@ func TestSigningMaterialRejectsTrailingJSONValues(t *testing.T) {
 		t.Fatal("trust anchor with trailing JSON value was accepted")
 	}
 }
+
+func TestLoadTrustAnchorRejectsOversizedInput(t *testing.T) {
+	anchorPath := filepath.Join(t.TempDir(), "oversized-anchor.json")
+	if err := os.WriteFile(anchorPath, bytes.Repeat([]byte{'x'}, int(portableRecordReadLimit+1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadTrustAnchor(anchorPath); err == nil {
+		t.Fatal("oversized trust anchor was accepted")
+	}
+}
+
+func TestRecoveryInputsRejectSymlinkPaths(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink test requires Unix link semantics")
+	}
+	directory := t.TempDir()
+	_, anchor, err := OpenSigningMaterial(directory, testPublicationDomain, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchorPath := filepath.Join(t.TempDir(), "anchor.json")
+	if _, err := ExportTrustAnchor(anchor, anchorPath); err != nil {
+		t.Fatal(err)
+	}
+	anchorLink := filepath.Join(t.TempDir(), "anchor-link.json")
+	if err := os.Symlink(anchorPath, anchorLink); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadTrustAnchor(anchorLink); err == nil {
+		t.Fatal("trust anchor symlink was followed")
+	}
+
+	fixture := newSignedPublicationFixture(t, "recovery-reference-input.txt", []byte("recovery reference input"))
+	result := fixture.ingest(t, "sha256:recovery-reference-input-plan")
+	reference, err := fixture.service.BuildRecoveryReference(t.Context(), result.SnapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	referencePath := filepath.Join(t.TempDir(), "reference.json")
+	payload, err := MarshalRecoveryReference(reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(referencePath, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	referenceLink := filepath.Join(t.TempDir(), "reference-link.json")
+	if err := os.Symlink(referencePath, referenceLink); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadRecoveryReference(referenceLink); err == nil {
+		t.Fatal("recovery reference symlink was followed")
+	}
+}

@@ -19,6 +19,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/pelletier/go-toml/v2"
 	"gopkg.in/yaml.v3"
 )
 
@@ -44,6 +45,7 @@ const (
 	CatalogEnv         = "RESTOREWEAVE_CATALOG"
 	RepositoryEnv      = "RESTOREWEAVE_REPOSITORY"
 	VectorsEnv         = "RESTOREWEAVE_VECTORS"
+	ModelsEnv          = "RESTOREWEAVE_MODELS"
 	RecoveryRecordsEnv = "RESTOREWEAVE_RECOVERY_RECORDS"
 )
 
@@ -51,42 +53,43 @@ const (
 // local filesystem path or a backend URI (for example, an explicitly selected
 // object-store profile).  The other paths are local filesystem paths.
 type Paths struct {
-	Catalog         string `yaml:"catalog" json:"catalog"`
-	Repository      string `yaml:"repository" json:"repository"`
-	Vectors         string `yaml:"vectors" json:"vectors"`
-	RecoveryRecords string `yaml:"recovery_records" json:"recovery_records"`
+	Catalog         string `yaml:"catalog" toml:"catalog" json:"catalog"`
+	Repository      string `yaml:"repository" toml:"repository" json:"repository"`
+	Vectors         string `yaml:"vectors" toml:"vectors" json:"vectors"`
+	Models          string `yaml:"models" toml:"models" json:"models"`
+	RecoveryRecords string `yaml:"recovery_records" toml:"recovery_records" json:"recovery_records"`
 }
 
 // StorageConfig controls exact protection and repository representations.
 type StorageConfig struct {
-	RepositoryProfile            string `yaml:"repository_profile" json:"repository_profile"`
-	DefaultProtection            string `yaml:"default_protection" json:"default_protection"`
-	AllowLinkOnly                bool   `yaml:"allow_link_only" json:"allow_link_only"`
-	LinkOnlyRequiresConfirmation bool   `yaml:"link_only_requires_confirmation" json:"link_only_requires_confirmation"`
-	CompressionProfile           string `yaml:"compression_profile" json:"compression_profile"`
-	NeuralCodec                  string `yaml:"neural_codec" json:"neural_codec"`
+	RepositoryProfile            string `yaml:"repository_profile" toml:"repository_profile" json:"repository_profile"`
+	DefaultProtection            string `yaml:"default_protection" toml:"default_protection" json:"default_protection"`
+	AllowLinkOnly                bool   `yaml:"allow_link_only" toml:"allow_link_only" json:"allow_link_only"`
+	LinkOnlyRequiresConfirmation bool   `yaml:"link_only_requires_confirmation" toml:"link_only_requires_confirmation" json:"link_only_requires_confirmation"`
+	CompressionProfile           string `yaml:"compression_profile" toml:"compression_profile" json:"compression_profile"`
+	NeuralCodec                  string `yaml:"neural_codec" toml:"neural_codec" json:"neural_codec"`
 }
 
 // SemanticConfig selects the embedding and vector-generation providers.
 // OnlineCredentialRef is a reference into a host secret store, never a
 // secret itself.
 type SemanticConfig struct {
-	EmbeddingMode                  string `yaml:"embedding_mode" json:"embedding_mode"`
-	LocalProfile                   string `yaml:"local_profile" json:"local_profile"`
-	OnlineProfile                  string `yaml:"online_profile" json:"online_profile"`
-	OnlineCredentialRef            string `yaml:"online_credential_ref" json:"online_credential_ref"`
-	VectorBackend                  string `yaml:"vector_backend" json:"vector_backend"`
-	SendContentWithoutConfirmation bool   `yaml:"send_content_without_confirmation" json:"send_content_without_confirmation"`
+	EmbeddingMode                  string `yaml:"embedding_mode" toml:"embedding_mode" json:"embedding_mode"`
+	LocalProfile                   string `yaml:"local_profile" toml:"local_profile" json:"local_profile"`
+	OnlineProfile                  string `yaml:"online_profile" toml:"online_profile" json:"online_profile"`
+	OnlineCredentialRef            string `yaml:"online_credential_ref" toml:"online_credential_ref" json:"online_credential_ref"`
+	VectorBackend                  string `yaml:"vector_backend" toml:"vector_backend" json:"vector_backend"`
+	SendContentWithoutConfirmation bool   `yaml:"send_content_without_confirmation" toml:"send_content_without_confirmation" json:"send_content_without_confirmation"`
 }
 
 // DescriptionConfig controls durable long-form descriptions.  Description
 // generation and embedding are separate providers by design.
 type DescriptionConfig struct {
-	Enabled         bool   `yaml:"enabled" json:"enabled"`
-	Generate        string `yaml:"generate" json:"generate"`
-	ProviderProfile string `yaml:"provider_profile" json:"provider_profile"`
-	CredentialRef   string `yaml:"credential_ref" json:"credential_ref"`
-	RetainFullText  bool   `yaml:"retain_full_text" json:"retain_full_text"`
+	Enabled         bool   `yaml:"enabled" toml:"enabled" json:"enabled"`
+	Generate        string `yaml:"generate" toml:"generate" json:"generate"`
+	ProviderProfile string `yaml:"provider_profile" toml:"provider_profile" json:"provider_profile"`
+	CredentialRef   string `yaml:"credential_ref" toml:"credential_ref" json:"credential_ref"`
+	RetainFullText  bool   `yaml:"retain_full_text" toml:"retain_full_text" json:"retain_full_text"`
 }
 
 // Descriptions is retained as a convenient field/type name for callers that
@@ -95,23 +98,31 @@ type Descriptions = DescriptionConfig
 
 // RecoveryConfig controls fallback and external reacquisition policy.
 type RecoveryConfig struct {
-	RequireExactFallback       bool   `yaml:"require_exact_fallback" json:"require_exact_fallback"`
-	AllowExternalReacquisition bool   `yaml:"allow_external_reacquisition" json:"allow_external_reacquisition"`
-	PublicationSigning         string `yaml:"publication_signing" json:"publication_signing"`
-	PublicationDomain          string `yaml:"publication_domain" json:"publication_domain"`
+	RequireExactFallback       bool   `yaml:"require_exact_fallback" toml:"require_exact_fallback" json:"require_exact_fallback"`
+	AllowExternalReacquisition bool   `yaml:"allow_external_reacquisition" toml:"allow_external_reacquisition" json:"allow_external_reacquisition"`
+	PublicationSigning         string `yaml:"publication_signing" toml:"publication_signing" json:"publication_signing"`
+	PublicationDomain          string `yaml:"publication_domain" toml:"publication_domain" json:"publication_domain"`
 }
 
 // Recovery is a short alias matching the top-level YAML section name.
 type Recovery = RecoveryConfig
 
+// APIConfig controls the optional HTTP adapter. Authentication material is
+// injected by the host environment and is never persisted here.
+type APIConfig struct {
+	Enabled bool   `yaml:"enabled" toml:"enabled" json:"enabled"`
+	Listen  string `yaml:"listen" toml:"listen" json:"listen"`
+}
+
 // Config is the persisted schema-v1 profile.
 type Config struct {
-	Schema       string            `yaml:"schema" json:"schema"`
-	Paths        Paths             `yaml:"paths" json:"paths"`
-	Storage      StorageConfig     `yaml:"storage" json:"storage"`
-	Semantic     SemanticConfig    `yaml:"semantic" json:"semantic"`
-	Descriptions DescriptionConfig `yaml:"descriptions" json:"descriptions"`
-	Recovery     RecoveryConfig    `yaml:"recovery" json:"recovery"`
+	Schema       string            `yaml:"schema" toml:"schema" json:"schema"`
+	Paths        Paths             `yaml:"paths" toml:"paths" json:"paths"`
+	Storage      StorageConfig     `yaml:"storage" toml:"storage" json:"storage"`
+	Semantic     SemanticConfig    `yaml:"semantic" toml:"semantic" json:"semantic"`
+	Descriptions DescriptionConfig `yaml:"descriptions" toml:"descriptions" json:"descriptions"`
+	Recovery     RecoveryConfig    `yaml:"recovery" toml:"recovery" json:"recovery"`
+	API          APIConfig         `yaml:"api" toml:"api" json:"api"`
 
 	// YAML's bool type has no "unset" state.  These markers are populated by
 	// Decode so a subsequent Resolve call does not turn an explicit false back
@@ -130,6 +141,7 @@ type PathOverrides struct {
 	Catalog         string
 	Repository      string
 	Vectors         string
+	Models          string
 	RecoveryRecords string
 }
 
@@ -191,13 +203,13 @@ func platformConfigPath() string {
 
 func platformConfigPathForEnv(env map[string]string) string {
 	if value := strings.TrimSpace(env["XDG_CONFIG_HOME"]); value != "" {
-		return filepath.Join(value, "restoreweave", "config.yaml")
+		return filepath.Join(value, "restoreweave", "config.toml")
 	}
 	home, err := os.UserHomeDir()
 	if err != nil || strings.TrimSpace(home) == "" {
-		return filepath.Join(os.TempDir(), "restoreweave", "config.yaml")
+		return filepath.Join(os.TempDir(), "restoreweave", "config.toml")
 	}
-	return filepath.Join(home, ".config", "restoreweave", "config.yaml")
+	return filepath.Join(home, ".config", "restoreweave", "config.toml")
 }
 
 // Default returns the current runnable development storage profile and the
@@ -211,6 +223,7 @@ func Default() Config {
 			Catalog:         platformDataPath("catalog.sqlite"),
 			Repository:      platformDataPath("repository"),
 			Vectors:         platformDataPath("vectors"),
+			Models:          platformDataPath("models"),
 			RecoveryRecords: platformDataPath("recovery"),
 		},
 		Storage: StorageConfig{
@@ -227,9 +240,12 @@ func Default() Config {
 			VectorBackend: "zvec",
 		},
 		Descriptions: DescriptionConfig{
-			Enabled:         true,
-			Generate:        "on_demand",
-			ProviderProfile: "local-or-configured-online",
+			Enabled:  true,
+			Generate: "on_demand",
+			// Description generation is an explicit operation. An empty profile
+			// keeps the default on-demand path honest until the operator selects a
+			// separately admitted DESCRIBE_SUBJECT provider.
+			ProviderProfile: "",
 			RetainFullText:  true,
 		},
 		Recovery: RecoveryConfig{
@@ -238,6 +254,7 @@ func Default() Config {
 			PublicationSigning:         PublicationSigningLocalEd25519,
 			PublicationDomain:          DefaultPublicationDomain,
 		},
+		API: APIConfig{Enabled: false, Listen: "127.0.0.1:4534"},
 	}
 }
 
@@ -255,18 +272,21 @@ func platformDataPath(name string) string {
 	return filepath.Join(home, ".local", "share", "restoreweave", name)
 }
 
-// LoadFile decodes one strict YAML document and validates its schema.  It does
-// not resolve relative paths; use LoadEffective or Resolve for that.
+// LoadFile decodes one strict persisted profile and validates its schema. TOML
+// is the canonical format; .yaml/.yml remains a read/write compatibility path
+// for profiles created before the TOML default was introduced.
 func LoadFile(path string) (Config, error) {
 	if strings.TrimSpace(path) == "" {
 		return Config{}, errors.New("config path is empty")
 	}
-	file, err := os.Open(path)
+	payload, err := os.ReadFile(path)
 	if err != nil {
 		return Config{}, fmt.Errorf("open config %q: %w", path, err)
 	}
-	defer file.Close()
-	return Decode(file)
+	if ext := strings.ToLower(filepath.Ext(path)); ext == ".yaml" || ext == ".yml" {
+		return Decode(bytes.NewReader(payload))
+	}
+	return DecodeTOML(bytes.NewReader(payload))
 }
 
 // Decode decodes one strict YAML document from r.
@@ -303,6 +323,33 @@ func Decode(r io.Reader) (Config, error) {
 	original := cfg
 	cfg = withDefaults(cfg)
 	cfg = restoreExplicitBooleans(cfg, original, payload)
+	if err := validate(cfg, false); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
+}
+
+// DecodeTOML decodes one strict TOML profile. TOML is used for new persisted
+// profiles because it is explicit about tables and remains easy to edit.
+func DecodeTOML(r io.Reader) (Config, error) {
+	if r == nil {
+		return Config{}, errors.New("config reader is nil")
+	}
+	payload, err := io.ReadAll(r)
+	if err != nil {
+		return Config{}, fmt.Errorf("read config TOML: %w", err)
+	}
+	decoder := toml.NewDecoder(bytes.NewReader(payload)).DisallowUnknownFields()
+	var cfg Config
+	if err := decoder.Decode(&cfg); err != nil {
+		return Config{}, fmt.Errorf("decode config TOML: %w", err)
+	}
+	if strings.TrimSpace(cfg.Schema) == "" {
+		return Config{}, fmt.Errorf("schema is required (want %q)", SchemaV1)
+	}
+	original := cfg
+	cfg = withDefaults(cfg)
+	cfg = restoreExplicitBooleansTOML(cfg, original, payload)
 	if err := validate(cfg, false); err != nil {
 		return Config{}, err
 	}
@@ -372,6 +419,45 @@ func restoreExplicitBooleansJSON(cfg, original Config, payload []byte) Config {
 	if has("storage", "allow_link_only") {
 		cfg.Storage.AllowLinkOnly = original.Storage.AllowLinkOnly
 		cfg.explicitStorageAllow = true
+	}
+	if has("descriptions", "enabled") {
+		cfg.Descriptions.Enabled = original.Descriptions.Enabled
+		cfg.explicitDescriptionsEnabled = true
+	}
+	if has("descriptions", "retain_full_text") {
+		cfg.Descriptions.RetainFullText = original.Descriptions.RetainFullText
+		cfg.explicitDescriptionsRetain = true
+	}
+	if has("recovery", "require_exact_fallback") {
+		cfg.Recovery.RequireExactFallback = original.Recovery.RequireExactFallback
+		cfg.explicitRecoveryFallback = true
+	}
+	if has("descriptions", "enabled") && !cfg.Descriptions.Enabled && !has("descriptions", "generate") {
+		cfg.Descriptions.Generate = "disabled"
+	}
+	return cfg
+}
+
+func restoreExplicitBooleansTOML(cfg, original Config, payload []byte) Config {
+	var root map[string]any
+	if err := toml.Unmarshal(payload, &root); err != nil {
+		return cfg
+	}
+	has := func(section, field string) bool {
+		fields, ok := root[section].(map[string]any)
+		if !ok {
+			return false
+		}
+		_, ok = fields[field]
+		return ok
+	}
+	if has("storage", "allow_link_only") {
+		cfg.Storage.AllowLinkOnly = original.Storage.AllowLinkOnly
+		cfg.explicitStorageAllow = true
+	}
+	if has("storage", "link_only_requires_confirmation") {
+		cfg.Storage.LinkOnlyRequiresConfirmation = original.Storage.LinkOnlyRequiresConfirmation
+		cfg.explicitStorageConfirmation = true
 	}
 	if has("descriptions", "enabled") {
 		cfg.Descriptions.Enabled = original.Descriptions.Enabled
@@ -476,6 +562,10 @@ func Resolve(cfg Config, options ResolveOptions) (ResolvedConfig, error) {
 	if err != nil {
 		return ResolvedConfig{}, fmt.Errorf("resolve paths.vectors: %w", err)
 	}
+	cfg.Paths.Models, err = resolveFilesystemPath(cfg.Paths.Models, baseDir)
+	if err != nil {
+		return ResolvedConfig{}, fmt.Errorf("resolve paths.models: %w", err)
+	}
 	cfg.Paths.RecoveryRecords, err = resolveFilesystemPath(cfg.Paths.RecoveryRecords, baseDir)
 	if err != nil {
 		return ResolvedConfig{}, fmt.Errorf("resolve paths.recovery_records: %w", err)
@@ -511,6 +601,9 @@ func applyEnvironmentPaths(paths *Paths, env map[string]string) {
 	if value := strings.TrimSpace(env[VectorsEnv]); value != "" {
 		paths.Vectors = value
 	}
+	if value := strings.TrimSpace(env[ModelsEnv]); value != "" {
+		paths.Models = value
+	}
 	if value := strings.TrimSpace(env[RecoveryRecordsEnv]); value != "" {
 		paths.RecoveryRecords = value
 	}
@@ -525,6 +618,9 @@ func applyPathOverrides(paths *Paths, overrides PathOverrides) {
 	}
 	if value := strings.TrimSpace(overrides.Vectors); value != "" {
 		paths.Vectors = value
+	}
+	if value := strings.TrimSpace(overrides.Models); value != "" {
+		paths.Models = value
 	}
 	if value := strings.TrimSpace(overrides.RecoveryRecords); value != "" {
 		paths.RecoveryRecords = value
@@ -611,6 +707,13 @@ func validate(cfg Config, resolvedPaths bool) error {
 	if err := validateLocation("paths.vectors", cfg.Paths.Vectors, resolvedPaths, false); err != nil {
 		return err
 	}
+	if strings.TrimSpace(cfg.Paths.Models) != "" {
+		if err := validateLocation("paths.models", cfg.Paths.Models, resolvedPaths, false); err != nil {
+			return err
+		}
+	} else if resolvedPaths {
+		return errors.New("paths.models is required")
+	}
 	if err := validateLocation("paths.recovery_records", cfg.Paths.RecoveryRecords, resolvedPaths, false); err != nil {
 		return err
 	}
@@ -690,10 +793,10 @@ func validate(cfg Config, resolvedPaths bool) error {
 		default:
 			return fmt.Errorf("descriptions.generate %q is invalid", cfg.Descriptions.Generate)
 		}
-		if cfg.Descriptions.Generate != "disabled" && strings.TrimSpace(cfg.Descriptions.ProviderProfile) == "" {
-			return errors.New("descriptions.provider_profile is required when description generation is enabled")
+		if cfg.Descriptions.Generate == "on_ingest" && strings.TrimSpace(cfg.Descriptions.ProviderProfile) == "" {
+			return errors.New("descriptions.provider_profile is required for on_ingest description generation")
 		}
-		if cfg.Descriptions.Generate != "disabled" {
+		if cfg.Descriptions.Generate != "disabled" && strings.TrimSpace(cfg.Descriptions.ProviderProfile) != "" {
 			if err := validateProfileName("descriptions.provider_profile", cfg.Descriptions.ProviderProfile); err != nil {
 				return err
 			}
@@ -715,6 +818,14 @@ func validate(cfg Config, resolvedPaths bool) error {
 	}
 	if err := validatePublicationDomain(cfg.Recovery.PublicationDomain); err != nil {
 		return err
+	}
+	if cfg.API.Enabled {
+		if strings.TrimSpace(cfg.API.Listen) == "" {
+			return errors.New("api.listen is required when api.enabled is true")
+		}
+		if strings.TrimSpace(cfg.API.Listen) != cfg.API.Listen || strings.ContainsFunc(cfg.API.Listen, unicode.IsControl) {
+			return errors.New("api.listen must be a non-whitespace listener address")
+		}
 	}
 	if resolvedPaths {
 		if err := validatePathSeparation(cfg.Paths); err != nil {
@@ -825,6 +936,7 @@ func validatePathSeparation(paths Paths) error {
 		{"catalog", paths.Catalog},
 		{"repository", paths.Repository},
 		{"vectors", paths.Vectors},
+		{"models", paths.Models},
 		{"recovery_records", paths.RecoveryRecords},
 	}
 	for i := range locations {
@@ -873,6 +985,7 @@ func defaultForEnvironment(env map[string]string) Config {
 		defaults.Paths.Catalog = filepath.Join(value, "restoreweave", "catalog.sqlite")
 		defaults.Paths.Repository = filepath.Join(value, "restoreweave", "repository")
 		defaults.Paths.Vectors = filepath.Join(value, "restoreweave", "vectors")
+		defaults.Paths.Models = filepath.Join(value, "restoreweave", "models")
 		defaults.Paths.RecoveryRecords = filepath.Join(value, "restoreweave", "recovery")
 	}
 	return defaults
@@ -892,6 +1005,9 @@ func withDefaultsFrom(cfg Config, defaults Config) Config {
 	}
 	if cfg.Paths.Vectors == "" {
 		cfg.Paths.Vectors = defaults.Paths.Vectors
+	}
+	if cfg.Paths.Models == "" {
+		cfg.Paths.Models = defaults.Paths.Models
 	}
 	if cfg.Paths.RecoveryRecords == "" {
 		cfg.Paths.RecoveryRecords = defaults.Paths.RecoveryRecords
@@ -948,6 +1064,9 @@ func withDefaultsFrom(cfg Config, defaults Config) Config {
 	}
 	if cfg.Recovery.PublicationDomain == "" {
 		cfg.Recovery.PublicationDomain = defaults.Recovery.PublicationDomain
+	}
+	if cfg.API.Listen == "" {
+		cfg.API.Listen = defaults.API.Listen
 	}
 	return cfg
 }
@@ -1034,9 +1153,7 @@ func RedactedJSON(resolved ResolvedConfig) ([]byte, error) {
 	return resolved.RedactedJSON()
 }
 
-// MarshalYAML validates and serializes a persisted profile with defaults
-// filled.  Relative paths are preserved so a config remains portable between
-// machines; resolution happens at load time.
+// MarshalYAML validates and serializes the legacy YAML representation.
 func MarshalYAML(cfg Config) ([]byte, error) {
 	if err := validate(cfg, false); err != nil {
 		return nil, err
@@ -1044,12 +1161,30 @@ func MarshalYAML(cfg Config) ([]byte, error) {
 	return yaml.Marshal(cfg)
 }
 
+// MarshalTOML validates and serializes the canonical persisted representation.
+// Relative paths are preserved so a config remains portable between machines;
+// resolution happens at load time.
+func MarshalTOML(cfg Config) ([]byte, error) {
+	if err := validate(cfg, false); err != nil {
+		return nil, err
+	}
+	return toml.Marshal(cfg)
+}
+
+func marshalPersisted(path string, cfg Config) ([]byte, error) {
+	ext := strings.ToLower(filepath.Ext(path))
+	if ext == ".yaml" || ext == ".yml" {
+		return MarshalYAML(cfg)
+	}
+	return MarshalTOML(cfg)
+}
+
 // Save writes a validated profile atomically with owner-only permissions.
 func Save(path string, cfg Config) error {
 	if strings.TrimSpace(path) == "" {
 		return errors.New("config path is empty")
 	}
-	payload, err := MarshalYAML(cfg)
+	payload, err := marshalPersisted(path, cfg)
 	if err != nil {
 		return err
 	}

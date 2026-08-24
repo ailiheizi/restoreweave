@@ -69,8 +69,15 @@ func TestSignedPublicationAuthenticatesPortableFileFacts(t *testing.T) {
 		t.Fatalf("captured file facts are incomplete: %+v", factByName)
 	}
 	for _, name := range []string{PortableFactXAttrs, PortableFactACLs, PortableFactSparseExtents} {
-		if factByName[name].State != PortableFactUnsupported {
-			t.Fatalf("fact %s state = %q, want UNSUPPORTED", name, factByName[name].State)
+		switch name {
+		case PortableFactXAttrs, PortableFactACLs:
+			if factByName[name].State != PortableFactObserved && factByName[name].State != PortableFactUnobserved && factByName[name].State != PortableFactUnsupported {
+				t.Fatalf("fact %s state = %q, want an explicit capture/degradation state", name, factByName[name].State)
+			}
+		case PortableFactSparseExtents:
+			if factByName[name].State != PortableFactUnsupported {
+				t.Fatalf("fact %s state = %q, want UNSUPPORTED", name, factByName[name].State)
+			}
 		}
 	}
 	var hardLink PortableHardLinkValue
@@ -358,10 +365,11 @@ func TestSignedPublicationRejectsTamperedPreparedClosure(t *testing.T) {
 }
 
 type signedPublicationFixture struct {
-	service *Service
-	store   *sqlite.Store
-	repo    *repository.Dir
-	source  string
+	service     *Service
+	store       *sqlite.Store
+	catalogPath string
+	repo        *repository.Dir
+	source      string
 }
 
 // errorAfterRecordPlaceRepo models a lost response after the repository has
@@ -392,7 +400,8 @@ func newSignedPublicationFixture(t *testing.T, name string, payload []byte) sign
 	if err := os.WriteFile(filepath.Join(source, name), payload, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "catalog.sqlite"), sqlite.Options{})
+	catalogPath := filepath.Join(t.TempDir(), "catalog.sqlite")
+	store, err := sqlite.Open(ctx, catalogPath, sqlite.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -409,8 +418,9 @@ func newSignedPublicationFixture(t *testing.T, name string, payload []byte) sign
 		service: &Service{
 			Store: store, Repo: repo, SigningIdentity: &identity, TrustAnchor: &anchor,
 			PublicationDomain: testPublicationDomain, RequireSignedPublication: true,
+			ConfigDigest: "sha256:exact-test-config",
 		},
-		store: store, repo: repo, source: source,
+		store: store, catalogPath: catalogPath, repo: repo, source: source,
 	}
 }
 

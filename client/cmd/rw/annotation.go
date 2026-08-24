@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -10,10 +12,13 @@ import (
 )
 
 func newSearchCommand(env *clientEnv) *cobra.Command {
+	var filterValues []string
+	var language, suffix, entryType, contentID, duplicateGroup, protectionMode string
+	var sizeMin, sizeMax, mtimeAfter, mtimeBefore int64
 	commandNode := newExitCommand(env, "search <query>", "Query the bundled lexical index",
 		func(cmd *cobra.Command, env *clientEnv, args []string) int {
 			if len(args) != 1 {
-				fmt.Fprintf(cmd.ErrOrStderr(), "usage: rw search <query> [--workspace <id>] [--generation <id>] [--dimension <id>] [--fuse <id>] [--axis <name>]\n")
+				fmt.Fprintf(cmd.ErrOrStderr(), "usage: rw search <query> [--workspace <id>] [--filter key=value]\n")
 				return 1
 			}
 			input := map[string]any{"query": args[0]}
@@ -31,6 +36,22 @@ func newSearchCommand(env *clientEnv) *cobra.Command {
 			}
 			if fuse, err := cmd.Flags().GetStringSlice("fuse"); err == nil && len(fuse) > 0 {
 				input["fuse"] = fuse
+			}
+			filters, err := collectSearchFilters(filterValues, searchFilterFlags{
+				Language: language, Suffix: suffix, EntryType: entryType,
+				ContentID: contentID, DuplicateGroup: duplicateGroup,
+				ProtectionMode: protectionMode,
+				SizeMin:        explicitInt64Flag(cmd, "size-min", sizeMin),
+				SizeMax:        explicitInt64Flag(cmd, "size-max", sizeMax),
+				MtimeAfter:     explicitInt64Flag(cmd, "mtime-after", mtimeAfter),
+				MtimeBefore:    explicitInt64Flag(cmd, "mtime-before", mtimeBefore),
+			})
+			if err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "invalid search filter: %v\n", err)
+				return 1
+			}
+			if len(filters) > 0 {
+				input["filters"] = filters
 			}
 			return env.request(cmd, command.OpSearchQuery, input, func(cmd *cobra.Command, result command.Result) error {
 				var data command.SearchQueryData
@@ -58,7 +79,90 @@ func newSearchCommand(env *clientEnv) *cobra.Command {
 	commandNode.Flags().String("dimension", "", "declared index dimension (default lexical-metadata-fts)")
 	commandNode.Flags().StringSlice("axis", nil, "restrict lexical construct axes (path,name,suffix,tags,notes,extracted)")
 	commandNode.Flags().StringSlice("fuse", nil, "host-owned fusion of two or more declared dimensions")
+	commandNode.Flags().StringArrayVar(&filterValues, "filter", nil, "typed filter as key=value; repeat for entry_type, content_id, duplicate_group, protection_mode, language, suffix, size_min, size_max, mtime_after, or mtime_before")
+	commandNode.Flags().StringVar(&language, "language", "", "exact language facet")
+	commandNode.Flags().StringVar(&suffix, "suffix", "", "exact filename suffix facet")
+	commandNode.Flags().StringVar(&entryType, "entry-type", "", "exact entry type facet")
+	commandNode.Flags().StringVar(&contentID, "content-id", "", "exact content identity facet")
+	commandNode.Flags().StringVar(&duplicateGroup, "duplicate-group", "", "exact duplicate group facet")
+	commandNode.Flags().StringVar(&protectionMode, "protection-mode", "", "protection mode facet")
+	commandNode.Flags().Int64Var(&sizeMin, "size-min", 0, "minimum logical size facet")
+	commandNode.Flags().Int64Var(&sizeMax, "size-max", 0, "maximum logical size facet")
+	commandNode.Flags().Int64Var(&mtimeAfter, "mtime-after", 0, "minimum modification time in Unix milliseconds")
+	commandNode.Flags().Int64Var(&mtimeBefore, "mtime-before", 0, "maximum modification time in Unix milliseconds")
 	return commandNode.Command
+}
+
+type searchFilterFlags struct {
+	Language, Suffix, EntryType, ContentID, DuplicateGroup, ProtectionMode string
+	SizeMin, SizeMax, MtimeAfter, MtimeBefore                              *int64
+}
+
+func explicitInt64Flag(cmd *cobra.Command, name string, value int64) *int64 {
+	if !cmd.Flags().Changed(name) {
+		return nil
+	}
+	return &value
+}
+
+// collectSearchFilters accepts the public search.filters field names and
+// keeps numeric facets typed all the way to the command envelope.
+func collectSearchFilters(values []string, flags searchFilterFlags) (map[string]any, error) {
+	filters := make(map[string]any)
+	for _, raw := range values {
+		key, value, ok := strings.Cut(raw, "=")
+		key, value = strings.TrimSpace(key), strings.TrimSpace(value)
+		if !ok || key == "" || value == "" {
+			return nil, fmt.Errorf("expected key=value, got %q", raw)
+		}
+		if _, exists := filters[key]; exists {
+			return nil, fmt.Errorf("duplicate %q", key)
+		}
+		parsed, err := parseSearchFilterValue(key, value)
+		if err != nil {
+			return nil, err
+		}
+		filters[key] = parsed
+	}
+	for key, value := range map[string]string{
+		"language": flags.Language, "suffix": flags.Suffix, "entry_type": flags.EntryType,
+		"content_id": flags.ContentID, "duplicate_group": flags.DuplicateGroup,
+		"protection_mode": flags.ProtectionMode,
+	} {
+		if value != "" {
+			if _, exists := filters[key]; exists {
+				return nil, fmt.Errorf("duplicate %q", key)
+			}
+			filters[key] = value
+		}
+	}
+	for key, value := range map[string]*int64{
+		"size_min": flags.SizeMin, "size_max": flags.SizeMax,
+		"mtime_after": flags.MtimeAfter, "mtime_before": flags.MtimeBefore,
+	} {
+		if value != nil {
+			if _, exists := filters[key]; exists {
+				return nil, fmt.Errorf("duplicate %q", key)
+			}
+			filters[key] = *value
+		}
+	}
+	return filters, nil
+}
+
+func parseSearchFilterValue(key, value string) (any, error) {
+	switch key {
+	case "entry_type", "content_id", "duplicate_group", "protection_mode", "language", "suffix":
+		return value, nil
+	case "size_min", "size_max", "mtime_after", "mtime_before":
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("%s must be an integer", key)
+		}
+		return parsed, nil
+	default:
+		return nil, fmt.Errorf("unknown field %q", key)
+	}
 }
 
 func newTagCommand(env *clientEnv) *cobra.Command {

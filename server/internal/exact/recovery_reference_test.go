@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -352,6 +354,253 @@ func TestRecoveryReferenceRoundTripAndRepositoryValidation(t *testing.T) {
 	}
 	if err := decoded.ValidateAgainstRepository(context.Background(), fixture.repo, *fixture.service.TrustAnchor); err != nil {
 		t.Fatalf("validate recovery reference against repository: %v", err)
+	}
+}
+
+func TestRecoveryReferenceRepositoryValidationRejectsMissingOrCorruptExactPayload(t *testing.T) {
+	for _, mode := range []string{"missing", "corrupt"} {
+		t.Run(mode, func(t *testing.T) {
+			fixture := newSignedPublicationFixture(t, "reference-payload.txt", []byte("reference payload"))
+			result := fixture.ingest(t, "sha256:reference-payload-plan")
+			reference, err := fixture.service.BuildRecoveryReference(context.Background(), result.SnapshotRef)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var contentID string
+			for _, entry := range reference.PreparedClosure.Manifest.Entries {
+				if entry.ContentID != "" {
+					contentID = entry.ContentID
+					break
+				}
+			}
+			if contentID == "" {
+				t.Fatal("reference manifest has no exact payload")
+			}
+			hexDigest := strings.TrimPrefix(contentID, "sha256:")
+			path := filepath.Join(fixture.repo.Root(), "blobs", "sha256", hexDigest[:2], hexDigest)
+			if mode == "missing" {
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(path, []byte("corrupt payload"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := reference.ValidateAgainstRepository(context.Background(), fixture.repo, *fixture.service.TrustAnchor); err == nil {
+				t.Fatalf("recovery reference accepted a %s exact payload", mode)
+			}
+		})
+	}
+}
+
+func TestRecoveryReferenceRepositoryValidationRejectsTamperedExactPayload(t *testing.T) {
+	fixture := newSignedPublicationFixture(t, "reference-tampered-payload.txt", []byte("reference tampered payload"))
+	result := fixture.ingest(t, "sha256:reference-tampered-payload-plan")
+	reference, err := fixture.service.BuildRecoveryReference(context.Background(), result.SnapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var contentID string
+	for _, entry := range reference.PreparedClosure.Manifest.Entries {
+		if entry.ContentID != "" {
+			contentID = entry.ContentID
+			break
+		}
+	}
+	if contentID == "" {
+		t.Fatal("reference manifest has no exact payload")
+	}
+	hexDigest := strings.TrimPrefix(contentID, "sha256:")
+	path := filepath.Join(fixture.repo.Root(), "blobs", "sha256", hexDigest[:2], hexDigest)
+	if !flipFileByte(t, path) {
+		t.Fatal("exact payload tamper did not change bytes")
+	}
+	if err := reference.ValidateAgainstRepository(context.Background(), fixture.repo, *fixture.service.TrustAnchor); err == nil {
+		t.Fatal("recovery reference accepted a tampered exact payload")
+	}
+}
+
+func TestRecoveryReferenceValidateRejectsPreparedPlacementDrift(t *testing.T) {
+	fixture := newSignedPublicationFixture(t, "reference-prepared-binding.txt", []byte("prepared binding"))
+	result := fixture.ingest(t, "sha256:reference-prepared-binding-plan")
+	reference, err := fixture.service.BuildRecoveryReference(context.Background(), result.SnapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit := reference.PublicationCommit
+	commit.PreparedObjectDigest = "sha256:" + strings.Repeat("f", 64)
+	commit.Signature = nil
+	commit, err = SignPublicationCommit(*fixture.service.SigningIdentity, commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference.PublicationCommit = commit
+	reference.PublicationCommitDigest, err = commit.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference.FactHealth = RecoveryFactHealthIncomplete
+	reference.PortableFactClosures = nil
+	if err := reference.Validate(*fixture.service.TrustAnchor); err == nil {
+		t.Fatal("recovery reference accepted prepared placement drift")
+	}
+}
+
+func rewriteRecoveryReferenceFactForTest(t *testing.T, fixture signedPublicationFixture, reference *RecoveryReference, mutate func(*portableFactBundle)) {
+	t.Helper()
+	if len(reference.PortableFactClosures) != 1 {
+		t.Fatalf("portable fact closure count = %d, want 1", len(reference.PortableFactClosures))
+	}
+	fact := reference.PortableFactClosures[0]
+	var bundle portableFactBundle
+	if err := decodeStrictRecord(fact.Envelope.Bundle, &bundle); err != nil {
+		t.Fatal(err)
+	}
+	mutate(&bundle)
+	sortPortableFactRecordsForTest(&bundle)
+	bundleBytes, err := CanonicalJSON(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closure := fact.Envelope.Closure
+	closure.BundleDigest = DigestBytes(bundleBytes)
+	closure.BundleLength = int64(len(bundleBytes))
+	closure.RecordCount = int64(len(bundle.Records))
+	closure.AttachmentCount = int64(len(bundle.Attachments))
+	closure.Signature = nil
+	closure, err = SignPortableFactClosure(*fixture.service.SigningIdentity, closure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope := PortableFactClosureEnvelope{Schema: PortableFactClosureEnvelopeSchemaV1, Closure: closure, Bundle: bundleBytes}
+	envelopeBytes, err := CanonicalJSON(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closureDigest, err := closure.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference.PortableFactClosures[0] = RecoveryFactClosureReference{
+		RecordDigest: DigestBytes(envelopeBytes), ClosureDigest: closureDigest, Envelope: envelope,
+	}
+}
+
+func TestRecoveryReferenceValidateRejectsManifestUnboundPortableFacts(t *testing.T) {
+	fixture := newSignedPublicationFixture(t, "reference-manifest-binding.txt", []byte("manifest binding"))
+	result := fixture.ingest(t, "sha256:reference-manifest-binding-plan")
+	reference, err := fixture.service.BuildRecoveryReference(context.Background(), result.SnapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewriteRecoveryReferenceFactForTest(t, fixture, &reference, func(bundle *portableFactBundle) {
+		index := findPortableRecord(t, *bundle, "SUBJECT_MAPPING")
+		var mapping subjectMappingPayload
+		if err := decodeStrictRecord(bundle.Records[index].Payload, &mapping); err != nil {
+			t.Fatal(err)
+		}
+		mapping.RawName = []byte("authenticated-but-not-in-manifest.txt")
+		rewritePortableRecordPayload(t, &bundle.Records[index], mapping)
+	})
+	if err := reference.Validate(*fixture.service.TrustAnchor); err == nil {
+		t.Fatal("manifest-unbound portable fact bundle was accepted by recovery reference validation")
+	}
+}
+
+func TestRecoveryReferenceRejectsNonMonotonicFactSuccessorTime(t *testing.T) {
+	evidence := newPortableEvidenceFixture(t)
+	reference, err := evidence.fixture.service.BuildRecoveryReference(context.Background(), evidence.result.SnapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reference.PortableFactClosures) != 2 {
+		t.Fatalf("portable fact closures = %d, want 2", len(reference.PortableFactClosures))
+	}
+	parentTime := reference.PublicationCommit.SignedAt
+	first := reference.PortableFactClosures[0].Envelope.Closure
+	first.SignedAt = parentTime.Add(2 * time.Second)
+	first.Signature = nil
+	first, err = SignPortableFactClosure(*evidence.fixture.service.SigningIdentity, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstEnvelope := reference.PortableFactClosures[0].Envelope
+	firstEnvelope.Closure = first
+	firstBytes, err := CanonicalJSON(firstEnvelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstDigest, err := first.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference.PortableFactClosures[0] = RecoveryFactClosureReference{
+		RecordDigest: DigestBytes(firstBytes), ClosureDigest: firstDigest, Envelope: firstEnvelope,
+	}
+	second := reference.PortableFactClosures[1].Envelope.Closure
+	second.PredecessorClosureDigest = firstDigest
+	second.SignedAt = parentTime.Add(time.Second)
+	second.Signature = nil
+	second, err = SignPortableFactClosure(*evidence.fixture.service.SigningIdentity, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondEnvelope := reference.PortableFactClosures[1].Envelope
+	secondEnvelope.Closure = second
+	secondBytes, err := CanonicalJSON(secondEnvelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondDigest, err := second.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference.PortableFactClosures[1] = RecoveryFactClosureReference{
+		RecordDigest: DigestBytes(secondBytes), ClosureDigest: secondDigest, Envelope: secondEnvelope,
+	}
+	if err := reference.Validate(*evidence.fixture.service.TrustAnchor); err == nil {
+		t.Fatal("non-monotonic portable fact successor time was accepted")
+	}
+}
+
+func TestRecoveryReferenceRejectsBrokenPublicationParentLineage(t *testing.T) {
+	fixture := newSignedPublicationFixture(t, "reference-lineage.txt", []byte("lineage"))
+	fixture.ingest(t, "sha256:reference-lineage-first-plan")
+	if err := os.WriteFile(filepath.Join(fixture.source, "lineage-second.txt"), []byte("lineage second"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second := fixture.ingest(t, "sha256:reference-lineage-second-plan")
+	reference, err := fixture.service.BuildRecoveryReference(context.Background(), second.SnapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commits, err := listCommitMarkers(context.Background(), fixture.repo, *fixture.service.TrustAnchor, testPublicationDomain)
+	if err != nil || len(commits) != 2 {
+		t.Fatalf("committed lineage = %d, err=%v", len(commits), err)
+	}
+	if err := os.Remove(recordRelocationPath(t, fixture.repo.Root(), repository.RecordPublicationCommit, commits[0].CommitDigest)); err != nil {
+		t.Fatal(err)
+	}
+	if err := reference.ValidateAgainstRepository(context.Background(), fixture.repo, *fixture.service.TrustAnchor); err == nil {
+		t.Fatal("reference with a missing publication parent was accepted")
+	}
+}
+
+func TestBuildRecoveryReferenceReportsMissingFactChildAsIncomplete(t *testing.T) {
+	fixture := newSignedPublicationFixture(t, "reference-incomplete.txt", []byte("incomplete facts"))
+	result := fixture.ingest(t, "sha256:reference-incomplete-plan")
+	digests, err := fixture.repo.ListRecordDigests(context.Background(), repository.RecordPortableFactClosure)
+	if err != nil || len(digests) != 1 {
+		t.Fatalf("portable fact digests = %v, err=%v", digests, err)
+	}
+	if err := os.Remove(recordRelocationPath(t, fixture.repo.Root(), repository.RecordPortableFactClosure, digests[0])); err != nil {
+		t.Fatal(err)
+	}
+	reference, err := fixture.service.BuildRecoveryReference(context.Background(), result.SnapshotRef)
+	if err != nil {
+		t.Fatalf("build incomplete recovery reference: %v", err)
+	}
+	if reference.FactHealth != RecoveryFactHealthIncomplete || len(reference.PortableFactClosures) != 0 {
+		t.Fatalf("incomplete reference health/closures = %s/%d", reference.FactHealth, len(reference.PortableFactClosures))
 	}
 }
 

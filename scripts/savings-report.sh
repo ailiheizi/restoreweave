@@ -6,8 +6,9 @@
 # in-tree repository profiles (raw development CAS and the local-zstd-v1
 # candidate) over a small deterministic corpus. This is candidate measurement,
 # not qualification: it reports logical bytes, whole-file duplicate savings,
-# compression savings, physical stored bytes, overhead, and net physical
-# savings separately and never adds the layers together.
+# compression savings, physical stored bytes, repository growth, typed overhead
+# categories, and net physical savings separately and never adds the layers
+# together. UNMEASURED index/model/temp categories remain visible as status.
 #
 # The runner is a build-tagged Go program under
 # server/internal/repository/savingsreport/ and is invoked via `go run` so the

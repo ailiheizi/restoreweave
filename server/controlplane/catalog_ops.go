@@ -433,17 +433,68 @@ func (d *Dispatcher) authorizeHits(ctx context.Context, workspaceID, fallbackWor
 		if err != nil {
 			continue
 		}
+		displayPath := strings.TrimSpace(hit.Path)
+		if displayPath == "" {
+			displayPath = d.namespaceDisplayPath(ctx, workspaceID, entry)
+		}
 		authorized = append(authorized, command.SearchHitData{
 			SubjectRef:    entry.ID,
-			Path:          hit.Path,
+			Path:          displayPath,
 			Name:          entry.DisplayName,
 			EntryType:     string(entry.EntryType),
 			ContentID:     entry.ContentID,
 			ConstructAxes: hit.ConstructAxes,
 			Dimensions:    dimensions[hit.SubjectID],
+			Segments:      projectSearchSegments(hit.Segments),
 		})
 	}
 	return authorized
+}
+
+func (d *Dispatcher) namespaceDisplayPath(ctx context.Context, workspaceID string, entry sqlite.NamespaceEntry) string {
+	parts := make([]string, 0, 8)
+	seen := map[string]struct{}{}
+	current := entry
+	for current.ID != "" {
+		if _, duplicate := seen[current.ID]; duplicate {
+			break
+		}
+		seen[current.ID] = struct{}{}
+		if current.DisplayName != "" {
+			parts = append([]string{current.DisplayName}, parts...)
+		}
+		if current.ParentID == "" {
+			break
+		}
+		parent, err := d.store.GetNamespaceEntry(ctx, workspaceID, current.ParentID)
+		if err != nil || parent.RootID != entry.RootID {
+			break
+		}
+		current = parent
+	}
+	return strings.Join(parts, "/")
+}
+
+func projectSearchSegments(segments []search.SegmentRef) []command.SearchSegmentData {
+	if len(segments) == 0 {
+		return nil
+	}
+	projected := make([]command.SearchSegmentData, 0, len(segments))
+	for _, segment := range segments {
+		projected = append(projected, command.SearchSegmentData{
+			DescriptionDocumentID: segment.DescriptionDocumentID,
+			SourceType:            segment.SourceType,
+			SourceID:              segment.SourceID,
+			SegmentID:             segment.SegmentID,
+			Ordinal:               segment.Ordinal,
+			MatchedText:           segment.MatchedText,
+			Kind:                  segment.Kind,
+			Producer:              segment.Producer,
+			Accepted:              segment.Accepted,
+			Language:              segment.Language,
+		})
+	}
+	return projected
 }
 
 func (d *Dispatcher) upsertTag(ctx context.Context, input annotationUpsertInput) (sqlite.Annotation, error) {

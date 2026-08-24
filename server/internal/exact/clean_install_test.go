@@ -8,6 +8,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/ailiheizi/restoreweave/server/internal/repository"
@@ -160,6 +162,131 @@ func TestCleanInstallImportArtifactAcceptsV2AndLegacyV1(t *testing.T) {
 	if legacy.Schema != RecoveryExportBundleSchemaV1 || legacy.SnapshotRef != result.SnapshotRef ||
 		legacy.FactHealth != RecoveryFactHealthIncomplete {
 		t.Fatalf("legacy import result = %+v", legacy)
+	}
+}
+
+func TestCleanInstallRecoveryArtifactInputsRejectSymlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink test requires Unix link semantics")
+	}
+	ctx := context.Background()
+	repoRoot, _, legacyPath, anchorPath, anchor, result := cleanInstallFixture(t)
+	reader := openCleanInstallReader(t, repoRoot, anchor)
+	v2Path := filepath.Join(t.TempDir(), "recovery-reference.json")
+	if _, err := reader.ExportRecoveryReference(ctx, result.SnapshotRef, v2Path); err != nil {
+		t.Fatalf("export v2 recovery reference: %v", err)
+	}
+
+	legacyLink := filepath.Join(t.TempDir(), "legacy-link.json")
+	if err := os.Symlink(legacyPath, legacyLink); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.ImportRecoveryBundle(ctx, legacyLink, anchorPath, testPublicationDomain); err == nil {
+		t.Fatal("legacy recovery bundle symlink was followed")
+	}
+	if _, err := reader.ImportRecoveryArtifact(ctx, legacyLink, anchorPath, testPublicationDomain); err == nil {
+		t.Fatal("legacy recovery artifact symlink was followed")
+	}
+
+	v2Link := filepath.Join(t.TempDir(), "v2-link.json")
+	if err := os.Symlink(v2Path, v2Link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.ImportRecoveryArtifact(ctx, v2Link, anchorPath, testPublicationDomain); err == nil {
+		t.Fatal("v2 recovery artifact symlink was followed")
+	}
+
+	destination := filepath.Join(t.TempDir(), "should-not-exist.json")
+	if _, err := reader.MigrateRecoveryArtifact(ctx, legacyLink, anchorPath, destination, testPublicationDomain); err == nil {
+		t.Fatal("migration followed a legacy recovery artifact symlink")
+	}
+	if _, err := os.Stat(destination); !os.IsNotExist(err) {
+		t.Fatalf("migration wrote destination after rejecting symlink: stat error=%v", err)
+	}
+}
+
+func TestCleanInstallMigratesLegacyV1ToV2Successor(t *testing.T) {
+	ctx := context.Background()
+	repoRoot, _, legacyPath, anchorPath, anchor, result := cleanInstallFixture(t)
+	reader := openCleanInstallReader(t, repoRoot, anchor)
+	destination := filepath.Join(t.TempDir(), "migrated-reference.json")
+	migrated, err := reader.MigrateRecoveryArtifact(ctx, legacyPath, anchorPath, destination, testPublicationDomain)
+	if err != nil {
+		t.Fatalf("migrate legacy recovery artifact: %v", err)
+	}
+	if migrated.Schema != RecoveryReferenceSchemaV2 || migrated.SnapshotRef != result.SnapshotRef ||
+		migrated.ManifestDigest != result.ManifestDigest || !migrated.IndependentlyStored {
+		t.Fatalf("migration result = %+v", migrated)
+	}
+	payload, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference, err := DecodeRecoveryReference(payload)
+	if err != nil {
+		t.Fatalf("decode migrated reference: %v", err)
+	}
+	if reference.PublicationCommitDigest != result.PublicationCommitDigest ||
+		reference.PreparedClosure.Manifest.ManifestDigest != result.ManifestDigest ||
+		reference.FactHealth != RecoveryFactHealthComplete {
+		t.Fatalf("migrated reference changed identity or lost facts: %+v", reference)
+	}
+	if err := reference.ValidateAgainstRepository(ctx, reader.Repo, anchor); err != nil {
+		t.Fatalf("migrated reference does not validate: %v", err)
+	}
+	// The legacy source remains intact and independently readable.
+	if _, err := os.Stat(legacyPath); err != nil {
+		t.Fatalf("legacy source was removed during migration: %v", err)
+	}
+}
+
+func TestCleanInstallMigrationRejectsTamperedLegacyArtifact(t *testing.T) {
+	ctx := context.Background()
+	repoRoot, _, legacyPath, anchorPath, anchor, _ := cleanInstallFixture(t)
+	payload, err := os.ReadFile(legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(payload) < 2 {
+		t.Fatal("legacy recovery artifact unexpectedly empty")
+	}
+	payload[len(payload)/2] ^= 0x01
+	tamperedPath := filepath.Join(t.TempDir(), "tampered-legacy.json")
+	if err := os.WriteFile(tamperedPath, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reader := openCleanInstallReader(t, repoRoot, anchor)
+	destination := filepath.Join(t.TempDir(), "should-not-exist.json")
+	if _, err := reader.MigrateRecoveryArtifact(ctx, tamperedPath, anchorPath, destination, testPublicationDomain); err == nil {
+		t.Fatal("migration accepted a tampered legacy artifact")
+	}
+	if _, err := os.Stat(destination); !os.IsNotExist(err) {
+		t.Fatalf("migration wrote destination after rejection: stat error=%v", err)
+	}
+}
+
+func TestCleanInstallLegacyImportRejectsMissingExactPayload(t *testing.T) {
+	ctx := context.Background()
+	repoRoot, _, legacyPath, anchorPath, anchor, _ := cleanInstallFixture(t)
+	bundle, err := readRecoveryBundle(legacyPath)
+	if err != nil || len(bundle.PreparedClosure.PayloadReceipt.Objects) == 0 {
+		t.Fatalf("read legacy payload receipt: bundle=%+v err=%v", bundle, err)
+	}
+	contentID := bundle.PreparedClosure.PayloadReceipt.Objects[0].ContentID
+	hexDigest := strings.TrimPrefix(contentID, "sha256:")
+	if err := os.Remove(filepath.Join(repoRoot, "blobs", "sha256", hexDigest[:2], hexDigest)); err != nil {
+		t.Fatal(err)
+	}
+	reader := openCleanInstallReader(t, repoRoot, anchor)
+	if _, err := reader.ImportRecoveryBundle(ctx, legacyPath, anchorPath, testPublicationDomain); err == nil {
+		t.Fatal("legacy recovery import accepted a missing exact payload")
+	}
+	destination := filepath.Join(t.TempDir(), "should-not-exist.json")
+	if _, err := reader.MigrateRecoveryArtifact(ctx, legacyPath, anchorPath, destination, testPublicationDomain); err == nil {
+		t.Fatal("legacy migration accepted a missing exact payload")
+	}
+	if _, err := os.Stat(destination); !os.IsNotExist(err) {
+		t.Fatalf("migration wrote destination after missing-payload rejection: stat error=%v", err)
 	}
 }
 

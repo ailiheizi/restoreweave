@@ -409,6 +409,32 @@ func TestCLIStatusJSON(t *testing.T) {
 	}
 }
 
+func TestCollectSearchFiltersPreservesTypedLanguageAndSuffixFilters(t *testing.T) {
+	filters, err := collectSearchFilters([]string{"language=EN", "suffix=.TXT", "size_min=12"}, searchFilterFlags{})
+	if err != nil {
+		t.Fatalf("collect search filters: %v", err)
+	}
+	if filters["language"] != "EN" || filters["suffix"] != ".TXT" || filters["size_min"] != int64(12) {
+		t.Fatalf("collected filters = %#v", filters)
+	}
+
+	filters, err = collectSearchFilters(nil, searchFilterFlags{Language: "en", Suffix: ".flac"})
+	if err != nil || filters["language"] != "en" || filters["suffix"] != ".flac" {
+		t.Fatalf("flag filters = %#v, err=%v", filters, err)
+	}
+	if _, err := collectSearchFilters([]string{"language=en", "language=zh"}, searchFilterFlags{}); err == nil {
+		t.Fatal("duplicate language filter was accepted")
+	}
+	if _, err := collectSearchFilters([]string{"unsupported=value"}, searchFilterFlags{}); err == nil {
+		t.Fatal("unsupported filter was accepted")
+	}
+	zero := int64(0)
+	filters, err = collectSearchFilters(nil, searchFilterFlags{SizeMax: &zero})
+	if err != nil || filters["size_max"] != int64(0) {
+		t.Fatalf("explicit zero numeric filter = %#v, err=%v", filters, err)
+	}
+}
+
 func TestCLICapabilityList(t *testing.T) {
 	socketPath, _ := startDaemon(t)
 	code, stdout, _ := runCLI(t, "--socket", socketPath, "capability", "list")

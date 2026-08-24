@@ -99,6 +99,41 @@ func (s *Service) ReconcileIngestPublication(ctx context.Context, workspaceID, e
 	return result, nil
 }
 
+// ReconcileIngestPublicationCompletion first authenticates the already
+// committed root publication, then idempotently closes only its deterministic
+// post-commit children from durable terminal catalog rows. It never rescans
+// the source, re-runs a processor, replaces exact payloads, or signs a second
+// root publication.
+func (s *Service) ReconcileIngestPublicationCompletion(ctx context.Context, workspaceID, executionKey string) (IngestResult, error) {
+	result, err := s.ReconcileIngestPublication(ctx, workspaceID, executionKey)
+	if err != nil {
+		return result, err
+	}
+	if !s.signedPublicationEnabled() {
+		return result, nil
+	}
+	if s.Store == nil || strings.TrimSpace(result.PublicationCommitDigest) == "" {
+		return result, errors.New("signed post-commit reconciliation requires catalog terminal rows and a committed parent")
+	}
+	bundle, err := s.Store.ExportProcessorAttempts(ctx, workspaceID, result.SnapshotRef)
+	if err != nil {
+		return result, fmt.Errorf("inspect processor attempts for reconciliation: %w", err)
+	}
+	parsed, err := validateProcessorAttemptBundle(bundle, workspaceID, result.SnapshotRef)
+	if err != nil {
+		return result, err
+	}
+	if len(parsed.Attempts) > 0 {
+		if err := s.publishProcessorAttemptClosure(context.WithoutCancel(ctx), workspaceID, result.SnapshotRef, result.PublicationCommitDigest); err != nil {
+			return result, err
+		}
+	}
+	if err := s.publishPortableFactClosure(context.WithoutCancel(ctx), workspaceID, result.SnapshotRef, result.PublicationCommitDigest); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
 // preparedPublicationByPlanDigest finds a valid prepared closure that names an
 // execution key but has no committed marker. Such an object is evidence of an
 // interrupted publication, never evidence of a published snapshot.

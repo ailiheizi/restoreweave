@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // RootedFileSystem is a FileSystem whose every operation is resolved
@@ -102,6 +103,31 @@ func (fileSystem *RootedFileSystem) OpenDirNoFollow(path string) (ReadDirStatClo
 		return nil, os.ErrInvalid
 	}
 	return &rootedDirFile{capture: fileSystem.capture, file: file}, nil
+}
+
+// CaptureFilesystemFacts reads optional metadata through the same retained
+// root descriptor as traversal. It never reopens the display path from the
+// ambient process working directory.
+func (fileSystem *RootedFileSystem) CaptureFilesystemFacts(path string, kind EntryKind) FilesystemFacts {
+	now := time.Now().UTC()
+	if err := fileSystem.verifyRoot(); err != nil {
+		facts := emptyFilesystemFacts(now, kind)
+		facts.XAttrs.State = CaptureFactUnobserved
+		facts.XAttrs.ReasonCode = "CAPTURE_ROOT_UNAVAILABLE"
+		facts.ACLs.State = CaptureFactUnobserved
+		facts.ACLs.ReasonCode = "CAPTURE_ROOT_UNAVAILABLE"
+		return facts
+	}
+	rel, err := fileSystem.relative(path)
+	if err != nil {
+		facts := emptyFilesystemFacts(now, kind)
+		facts.XAttrs.State = CaptureFactUnobserved
+		facts.XAttrs.ReasonCode = "CAPTURE_PATH_INVALID"
+		facts.ACLs.State = CaptureFactUnobserved
+		facts.ACLs.ReasonCode = "CAPTURE_PATH_INVALID"
+		return facts
+	}
+	return captureRootedFilesystemFacts(fileSystem.capture.fd, rel, kind, now)
 }
 
 // rootedRegularFile is a no-follow regular-file handle. Stat revalidates the

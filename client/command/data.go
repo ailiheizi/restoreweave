@@ -415,43 +415,47 @@ type AnnotationExportData struct {
 // description revision. Segments are retained here as source material; any
 // embeddings or other retrieval generations remain rebuildable derivatives.
 type DescriptionDocumentData struct {
-	ID              string                `json:"description_document_id"`
-	WorkspaceID     string                `json:"workspace_id"`
-	SubjectRef      string                `json:"subject_ref"`
-	Kind            string                `json:"kind"`
-	Title           string                `json:"title,omitempty"`
-	Language        string                `json:"language"`
-	Body            string                `json:"body"`
-	BodyDigest      string                `json:"body_digest"`
-	SourceRef       string                `json:"source_ref,omitempty"`
-	ProducerProfile string                `json:"producer_profile,omitempty"`
-	Confidence      *float64              `json:"confidence,omitempty"`
-	Coverage        *float64              `json:"coverage,omitempty"`
-	Visibility      string                `json:"visibility"`
-	Accepted        bool                  `json:"accepted"`
-	Revision        int64                 `json:"revision"`
-	PredecessorID   string                `json:"predecessor_id,omitempty"`
-	Metadata        json.RawMessage       `json:"metadata,omitempty"`
-	CreatedAt       string                `json:"created_at,omitempty"`
-	UpdatedAt       string                `json:"updated_at,omitempty"`
-	Segments        []SemanticSegmentData `json:"segments"`
+	ID                    string                `json:"description_document_id"`
+	WorkspaceID           string                `json:"workspace_id"`
+	SubjectRef            string                `json:"subject_ref"`
+	Kind                  string                `json:"kind"`
+	Title                 string                `json:"title,omitempty"`
+	Language              string                `json:"language"`
+	Body                  string                `json:"body"`
+	BodyDigest            string                `json:"body_digest"`
+	SourceRef             string                `json:"source_ref,omitempty"`
+	ProducerProfile       string                `json:"producer_profile,omitempty"`
+	ConfigDigest          string                `json:"config_digest,omitempty"`
+	ProducerProfileDigest string                `json:"producer_profile_digest,omitempty"`
+	Confidence            *float64              `json:"confidence,omitempty"`
+	Coverage              *float64              `json:"coverage,omitempty"`
+	Visibility            string                `json:"visibility"`
+	Accepted              bool                  `json:"accepted"`
+	Revision              int64                 `json:"revision"`
+	PredecessorID         string                `json:"predecessor_id,omitempty"`
+	Metadata              json.RawMessage       `json:"metadata,omitempty"`
+	CreatedAt             string                `json:"created_at,omitempty"`
+	UpdatedAt             string                `json:"updated_at,omitempty"`
+	Segments              []SemanticSegmentData `json:"segments"`
 }
 
 // SemanticSegmentData is an ordered, provenance-bearing source span of a
 // description document. SourceSpan uses byte offsets into Body.
 type SemanticSegmentData struct {
-	ID          string          `json:"semantic_segment_id"`
-	WorkspaceID string          `json:"workspace_id"`
-	DocumentID  string          `json:"description_document_id"`
-	SubjectRef  string          `json:"subject_ref"`
-	Ordinal     int64           `json:"ordinal"`
-	Text        string          `json:"text"`
-	TextDigest  string          `json:"text_digest"`
-	Language    string          `json:"language"`
-	Section     string          `json:"section,omitempty"`
-	SourceSpan  json.RawMessage `json:"source_span"`
-	Metadata    json.RawMessage `json:"metadata,omitempty"`
-	CreatedAt   string          `json:"created_at,omitempty"`
+	ID                        string          `json:"semantic_segment_id"`
+	WorkspaceID               string          `json:"workspace_id"`
+	DocumentID                string          `json:"description_document_id"`
+	SubjectRef                string          `json:"subject_ref"`
+	Ordinal                   int64           `json:"ordinal"`
+	Text                      string          `json:"text"`
+	TextDigest                string          `json:"text_digest"`
+	Language                  string          `json:"language"`
+	Section                   string          `json:"section,omitempty"`
+	SourceSpan                json.RawMessage `json:"source_span"`
+	Metadata                  json.RawMessage `json:"metadata,omitempty"`
+	DocumentRevision          int64           `json:"document_revision"`
+	SegmentationProfileDigest string          `json:"segmentation_profile_digest,omitempty"`
+	CreatedAt                 string          `json:"created_at,omitempty"`
 }
 
 type DescriptionListData struct {
@@ -462,23 +466,25 @@ type DescriptionListData struct {
 // DescriptionSummaryData is the bounded description.list projection. Full
 // body text and segments are available from description.get.
 type DescriptionSummaryData struct {
-	ID              string   `json:"description_document_id"`
-	WorkspaceID     string   `json:"workspace_id"`
-	SubjectRef      string   `json:"subject_ref"`
-	Kind            string   `json:"kind"`
-	Title           string   `json:"title,omitempty"`
-	Language        string   `json:"language"`
-	BodyDigest      string   `json:"body_digest"`
-	SourceRef       string   `json:"source_ref,omitempty"`
-	ProducerProfile string   `json:"producer_profile,omitempty"`
-	Confidence      *float64 `json:"confidence,omitempty"`
-	Coverage        *float64 `json:"coverage,omitempty"`
-	Visibility      string   `json:"visibility"`
-	Accepted        bool     `json:"accepted"`
-	Revision        int64    `json:"revision"`
-	PredecessorID   string   `json:"predecessor_id,omitempty"`
-	CreatedAt       string   `json:"created_at,omitempty"`
-	UpdatedAt       string   `json:"updated_at,omitempty"`
+	ID                    string   `json:"description_document_id"`
+	WorkspaceID           string   `json:"workspace_id"`
+	SubjectRef            string   `json:"subject_ref"`
+	Kind                  string   `json:"kind"`
+	Title                 string   `json:"title,omitempty"`
+	Language              string   `json:"language"`
+	BodyDigest            string   `json:"body_digest"`
+	SourceRef             string   `json:"source_ref,omitempty"`
+	ProducerProfile       string   `json:"producer_profile,omitempty"`
+	ConfigDigest          string   `json:"config_digest,omitempty"`
+	ProducerProfileDigest string   `json:"producer_profile_digest,omitempty"`
+	Confidence            *float64 `json:"confidence,omitempty"`
+	Coverage              *float64 `json:"coverage,omitempty"`
+	Visibility            string   `json:"visibility"`
+	Accepted              bool     `json:"accepted"`
+	Revision              int64    `json:"revision"`
+	PredecessorID         string   `json:"predecessor_id,omitempty"`
+	CreatedAt             string   `json:"created_at,omitempty"`
+	UpdatedAt             string   `json:"updated_at,omitempty"`
 }
 
 type DescriptionGetData struct {
@@ -490,13 +496,30 @@ type DescriptionCreateData struct {
 }
 
 type SearchHitData struct {
-	SubjectRef    string   `json:"subject_ref"`
-	Path          string   `json:"path"`
-	Name          string   `json:"name"`
-	EntryType     string   `json:"entry_type"`
-	ContentID     string   `json:"content_id,omitempty"`
-	ConstructAxes []string `json:"construct_axes,omitempty"`
-	Dimensions    []string `json:"dimensions,omitempty"`
+	SubjectRef    string              `json:"subject_ref"`
+	Path          string              `json:"path"`
+	Name          string              `json:"name"`
+	EntryType     string              `json:"entry_type"`
+	ContentID     string              `json:"content_id,omitempty"`
+	ConstructAxes []string            `json:"construct_axes,omitempty"`
+	Dimensions    []string            `json:"dimensions,omitempty"`
+	Segments      []SearchSegmentData `json:"segments,omitempty"`
+}
+
+// SearchSegmentData preserves the description segment and provenance that
+// produced a search hit. Segment text is a matched source span, not a new
+// description or an exact-identity claim.
+type SearchSegmentData struct {
+	DescriptionDocumentID string `json:"description_document_id,omitempty"`
+	SourceType            string `json:"source_type,omitempty"`
+	SourceID              string `json:"source_id,omitempty"`
+	SegmentID             string `json:"semantic_segment_id"`
+	Ordinal               int64  `json:"ordinal"`
+	MatchedText           string `json:"matched_text"`
+	Kind                  string `json:"kind"`
+	Producer              string `json:"producer"`
+	Accepted              bool   `json:"accepted"`
+	Language              string `json:"language"`
 }
 
 type SearchComponentData struct {
@@ -659,17 +682,62 @@ type RecoveryTokenExportInput struct {
 // publication, and trust-anchor reference. It is a pointer and proof, never
 // the payload.
 type RecoveryTokenData struct {
+	// The legacy top-level token fields remain populated with the first token
+	// for compatibility. Subject-scope callers should consume Tokens.
+	TokenSchema          string                   `json:"token_schema"`
+	SnapshotRef          string                   `json:"snapshot_ref"`
+	PublicationDomain    string                   `json:"publication_domain,omitempty"`
+	SubjectRef           string                   `json:"subject_ref"`
+	RecoveryReferenceID  string                   `json:"recovery_reference_id"`
+	ReferenceKind        string                   `json:"reference_kind,omitempty"`
+	ProtectionClaim      string                   `json:"protection_claim,omitempty"`
+	ExpectedContentID    string                   `json:"expected_content_id,omitempty"`
+	ExpectedLength       int64                    `json:"expected_length,omitempty"`
+	RecipeDigest         string                   `json:"recipe_digest,omitempty"`
+	LocatorSetDigest     string                   `json:"locator_set_digest,omitempty"`
+	PublicationCommitRef string                   `json:"publication_commit_ref"`
+	TrustAnchorRef       string                   `json:"trust_anchor_ref"`
+	Expiry               string                   `json:"expiry,omitempty"`
+	TokenDigest          string                   `json:"token_digest"`
+	TokenSetSchema       string                   `json:"token_set_schema,omitempty"`
+	SubjectPath          string                   `json:"subject_path,omitempty"`
+	ProtectionOutcome    string                   `json:"protection_outcome,omitempty"`
+	Tokens               []RecoveryTokenItemData  `json:"tokens"`
+	Unprotected          *RecoveryUnprotectedData `json:"unprotected,omitempty"`
+	TokenSetDigest       string                   `json:"token_set_digest,omitempty"`
+}
+
+// RecoveryTokenItemData is one token in a subject-scope recovery export.
+type RecoveryTokenItemData struct {
 	TokenSchema          string `json:"token_schema"`
 	SnapshotRef          string `json:"snapshot_ref"`
+	PublicationDomain    string `json:"publication_domain"`
 	SubjectRef           string `json:"subject_ref"`
 	RecoveryReferenceID  string `json:"recovery_reference_id"`
+	ReferenceKind        string `json:"reference_kind"`
+	ProtectionClaim      string `json:"protection_claim"`
 	ExpectedContentID    string `json:"expected_content_id,omitempty"`
 	ExpectedLength       int64  `json:"expected_length,omitempty"`
 	RecipeDigest         string `json:"recipe_digest,omitempty"`
+	LocatorSetDigest     string `json:"locator_set_digest,omitempty"`
 	PublicationCommitRef string `json:"publication_commit_ref"`
 	TrustAnchorRef       string `json:"trust_anchor_ref"`
 	Expiry               string `json:"expiry,omitempty"`
 	TokenDigest          string `json:"token_digest"`
+}
+
+// RecoveryUnprotectedData makes a metadata-only outcome explicit. It is not
+// a recovery token and must never be rendered as a restore route.
+type RecoveryUnprotectedData struct {
+	Schema               string `json:"schema"`
+	SnapshotRef          string `json:"snapshot_ref"`
+	SubjectRef           string `json:"subject_ref"`
+	SubjectPath          string `json:"subject_path"`
+	ProtectionMode       string `json:"protection_mode"`
+	ProtectionOutcome    string `json:"protection_outcome"`
+	ReasonCode           string `json:"reason_code,omitempty"`
+	ExpectedLogicalBytes *int64 `json:"expected_logical_bytes,omitempty"`
+	RecordDigest         string `json:"record_digest"`
 }
 
 // ViewSaveInput is the view.save input.

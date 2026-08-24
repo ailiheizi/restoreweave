@@ -50,6 +50,7 @@ func relocateSizedRepository(t *testing.T, zstd bool) (service *Service, movedRo
 	service = &Service{
 		Store: store, Repo: repo, SigningIdentity: &identity, TrustAnchor: &anchor,
 		PublicationDomain: testPublicationDomain, RequireSignedPublication: true,
+		ConfigDigest: "sha256:exact-test-config",
 	}
 	plan, err := service.InspectIngest(ctx, source, IngestOptions{})
 	if err != nil {
@@ -93,6 +94,7 @@ func relocateSizedRepository(t *testing.T, zstd bool) (service *Service, movedRo
 	doc := sqlite.DescriptionDocument{
 		ID: docID, WorkspaceID: result.WorkspaceID, SubjectRef: subject,
 		Kind: sqlite.DescriptionUser, Language: "en", Body: "relocated description body", SourceRef: "user:relocation",
+		ConfigDigest: result.ConfigDigest,
 	}
 	if err := store.InsertDescriptionDocument(ctx, &doc); err != nil {
 		t.Fatal(err)

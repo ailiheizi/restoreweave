@@ -18,6 +18,10 @@ import (
 
 func addClosureTestAttempt(t *testing.T, fixture signedPublicationFixture, result IngestResult) {
 	t.Helper()
+	existing, err := fixture.store.ListProcessorAttempts(context.Background(), result.WorkspaceID, result.SnapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
 	attemptID, err := sqlite.NewStableID(sqlite.IDPrefixAttempt)
 	if err != nil {
 		t.Fatal(err)
@@ -29,10 +33,231 @@ func addClosureTestAttempt(t *testing.T, fixture signedPublicationFixture, resul
 		CapabilityID: "extract.text.v1", Status: "FAILED", ReasonCode: "PROCESSOR_STAGE_FAILED",
 		Reason: "fixture failure", Provenance: json.RawMessage(`{"source_content_id":"sha256:content"}`),
 		FenceToken: 1, ProcessorDigest: "sha256:processor",
-		CreatedAt: time.Unix(1, 0).UTC(), FinishedAt: time.Unix(2, 0).UTC(),
+		CreatedAt: time.Unix(int64(len(existing))*2+1, 0).UTC(), FinishedAt: time.Unix(int64(len(existing))*2+2, 0).UTC(),
 	}
 	if err := fixture.store.InsertProcessorAttempt(context.Background(), attempt); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestProcessorAttemptClosurePublishesCompleteStateSuccessor(t *testing.T) {
+	fixture := newSignedPublicationFixture(t, "retry-lineage.txt", []byte("retry lineage"))
+	result := fixture.ingest(t, "sha256:retry-lineage-plan")
+	addClosureTestAttempt(t, fixture, result)
+	if err := fixture.service.PublishProcessorAttemptClosure(context.Background(), result.WorkspaceID, result.SnapshotRef, result.PublicationCommitDigest); err != nil {
+		t.Fatal(err)
+	}
+	addClosureTestAttempt(t, fixture, result)
+	if err := fixture.service.PublishProcessorAttemptClosure(context.Background(), result.WorkspaceID, result.SnapshotRef, result.PublicationCommitDigest); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := &Service{Repo: fixture.repo, TrustAnchor: fixture.service.TrustAnchor, PublicationDomain: testPublicationDomain, RequireSignedPublication: true}
+	closures, err := reader.ListProcessorAttemptClosures(context.Background(), result.SnapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(closures) != 2 || closures[0].Closure.ClosureSequence != 1 || closures[1].Closure.ClosureSequence != 2 || closures[1].Closure.AttemptCount != 2 {
+		t.Fatalf("processor attempt successor chain = %+v", closures)
+	}
+	firstClosureDigest, err := closures[0].Closure.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closures[1].Closure.PredecessorClosureDigest != firstClosureDigest {
+		t.Fatalf("successor predecessor = %q, want %q", closures[1].Closure.PredecessorClosureDigest, firstClosureDigest)
+	}
+}
+
+func TestProcessorAttemptClosureRejectsInvalidSuccessorLineage(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*ProcessorAttemptClosureEnvelope)
+		want   string
+	}{
+		{
+			name: "broken predecessor",
+			mutate: func(envelope *ProcessorAttemptClosureEnvelope) {
+				envelope.Closure.PredecessorClosureDigest = "sha256:" + strings.Repeat("f", 64)
+			},
+			want: "successor lineage is invalid",
+		},
+		{
+			name: "rewritten history",
+			mutate: func(envelope *ProcessorAttemptClosureEnvelope) {
+				var bundle processorAttemptBundle
+				if err := json.Unmarshal(envelope.Bundle, &bundle); err != nil {
+					t.Fatal(err)
+				}
+				bundle.Attempts[0].Reason = "rewritten failure"
+				payload, err := json.Marshal(bundle)
+				if err != nil {
+					t.Fatal(err)
+				}
+				envelope.Bundle = payload
+				envelope.Closure.AttemptBundleDigest = DigestBytes(payload)
+				envelope.Closure.AttemptBundleLength = int64(len(payload))
+			},
+			want: "rewrites authenticated history",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newSignedPublicationFixture(t, "invalid-successor.txt", []byte("invalid successor"))
+			result := fixture.ingest(t, "sha256:invalid-successor-plan")
+			addClosureTestAttempt(t, fixture, result)
+			if err := fixture.service.PublishProcessorAttemptClosure(context.Background(), result.WorkspaceID, result.SnapshotRef, result.PublicationCommitDigest); err != nil {
+				t.Fatal(err)
+			}
+			addClosureTestAttempt(t, fixture, result)
+			if err := fixture.service.PublishProcessorAttemptClosure(context.Background(), result.WorkspaceID, result.SnapshotRef, result.PublicationCommitDigest); err != nil {
+				t.Fatal(err)
+			}
+
+			digests, err := fixture.repo.ListRecordDigests(context.Background(), repository.RecordProcessorAttemptClosure)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var successorDigest string
+			var successor ProcessorAttemptClosureEnvelope
+			for _, digest := range digests {
+				payload, err := readRecord(context.Background(), fixture.repo, repository.RecordProcessorAttemptClosure, digest)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var envelope ProcessorAttemptClosureEnvelope
+				if err := decodeStrictRecord(payload, &envelope); err != nil {
+					t.Fatal(err)
+				}
+				if envelope.Closure.ClosureSequence == 2 {
+					successorDigest, successor = digest, envelope
+				}
+			}
+			if successorDigest == "" {
+				t.Fatal("missing processor attempt successor fixture")
+			}
+			if err := os.Remove(recordRelocationPath(t, fixture.repo.Root(), repository.RecordProcessorAttemptClosure, successorDigest)); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(&successor)
+			successor.Closure.Signature = nil
+			successor.Closure, err = SignProcessorAttemptClosure(*fixture.service.SigningIdentity, successor.Closure)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload, err := CanonicalJSON(successor)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.repo.PlaceRecord(context.Background(), repository.RecordProcessorAttemptClosure, bytes.NewReader(payload)); err != nil {
+				t.Fatal(err)
+			}
+			reader := &Service{Repo: fixture.repo, TrustAnchor: fixture.service.TrustAnchor, PublicationDomain: testPublicationDomain, RequireSignedPublication: true}
+			if _, err := reader.ListProcessorAttemptClosures(context.Background(), result.SnapshotRef); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("invalid successor error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestProcessorAttemptClosureRejectsForkedSuccessor(t *testing.T) {
+	fixture := newSignedPublicationFixture(t, "forked-successor.txt", []byte("forked successor"))
+	result := fixture.ingest(t, "sha256:forked-successor-plan")
+	addClosureTestAttempt(t, fixture, result)
+	if err := fixture.service.PublishProcessorAttemptClosure(context.Background(), result.WorkspaceID, result.SnapshotRef, result.PublicationCommitDigest); err != nil {
+		t.Fatal(err)
+	}
+	addClosureTestAttempt(t, fixture, result)
+	if err := fixture.service.PublishProcessorAttemptClosure(context.Background(), result.WorkspaceID, result.SnapshotRef, result.PublicationCommitDigest); err != nil {
+		t.Fatal(err)
+	}
+	closures, err := fixture.service.ListProcessorAttemptClosures(context.Background(), result.SnapshotRef)
+	if err != nil || len(closures) != 2 {
+		t.Fatalf("processor closure chain = %+v, err=%v", closures, err)
+	}
+	fork := closures[1]
+	var bundle processorAttemptBundle
+	if err := json.Unmarshal(fork.Bundle, &bundle); err != nil {
+		t.Fatal(err)
+	}
+	bundle.Attempts[1].Reason = "different signed successor"
+	fork.Bundle, err = json.Marshal(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fork.Closure.AttemptBundleDigest = DigestBytes(fork.Bundle)
+	fork.Closure.AttemptBundleLength = int64(len(fork.Bundle))
+	fork.Closure.Signature = nil
+	fork.Closure, err = SignProcessorAttemptClosure(*fixture.service.SigningIdentity, fork.Closure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := CanonicalJSON(fork)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.repo.PlaceRecord(context.Background(), repository.RecordProcessorAttemptClosure, bytes.NewReader(payload)); err != nil {
+		t.Fatal(err)
+	}
+	reader := &Service{Repo: fixture.repo, TrustAnchor: fixture.service.TrustAnchor, PublicationDomain: testPublicationDomain, RequireSignedPublication: true}
+	if _, err := reader.ListProcessorAttemptClosures(context.Background(), result.SnapshotRef); err == nil || !strings.Contains(err.Error(), "sequence is missing or conflicting") {
+		t.Fatalf("forked successor error = %v", err)
+	}
+}
+
+func TestProcessorAttemptClosureV2SucceedsLegacyV1Root(t *testing.T) {
+	fixture := newSignedPublicationFixture(t, "legacy-attempt-root.txt", []byte("legacy attempt root"))
+	result := fixture.ingest(t, "sha256:legacy-attempt-root-plan")
+	addClosureTestAttempt(t, fixture, result)
+	if err := fixture.service.PublishProcessorAttemptClosure(context.Background(), result.WorkspaceID, result.SnapshotRef, result.PublicationCommitDigest); err != nil {
+		t.Fatal(err)
+	}
+	digests, err := fixture.repo.ListRecordDigests(context.Background(), repository.RecordProcessorAttemptClosure)
+	if err != nil || len(digests) != 1 {
+		t.Fatalf("processor closure digests = %v, err=%v", digests, err)
+	}
+	payload, err := readRecord(context.Background(), fixture.repo, repository.RecordProcessorAttemptClosure, digests[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacy ProcessorAttemptClosureEnvelope
+	if err := decodeStrictRecord(payload, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(recordRelocationPath(t, fixture.repo.Root(), repository.RecordProcessorAttemptClosure, digests[0])); err != nil {
+		t.Fatal(err)
+	}
+	legacy.Closure.Schema = ProcessorAttemptClosureSchemaV1
+	legacy.Closure.ClosureSequence = 0
+	legacy.Closure.PredecessorClosureDigest = ""
+	legacy.Closure.Signature = nil
+	legacy.Closure, err = SignProcessorAttemptClosure(*fixture.service.SigningIdentity, legacy.Closure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyPayload, err := CanonicalJSON(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.repo.PlaceRecord(context.Background(), repository.RecordProcessorAttemptClosure, bytes.NewReader(legacyPayload)); err != nil {
+		t.Fatal(err)
+	}
+
+	addClosureTestAttempt(t, fixture, result)
+	if err := fixture.service.PublishProcessorAttemptClosure(context.Background(), result.WorkspaceID, result.SnapshotRef, result.PublicationCommitDigest); err != nil {
+		t.Fatal(err)
+	}
+	reader := &Service{Repo: fixture.repo, TrustAnchor: fixture.service.TrustAnchor, PublicationDomain: testPublicationDomain, RequireSignedPublication: true}
+	closures, err := reader.ListProcessorAttemptClosures(context.Background(), result.SnapshotRef)
+	if err != nil || len(closures) != 2 {
+		t.Fatalf("legacy successor chain = %+v, err=%v", closures, err)
+	}
+	legacyDigest, err := closures[0].Closure.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closures[0].Closure.Schema != ProcessorAttemptClosureSchemaV1 || closures[1].Closure.Schema != ProcessorAttemptClosureSchemaV2 ||
+		closures[1].Closure.ClosureSequence != 2 || closures[1].Closure.PredecessorClosureDigest != legacyDigest {
+		t.Fatalf("legacy successor chain = %+v", closures)
 	}
 }
 
@@ -227,6 +452,49 @@ func TestProcessorAttemptClosureRejectsConflictingReplay(t *testing.T) {
 	if _, err := reader.ListProcessorAttemptClosures(context.Background(), result.SnapshotRef); err == nil ||
 		!strings.Contains(err.Error(), "conflicting") {
 		t.Fatal("conflicting processor closure was accepted")
+	}
+}
+
+func TestProcessorAttemptClosureRejectsMismatchedAttemptBundleSchema(t *testing.T) {
+	fixture := newSignedPublicationFixture(t, "attempt-schema.txt", []byte("attempt schema"))
+	result := fixture.ingest(t, "sha256:attempt-schema-plan")
+	addClosureTestAttempt(t, fixture, result)
+	if err := fixture.service.publishProcessorAttemptClosure(context.Background(), result.WorkspaceID, result.SnapshotRef, result.PublicationCommitDigest); err != nil {
+		t.Fatal(err)
+	}
+	digests, err := fixture.repo.ListRecordDigests(context.Background(), repository.RecordProcessorAttemptClosure)
+	if err != nil || len(digests) != 1 {
+		t.Fatalf("processor closure digests = %v, err=%v", digests, err)
+	}
+	payload, err := readRecord(context.Background(), fixture.repo, repository.RecordProcessorAttemptClosure, digests[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope ProcessorAttemptClosureEnvelope
+	if err := decodeStrictRecord(payload, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(recordRelocationPath(t, fixture.repo.Root(), repository.RecordProcessorAttemptClosure, digests[0])); err != nil {
+		t.Fatal(err)
+	}
+	envelope.Closure.AttemptBundleSchema = "restoreweave.processor-attempts/v2"
+	envelope.Closure.Signature = nil
+	signed, err := SignProcessorAttemptClosure(*fixture.service.SigningIdentity, envelope.Closure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := CanonicalJSON(ProcessorAttemptClosureEnvelope{
+		Schema: ProcessorAttemptClosureEnvelopeSchemaV1, Closure: signed, Bundle: envelope.Bundle,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.repo.PlaceRecord(context.Background(), repository.RecordProcessorAttemptClosure, bytes.NewReader(replacement)); err != nil {
+		t.Fatal(err)
+	}
+	reader := &Service{Repo: fixture.repo, TrustAnchor: fixture.service.TrustAnchor, PublicationDomain: testPublicationDomain, RequireSignedPublication: true}
+	if _, err := reader.ListProcessorAttemptClosures(context.Background(), result.SnapshotRef); err == nil {
+		t.Fatal("processor closure with a mismatched attempt bundle schema was accepted")
 	}
 }
 

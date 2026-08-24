@@ -176,7 +176,7 @@ func (d *Dispatcher) handlePlanApply(ctx context.Context, env command.Envelope, 
 		return catalogErrorResult(env, started, err)
 	}
 	if !claimed {
-		return d.replayPlanApplyJob(env, started, record, job)
+		return d.replayPlanApplyJob(ctx, env, started, record, body, job)
 	}
 
 	data, applyErr := d.executePlanBody(ctx, record, body)
@@ -184,10 +184,18 @@ func (d *Dispatcher) handlePlanApply(ctx context.Context, env command.Envelope, 
 	if applyErr != nil {
 		code := planApplyReasonCode(applyErr)
 		state := sqlite.JobFailed
-		if errors.Is(applyErr, exact.ErrUnknownExternalOutcome) {
+		if errors.Is(applyErr, exact.ErrUnknownExternalOutcome) || errors.Is(applyErr, exact.ErrNeedsReconciliation) {
 			state = sqlite.JobNeedsReconcile
 		}
-		if err := d.finishPlanApplyJob(ctx, env, job, state, data, code, applyErr.Error()); err != nil {
+		finishCtx := ctx
+		if state == sqlite.JobNeedsReconcile {
+			// The operation may have crossed an external durability boundary
+			// before its request context expired. Persist the reconciliation state
+			// with a detached context so the next plan.apply can reconcile the
+			// immutable publication instead of replaying the mutating lane.
+			finishCtx = context.WithoutCancel(ctx)
+		}
+		if err := d.finishPlanApplyJob(finishCtx, env, job, state, data, code, applyErr.Error()); err != nil {
 			return catalogErrorResult(env, started, err)
 		}
 		if state == sqlite.JobNeedsReconcile {
@@ -310,7 +318,7 @@ func (d *Dispatcher) executePlanBody(ctx context.Context, plan sqlite.Plan, body
 		// PLAN_APPLY job records its result. The publication's plan digest is
 		// the execution key; recover that result before rescanning or creating
 		// another snapshot/publication.
-		result, reconcileErr := d.exact.ReconcileIngestPublication(ctx, plan.WorkspaceID, plan.PlanDigest)
+		result, reconcileErr := d.exact.ReconcileIngestPublicationCompletion(ctx, plan.WorkspaceID, plan.PlanDigest)
 		if reconcileErr == nil {
 			return planApplyDataFromIngestResult(plan, result), nil
 		}
@@ -319,10 +327,17 @@ func (d *Dispatcher) executePlanBody(ctx context.Context, plan sqlite.Plan, body
 		}
 		result, err := d.exact.ApplyIngestPlanWithExecutionKey(ctx, *body.Ingest, plan.PlanDigest)
 		if err != nil {
+			// A root commit can be fully durable while a deterministic
+			// post-commit child still has an unknown placement outcome. Preserve
+			// the authenticated partial result so the job becomes durably
+			// reconcilable; do not collapse it to root-only success below.
+			if (errors.Is(err, exact.ErrUnknownExternalOutcome) || errors.Is(err, exact.ErrNeedsReconciliation)) && result.PublicationCommitDigest != "" {
+				return planApplyDataFromIngestResult(plan, result), err
+			}
 			// A concurrent publisher may have won the unique execution-key
 			// constraint after the first lookup. Reconcile its committed result
 			// instead of allowing this retry to publish a second snapshot.
-			if recovered, recoverErr := d.exact.ReconcileIngestPublication(ctx, plan.WorkspaceID, plan.PlanDigest); recoverErr == nil {
+			if recovered, recoverErr := d.exact.ReconcileIngestPublicationCompletion(ctx, plan.WorkspaceID, plan.PlanDigest); recoverErr == nil {
 				return planApplyDataFromIngestResult(plan, recovered), nil
 			}
 			return data, err
@@ -404,9 +419,11 @@ func (d *Dispatcher) finishPlanApplyJob(
 }
 
 func (d *Dispatcher) replayPlanApplyJob(
+	ctx context.Context,
 	env command.Envelope,
 	started time.Time,
 	plan sqlite.Plan,
+	body planBody,
 	job sqlite.Job,
 ) command.Result {
 	var stored planApplyJobResult
@@ -430,6 +447,43 @@ func (d *Dispatcher) replayPlanApplyJob(
 		message := firstNonEmpty(stored.Error, "plan apply previously failed")
 		return failed(env, started, newReason(code, message))
 	case sqlite.JobNeedsReconcile:
+		// A reconciliation retry is deliberately read-only. It may promote the
+		// existing job only after the immutable publication/output evidence is
+		// complete and bound to this exact execution key. It must never fall
+		// through to Apply* and create a second publication or overwrite an
+		// ambiguous destination.
+		if d.exact != nil {
+			switch body.Kind {
+			case "INGEST":
+				if reconciled, err := d.exact.ReconcileIngestPublicationCompletion(ctx, plan.WorkspaceID, plan.PlanDigest); err == nil {
+					data := planApplyDataFromIngestResult(plan, reconciled)
+					data.JobID = job.ID
+					data.AlreadyApplied = true
+					if finishErr := d.finishPlanApplyJob(ctx, env, job, sqlite.JobSucceeded, data, "", ""); finishErr != nil {
+						return catalogErrorResult(env, started, finishErr)
+					}
+					if len(data.Warnings) > 0 {
+						return degradedResult(env, started, data, "exact publication succeeded, but post-publication processing is unavailable: "+strings.Join(data.Warnings, "; "))
+					}
+					return succeeded(env, started, data)
+				}
+			case "RESTORE":
+				if body.Restore != nil {
+					if reconciled, err := d.exact.ReconcileRestorePlan(ctx, *body.Restore); err == nil {
+						data := command.PlanApplyData{
+							PlanID: plan.ID, PlanDigest: plan.PlanDigest, JobID: job.ID,
+							State: string(sqlite.JobSucceeded), AlreadyApplied: true,
+							SnapshotRef: reconciled.SnapshotRef, Destination: reconciled.Destination,
+							Files: reconciled.Files, Bytes: reconciled.Bytes,
+						}
+						if finishErr := d.finishPlanApplyJob(ctx, env, job, sqlite.JobSucceeded, data, "", ""); finishErr != nil {
+							return catalogErrorResult(env, started, finishErr)
+						}
+						return succeeded(env, started, data)
+					}
+				}
+			}
+		}
 		message := firstNonEmpty(stored.Error, "plan apply requires external outcome reconciliation")
 		return unknownExternalOutcomeResult(env, started, errors.New(message))
 	case sqlite.JobCancelled:

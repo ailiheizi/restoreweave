@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ailiheizi/restoreweave/server/internal/repository"
@@ -27,6 +28,8 @@ const (
 	FallbackFenceToken = 1
 )
 
+var publicationFenceRenewInterval = DefaultPublicationFenceTTL / 3
+
 // PublicationFencer is the optional cross-process publication lease seam.
 // When nil, exact.Service serializes publication with its in-process
 // publicationMu and stamps signed records with FallbackFenceToken.
@@ -34,7 +37,9 @@ type PublicationFencer interface {
 	// Acquire leases publicationDomain for owner using the opaque leaseToken.
 	// now and until define the lease window. A successful acquisition returns
 	// the strictly increasing fencing token that must be bound into every
-	// signed record published under the lease.
+	// signed record published under the lease. Repeating an active request with
+	// the same owner and leaseToken renews the window without changing its
+	// fencing token.
 	Acquire(ctx context.Context, publicationDomain, owner, leaseToken string, now, until time.Time) (token int64, err error)
 	// Validate confirms that the exact owner, leaseToken, and fencingToken
 	// still hold the domain at now. It must be checked immediately before
@@ -168,6 +173,9 @@ type publicationLease struct {
 	leaseToken        string
 	coordinationToken int64 // optional SQLite/external lease token
 	publicationLock   io.Closer
+	operationCtx      context.Context
+	stopKeepalive     func() error
+	keepaliveError    func() error
 	release           func() error
 }
 
@@ -205,26 +213,109 @@ func (s *Service) acquirePublicationFence(ctx context.Context) (publicationLease
 		}
 		lineageToken = uint64(coordinationToken)
 	}
+	operationCtx, cancel := context.WithCancel(ctx)
+	keepaliveDone := make(chan struct{})
+	var keepaliveMu sync.Mutex
+	var keepaliveErr error
+	stopKeepalive := func() error {
+		cancel()
+		<-keepaliveDone
+		keepaliveMu.Lock()
+		defer keepaliveMu.Unlock()
+		return keepaliveErr
+	}
+	if fencer == nil {
+		close(keepaliveDone)
+	} else {
+		go func() {
+			ticker := time.NewTicker(publicationFenceRenewInterval)
+			defer ticker.Stop()
+			defer close(keepaliveDone)
+			for {
+				select {
+				case <-operationCtx.Done():
+					return
+				case <-ticker.C:
+					renewErr := s.renewPublicationFence(operationCtx, publicationLease{leaseToken: leaseToken, coordinationToken: coordinationToken})
+					if renewErr != nil {
+						if operationCtx.Err() != nil {
+							return
+						}
+						keepaliveMu.Lock()
+						keepaliveErr = fmt.Errorf("renew publication fence: %w", renewErr)
+						keepaliveMu.Unlock()
+						cancel()
+						return
+					}
+				}
+			}
+		}()
+	}
 	return publicationLease{
 		token: lineageToken, coordinationToken: coordinationToken, leaseToken: leaseToken, publicationLock: publicationLock,
+		operationCtx: operationCtx, stopKeepalive: stopKeepalive, keepaliveError: func() error {
+			keepaliveMu.Lock()
+			defer keepaliveMu.Unlock()
+			return keepaliveErr
+		},
 		release: func() error {
+			keepaliveErr := stopKeepalive()
 			var releaseErr error
 			if fencer != nil {
-				releaseErr = fencer.Release(ctx, s.publicationFenceDomain(), s.publicationOwner(), leaseToken, coordinationToken, s.now())
+				releaseErr = fencer.Release(context.WithoutCancel(ctx), s.publicationFenceDomain(), s.publicationOwner(), leaseToken, coordinationToken, s.now())
 			}
 			if publicationLock != nil {
 				if lockErr := publicationLock.Close(); releaseErr == nil {
 					releaseErr = lockErr
 				}
 			}
-			return releaseErr
+			return errors.Join(keepaliveErr, releaseErr)
 		},
 	}, nil
+}
+
+// renewPublicationFence extends the current lease without changing its
+// fencing token. A changed token means another owner took over and is treated
+// as a fencing failure rather than silently adopting the new authority.
+func (s *Service) renewPublicationFence(ctx context.Context, lease publicationLease) error {
+	fencer := s.fencer()
+	if fencer == nil {
+		return nil
+	}
+	now := s.now()
+	renewed, err := fencer.Acquire(ctx, s.publicationFenceDomain(), s.publicationOwner(), lease.leaseToken, now, now.Add(DefaultPublicationFenceTTL))
+	if err != nil {
+		return err
+	}
+	if renewed != lease.coordinationToken {
+		return fmt.Errorf("publication fence renewal returned token %d, want %d", renewed, lease.coordinationToken)
+	}
+	return nil
+}
+
+// context returns a cancellation-aware context for all signed placement work.
+// A failed renewal cancels this context so repositories that honor context do
+// not continue a placement after another owner has taken over the lease.
+func (l publicationLease) context() context.Context {
+	if l.operationCtx != nil {
+		return l.operationCtx
+	}
+	return context.Background()
+}
+
+func (l publicationLease) renewalError() error {
+	if l.keepaliveError == nil {
+		return nil
+	}
+	return l.keepaliveError()
 }
 
 // validatePublicationFence checks the active lease immediately before a
 // signed record is placed. It is a no-op when no fencer is configured.
 func (s *Service) validatePublicationFence(ctx context.Context, lease publicationLease) error {
+	if err := lease.renewalError(); err != nil {
+		return err
+	}
 	fencer := s.fencer()
 	if fencer == nil {
 		return nil

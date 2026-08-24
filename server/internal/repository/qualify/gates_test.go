@@ -1,6 +1,7 @@
 package qualify
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -46,12 +47,92 @@ func TestLocalZstdPassesDriverGates(t *testing.T) {
 	}
 }
 
+func TestLocalZstdEncryptedPassesKeyGates(t *testing.T) {
+	ctx := context.Background()
+	key := bytes.Repeat([]byte{0x5a}, 32)
+	provider := repository.KeyProviderFunc(func(_ context.Context, ref string) ([]byte, error) {
+		if ref != "key://qualification" {
+			return nil, errors.New("unexpected key reference")
+		}
+		return append([]byte(nil), key...), nil
+	})
+	if err := EncryptedGates(ctx, filepath.Join(t.TempDir(), "encrypted"), "key://qualification", provider, []byte("encrypted qualification payload")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInTreeProfilesPassRepairGates(t *testing.T) {
+	ctx := context.Background()
+	payload := []byte("repair qualification payload")
+	raw, err := repository.OpenDir(filepath.Join(t.TempDir(), "raw"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := RepairGates(ctx, raw, payload); err != nil {
+		t.Fatalf("raw repair gate: %v", err)
+	}
+	zstd, err := repository.OpenZstdDir(filepath.Join(t.TempDir(), "zstd"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := RepairGates(ctx, zstd, payload); err != nil {
+		t.Fatalf("zstd repair gate: %v", err)
+	}
+}
+
 func TestResticControlBackupRestoreIndependentHash(t *testing.T) {
 	bin, err := exec.LookPath("restic")
 	if err != nil {
 		t.Skip("restic not on PATH; control probe skipped")
 	}
 	runBackupEngine(t, resticEngine{bin: bin})
+}
+
+func TestResticEncryptionAndWrongCredentialFailClosed(t *testing.T) {
+	bin, err := exec.LookPath("restic")
+	if err != nil {
+		t.Skip("restic not on PATH; credential probe skipped")
+	}
+	work := t.TempDir()
+	src := filepath.Join(work, "corpus")
+	if err := os.Mkdir(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "secret-check.txt"), []byte("encrypted candidate probe\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	engine := resticEngine{bin: bin}
+	if err := engine.init(work); err != nil {
+		t.Fatalf("restic init: %v", err)
+	}
+	if err := engine.backup(work, src); err != nil {
+		t.Fatalf("restic backup: %v", err)
+	}
+	if err := runCmd(work, engine.bin, engine.envWithPassword(work, "wrong-password"), "check"); err == nil {
+		t.Fatal("restic accepted an incorrect repository password")
+	}
+	var sawPassword bool
+	if err := filepath.WalkDir(engine.repoDir(work), func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		payload, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if bytes.Contains(payload, []byte(spikePassword)) {
+			sawPassword = true
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("inspect restic repository: %v", err)
+	}
+	if sawPassword {
+		t.Fatal("restic repository contains the plaintext password")
+	}
 }
 
 func TestKopiaProbeBackupRestoreIndependentHash(t *testing.T) {

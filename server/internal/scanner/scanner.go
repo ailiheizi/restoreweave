@@ -270,6 +270,7 @@ func (attempt *scanAttempt) walk(ctx context.Context, path pathContext) error {
 		record.State = EntryBoundarySkipped
 		return attempt.emit(ctx, record)
 	}
+	record.Filesystem = captureFilesystemFacts(attempt.fileSystem, record.AbsolutePath, record.Kind, attempt.scanner.now())
 
 	switch record.Kind {
 	case KindRegularFile:
@@ -299,6 +300,7 @@ func (attempt *scanAttempt) baseRecord(path pathContext) EntryRecord {
 		State:           EntryComplete,
 		HardLink:        HardLinkFacts{State: HardLinkNotApplicable},
 		Sparse:          SparseFacts{State: SparseNotApplicable},
+		Filesystem:      emptyFilesystemFacts(time.Time{}, KindUnknown),
 		Boundary:        BoundaryObservation{Action: BoundaryInclude},
 		Detection:       DetectionObservation{State: DetectionNotRequested},
 	}

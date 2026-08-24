@@ -34,6 +34,7 @@ type DriverRecord interface {
 type ProfileDescription struct {
 	Repository  string
 	Compression string
+	Encryption  string
 }
 
 type profileReporter interface {
@@ -46,6 +47,12 @@ var ErrReadOnly = errors.New("repository is open for recovery reads only")
 // profile markers, identities, temporary files, or any other state. It is the
 // only repository constructor used by the clean-install recovery reader.
 func OpenProfileReadOnly(profile, path string) (DriverRecord, error) {
+	return OpenProfileReadOnlyWithKeyProvider(profile, path, nil)
+}
+
+// OpenProfileReadOnlyWithKeyProvider is the clean-install reader constructor
+// for profiles whose host-owned key dependency is explicitly available.
+func OpenProfileReadOnlyWithKeyProvider(profile, path string, provider KeyProvider) (DriverRecord, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("repository path is required")
 	}
@@ -82,6 +89,16 @@ func OpenProfileReadOnly(profile, path string) (DriverRecord, error) {
 		driver = base
 	case RepositoryProfileLocalZstdV1:
 		driver = &ZstdDir{Dir: base}
+	case RepositoryProfileLocalZstdEncryptedV1:
+		metadata, metadataErr := readEncryptionMetadata(absolute, profile)
+		if metadataErr != nil {
+			return nil, metadataErr
+		}
+		key, keyErr := resolveEncryptionKey(context.Background(), provider, metadata.KeyRef)
+		if keyErr != nil {
+			return nil, keyErr
+		}
+		driver = &ZstdDir{Dir: base, encryption: &zstdEncryption{keyRef: metadata.KeyRef, key: key}}
 	default:
 		return nil, fmt.Errorf("unsupported repository profile %q", profile)
 	}
@@ -104,7 +121,7 @@ func DetectProfileReadOnly(path string) (string, error) {
 	}
 	profile := strings.TrimSpace(string(payload))
 	switch profile {
-	case RepositoryProfileDirectoryCASDev, RepositoryProfileLocalZstdV1:
+	case RepositoryProfileDirectoryCASDev, RepositoryProfileLocalZstdV1, RepositoryProfileLocalZstdEncryptedV1:
 		return profile, nil
 	default:
 		return "", fmt.Errorf("unsupported repository profile %q", profile)
@@ -122,6 +139,10 @@ func (*readOnlyDriver) Place(context.Context, io.Reader) (Receipt, error) {
 }
 
 func (*readOnlyDriver) PlaceExact(context.Context, string, io.Reader) (Receipt, error) {
+	return Receipt{}, ErrReadOnly
+}
+
+func (*readOnlyDriver) Repair(context.Context, string, io.Reader) (Receipt, error) {
 	return Receipt{}, ErrReadOnly
 }
 
@@ -144,22 +165,32 @@ func (*Dir) RepositoryProfile() ProfileDescription {
 	return ProfileDescription{
 		Repository:  RepositoryProfileDirectoryCASDev,
 		Compression: CompressionProfileIdentity,
+		Encryption:  EncryptionNone,
 	}
 }
 
 func (*Memory) RepositoryProfile() ProfileDescription {
-	return ProfileDescription{Repository: "memory-test-v1", Compression: CompressionProfileIdentity}
+	return ProfileDescription{Repository: "memory-test-v1", Compression: CompressionProfileIdentity, Encryption: EncryptionNone}
 }
 
 // OpenProfile opens one of the repository profiles owned by this package.
 // The profile name fixes the compression tuple; callers cannot accidentally
 // interpret a zstd repository as the raw development CAS.
 func OpenProfile(profile, path string) (DriverRecord, error) {
+	return OpenProfileWithKeyProvider(profile, path, nil)
+}
+
+// OpenProfileWithKeyProvider opens a profile with an explicitly injected host
+// key provider. Encrypted repositories must already carry their non-secret
+// key reference; new encrypted repositories should use OpenEncryptedZstdDir.
+func OpenProfileWithKeyProvider(profile, path string, provider KeyProvider) (DriverRecord, error) {
 	switch profile {
 	case RepositoryProfileDirectoryCASDev:
 		return OpenDir(path)
 	case RepositoryProfileLocalZstdV1:
 		return OpenZstdDir(path)
+	case RepositoryProfileLocalZstdEncryptedV1:
+		return OpenEncryptedZstdDir(path, "", provider)
 	default:
 		return nil, fmt.Errorf("unsupported repository profile %q", profile)
 	}
@@ -173,6 +204,8 @@ func OpenProfileWithCompression(repositoryProfile, compressionProfile, path stri
 	case repositoryProfile == RepositoryProfileDirectoryCASDev && compressionProfile == CompressionProfileIdentity:
 		return OpenProfile(repositoryProfile, path)
 	case repositoryProfile == RepositoryProfileLocalZstdV1 && compressionProfile == CompressionProfileZstdV1:
+		return OpenProfile(repositoryProfile, path)
+	case repositoryProfile == RepositoryProfileLocalZstdEncryptedV1 && compressionProfile == CompressionProfileZstdV1:
 		return OpenProfile(repositoryProfile, path)
 	default:
 		return nil, fmt.Errorf("unsupported repository/compression profile tuple %q/%q", repositoryProfile, compressionProfile)

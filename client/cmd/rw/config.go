@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -19,7 +20,7 @@ func newConfigCommand(env *clientEnv) *cobra.Command {
 	}
 
 	var path string
-	initCmd := newExitCommand(env, "init", "Create a default config.yaml without overwriting an existing file",
+	initCmd := newExitCommand(env, "init", "Create a default config.toml without overwriting an existing file",
 		func(cmd *cobra.Command, env *clientEnv, args []string) int {
 			resolved, err := rwconfig.Init(strings.TrimSpace(path))
 			if err != nil {
@@ -85,9 +86,15 @@ func newConfigCommand(env *clientEnv) *cobra.Command {
 				fmt.Fprintln(cmd.OutOrStdout(), string(encoded))
 				return 0
 			}
-			payload, err := rwconfig.MarshalYAML(resolved.Config)
-			if err != nil {
-				fmt.Fprintf(cmd.ErrOrStderr(), "config show: %v\n", err)
+			var payload []byte
+			var marshalErr error
+			if ext := strings.ToLower(filepath.Ext(resolved.ConfigPath)); ext == ".yaml" || ext == ".yml" {
+				payload, marshalErr = rwconfig.MarshalYAML(resolved.Config)
+			} else {
+				payload, marshalErr = rwconfig.MarshalTOML(resolved.Config)
+			}
+			if marshalErr != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "config show: %v\n", marshalErr)
 				return 1
 			}
 			fmt.Fprintln(cmd.OutOrStdout(), strings.TrimSpace(string(payload)))

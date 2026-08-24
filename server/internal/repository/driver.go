@@ -49,6 +49,13 @@ type Driver interface {
 	Root() string
 }
 
+// RepairDriver is an explicit host-owned repair seam. Repair is never
+// implicit during Open or Verify: callers provide a fresh exact byte stream,
+// and the driver atomically replaces only a verified damaged object.
+type RepairDriver interface {
+	Repair(ctx context.Context, contentID string, body io.Reader) (Receipt, error)
+}
+
 // Dir is a filesystem CAS. Layout: <root>/blobs/sha256/<ab>/<hex>.
 type Dir struct {
 	root     string
@@ -96,6 +103,70 @@ func (repo *Dir) PlaceExact(ctx context.Context, contentID string, body io.Reade
 	return repo.place(ctx, contentID, body)
 }
 
+func (repo *Dir) Repair(ctx context.Context, contentID string, body io.Reader) (Receipt, error) {
+	if err := ctx.Err(); err != nil {
+		return Receipt{}, err
+	}
+	if _, err := parseContentID(contentID); err != nil {
+		return Receipt{}, err
+	}
+	if body == nil {
+		return Receipt{}, errors.New("repair body is required")
+	}
+	temp, err := os.CreateTemp(filepath.Join(repo.root, tmpDirName), "repair-*.blob")
+	if err != nil {
+		return Receipt{}, fmt.Errorf("create repair tempfile: %w", err)
+	}
+	tempName := temp.Name()
+	defer func() {
+		_ = temp.Close()
+		_ = os.Remove(tempName)
+	}()
+	digest := sha256.New()
+	written, err := io.Copy(io.MultiWriter(temp, digest), body)
+	if err != nil {
+		return Receipt{}, fmt.Errorf("write repair: %w", err)
+	}
+	got := AlgorithmSHA256 + ":" + hex.EncodeToString(digest.Sum(nil))
+	if got != contentID {
+		return Receipt{}, fmt.Errorf("%w: got %s, want %s", ErrDigestMismatch, got, contentID)
+	}
+	if err := temp.Sync(); err != nil {
+		return Receipt{}, fmt.Errorf("sync repair: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return Receipt{}, fmt.Errorf("close repair: %w", err)
+	}
+	dest := blobPath(repo.root, contentID)
+	if err := validateRepositoryParentChain(repo.root, filepath.Dir(dest)); err != nil {
+		return Receipt{}, fmt.Errorf("repair destination: %w", err)
+	}
+	if info, statErr := os.Lstat(dest); statErr == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return Receipt{}, errors.New("repair target is not a regular file")
+		}
+		if verifyErr := repo.Verify(ctx, contentID); verifyErr == nil {
+			stored, sizeErr := fileSize(dest)
+			if sizeErr != nil {
+				return Receipt{}, sizeErr
+			}
+			return Receipt{ContentID: contentID, Bytes: written, StoredBytes: stored, Existed: true}, nil
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return Receipt{}, statErr
+	}
+	if err := os.Rename(tempName, dest); err != nil {
+		return Receipt{}, fmt.Errorf("atomically replace repaired object: %w", err)
+	}
+	if err := syncFilesystemParentChain(repo.root); err != nil {
+		return Receipt{}, err
+	}
+	if err := repo.Verify(ctx, contentID); err != nil {
+		return Receipt{}, err
+	}
+	return Receipt{ContentID: contentID, Bytes: written, StoredBytes: written, Existed: true}, nil
+}
+
 func (repo *Dir) place(ctx context.Context, expectedID string, body io.Reader) (Receipt, error) {
 	if err := ctx.Err(); err != nil {
 		return Receipt{}, err
@@ -134,7 +205,7 @@ func (repo *Dir) place(ctx context.Context, expectedID string, body io.Reader) (
 		return Receipt{}, fmt.Errorf("create blob directory: %w", err)
 	}
 	if _, err := os.Lstat(dest); err == nil {
-		if err := verifyFile(dest, contentID); err != nil {
+		if err := verifyFile(repo.root, dest, contentID); err != nil {
 			return Receipt{}, err
 		}
 		stored, err := fileSize(dest)
@@ -147,7 +218,7 @@ func (repo *Dir) place(ctx context.Context, expectedID string, body io.Reader) (
 	}
 	if err := publishNoReplace(tempName, dest, repo.root); err != nil {
 		if errors.Is(err, os.ErrExist) {
-			if verifyErr := verifyFile(dest, contentID); verifyErr != nil {
+			if verifyErr := verifyFile(repo.root, dest, contentID); verifyErr != nil {
 				return Receipt{}, verifyErr
 			}
 			stored, sizeErr := fileSize(dest)
@@ -168,7 +239,7 @@ func (repo *Dir) Open(ctx context.Context, contentID string) (io.ReadCloser, err
 	if _, err := parseContentID(contentID); err != nil {
 		return nil, err
 	}
-	file, err := os.Open(blobPath(repo.root, contentID))
+	file, err := openRepositoryFile(repo.root, blobPath(repo.root, contentID))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, contentID)
 	}
@@ -179,11 +250,11 @@ func (repo *Dir) Verify(ctx context.Context, contentID string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return verifyFile(blobPath(repo.root, contentID), contentID)
+	return verifyFile(repo.root, blobPath(repo.root, contentID), contentID)
 }
 
-func verifyFile(path, contentID string) error {
-	file, err := os.Open(path)
+func verifyFile(root, path, contentID string) error {
+	file, err := openRepositoryFile(root, path)
 	if errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("%w: %s", ErrNotFound, contentID)
 	}
@@ -267,6 +338,33 @@ func (repo *Memory) PlaceExact(ctx context.Context, contentID string, body io.Re
 		repo.blobs[got] = append([]byte(nil), payload...)
 	}
 	return Receipt{ContentID: got, Bytes: int64(len(payload)), StoredBytes: int64(len(payload)), Existed: existed}, nil
+}
+
+func (repo *Memory) Repair(ctx context.Context, contentID string, body io.Reader) (Receipt, error) {
+	if err := ctx.Err(); err != nil {
+		return Receipt{}, err
+	}
+	if _, err := parseContentID(contentID); err != nil {
+		return Receipt{}, err
+	}
+	if body == nil {
+		return Receipt{}, errors.New("repair body is required")
+	}
+	payload, err := io.ReadAll(body)
+	if err != nil {
+		return Receipt{}, err
+	}
+	sum := sha256.Sum256(payload)
+	if got := AlgorithmSHA256 + ":" + hex.EncodeToString(sum[:]); got != contentID {
+		return Receipt{}, fmt.Errorf("%w: got %s, want %s", ErrDigestMismatch, got, contentID)
+	}
+	repo.mu.Lock()
+	if repo.blobs == nil {
+		repo.blobs = make(map[string][]byte)
+	}
+	repo.blobs[contentID] = append([]byte(nil), payload...)
+	repo.mu.Unlock()
+	return Receipt{ContentID: contentID, Bytes: int64(len(payload)), StoredBytes: int64(len(payload)), Existed: true}, nil
 }
 
 func (repo *Memory) Open(ctx context.Context, contentID string) (io.ReadCloser, error) {
@@ -358,6 +456,50 @@ func syncFilesystemParentChain(start string) error {
 		root = parent
 	}
 	return syncParentChain(start, root)
+}
+
+func validateRepositoryParentChain(root, target string) error {
+	root = filepath.Clean(root)
+	target = filepath.Clean(target)
+	relative, err := filepath.Rel(root, target)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return errors.New("repair destination is outside repository root")
+	}
+	current := root
+	if info, err := os.Lstat(current); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("repository root is not a regular directory")
+	}
+	for _, component := range splitRepositoryRelativePath(relative) {
+		current = filepath.Join(current, component)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return fmt.Errorf("repository directory %q: %w", current, err)
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("repository directory %q is not a non-symlink directory", current)
+		}
+	}
+	return nil
+}
+
+func splitRepositoryRelativePath(path string) []string {
+	clean := filepath.Clean(path)
+	parts := make([]string, 0, 4)
+	for clean != "." && clean != string(filepath.Separator) {
+		parent, base := filepath.Split(clean)
+		if base != "" {
+			parts = append(parts, base)
+		}
+		parent = filepath.Clean(parent)
+		if parent == clean {
+			break
+		}
+		clean = parent
+	}
+	for left, right := 0, len(parts)-1; left < right; left, right = left+1, right-1 {
+		parts[left], parts[right] = parts[right], parts[left]
+	}
+	return parts
 }
 
 func syncDir(path string) error {

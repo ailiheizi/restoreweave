@@ -14,11 +14,12 @@ import (
 )
 
 const (
-	TraversalVersion  = "depth-first-raw-name-v1"
-	MetadataVersion   = "filesystem-metadata-v1"
-	HashVersion       = "sha256-stream-v1"
-	PathIDVersion     = "source-path-sha256-v1"
-	HardLinkIDVersion = "generation-device-inode-sha256-v1"
+	TraversalVersion       = "depth-first-raw-name-v1"
+	MetadataVersion        = "filesystem-metadata-v1"
+	FilesystemFactsVersion = "filesystem-facts-v1"
+	HashVersion            = "sha256-stream-v1"
+	PathIDVersion          = "source-path-sha256-v1"
+	HardLinkIDVersion      = "generation-device-inode-sha256-v1"
 )
 
 var (
@@ -147,6 +148,61 @@ type HardLinkFacts struct {
 	LinkCount      uint64        `json:"link_count,omitempty"`
 }
 
+// CaptureFactState is the scanner-side state vocabulary for optional
+// filesystem capabilities. A zero value is deliberately not a state: callers
+// must retain an explicit observed, unobserved, unsupported, or inconsistent
+// result instead of treating an absent field as a zero-valued fact.
+type CaptureFactState string
+
+const (
+	CaptureFactObserved     CaptureFactState = "OBSERVED"
+	CaptureFactUnobserved   CaptureFactState = "UNOBSERVED"
+	CaptureFactUnsupported  CaptureFactState = "UNSUPPORTED"
+	CaptureFactInconsistent CaptureFactState = "INCONSISTENT"
+)
+
+type ExtendedAttribute struct {
+	Name  string `json:"name"`
+	Value []byte `json:"value"`
+}
+
+// XAttrFacts contains the complete no-follow xattr observation when the
+// active filesystem profile can read it. Values are retained as bytes; JSON
+// serialization applies base64 without interpreting platform-specific text.
+type XAttrFacts struct {
+	State      CaptureFactState    `json:"state"`
+	Attributes []ExtendedAttribute `json:"attributes"`
+	ReasonCode string              `json:"reason_code,omitempty"`
+}
+
+type ACLRecord struct {
+	Name string `json:"name"`
+	Raw  []byte `json:"raw"`
+}
+
+// ACLFacts remains explicit even on profiles that cannot safely parse and
+// round-trip the host ACL representation. Mode bits are not an ACL substitute.
+type ACLFacts struct {
+	State      CaptureFactState `json:"state"`
+	Format     string           `json:"format,omitempty"`
+	Records    []ACLRecord      `json:"records,omitempty"`
+	ReasonCode string           `json:"reason_code,omitempty"`
+}
+
+type FilesystemFacts struct {
+	Version    string     `json:"version"`
+	CapturedAt time.Time  `json:"captured_at"`
+	XAttrs     XAttrFacts `json:"xattrs"`
+	ACLs       ACLFacts   `json:"acls"`
+}
+
+// FilesystemFactProvider is optional so injected test filesystems and foreign
+// adapters remain source-compatible. Production OS filesystems implement it;
+// an absent provider yields explicit UNOBSERVED facts.
+type FilesystemFactProvider interface {
+	CaptureFilesystemFacts(path string, kind EntryKind) FilesystemFacts
+}
+
 // SparseState is intentionally conservative. stat blocks below logical size
 // are only a hint because compression, clones, and filesystem accounting can
 // produce the same observation. Exact sparse restoration needs an extent-map
@@ -229,6 +285,7 @@ type EntryRecord struct {
 	Symlink         *SymlinkFacts        `json:"symlink,omitempty"`
 	HardLink        HardLinkFacts        `json:"hard_link"`
 	Sparse          SparseFacts          `json:"sparse"`
+	Filesystem      FilesystemFacts      `json:"filesystem_facts"`
 	Boundary        BoundaryObservation  `json:"boundary"`
 	Detection       DetectionObservation `json:"detection"`
 	Issues          []Issue              `json:"issues,omitempty"`

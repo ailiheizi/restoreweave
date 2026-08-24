@@ -15,6 +15,7 @@ const (
 	CatalogEnv         = shared.CatalogEnv
 	RepositoryEnv      = shared.RepositoryEnv
 	VectorsEnv         = shared.VectorsEnv
+	ModelsEnv          = shared.ModelsEnv
 	RecoveryRecordsEnv = shared.RecoveryRecordsEnv
 )
 
@@ -25,6 +26,7 @@ type DescriptionConfig = shared.DescriptionConfig
 type Descriptions = shared.Descriptions
 type RecoveryConfig = shared.RecoveryConfig
 type Recovery = shared.Recovery
+type APIConfig = shared.APIConfig
 type Config = shared.Config
 type PathOverrides = shared.PathOverrides
 type ResolveOptions = shared.ResolveOptions
@@ -37,6 +39,7 @@ func Default() Config                                     { return shared.Defaul
 func DefaultConfig() Config                               { return shared.DefaultConfig() }
 func LoadFile(path string) (Config, error)                { return shared.LoadFile(path) }
 func Decode(r io.Reader) (Config, error)                  { return shared.Decode(r) }
+func DecodeTOML(r io.Reader) (Config, error)              { return shared.DecodeTOML(r) }
 func Parse(r io.Reader) (Config, error)                   { return shared.Parse(r) }
 func DecodeJSON(r io.Reader) (Config, error)              { return shared.DecodeJSON(r) }
 func LoadEffective(o LoadOptions) (ResolvedConfig, error) { return shared.LoadEffective(o) }
@@ -46,6 +49,7 @@ func Resolve(c Config, o ResolveOptions) (ResolvedConfig, error) {
 }
 func Validate(c Config) error                { return shared.Validate(c) }
 func MarshalYAML(c Config) ([]byte, error)   { return shared.MarshalYAML(c) }
+func MarshalTOML(c Config) ([]byte, error)   { return shared.MarshalTOML(c) }
 func CanonicalJSON(c Config) ([]byte, error) { return shared.CanonicalJSON(c) }
 func RedactedJSON(c ResolvedConfig) ([]byte, error) {
 	return shared.RedactedJSON(c)

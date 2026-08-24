@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -166,9 +167,17 @@ func persistSigningIdentity(path, publicationDomain string, identity SigningIden
 }
 
 func loadTrustAnchor(path string) (TrustAnchor, error) {
-	payload, err := os.ReadFile(path)
+	file, err := openRecoveryInput(path)
 	if err != nil {
 		return TrustAnchor{}, err
+	}
+	defer file.Close()
+	payload, err := io.ReadAll(io.LimitReader(file, portableRecordReadLimit+1))
+	if err != nil {
+		return TrustAnchor{}, err
+	}
+	if int64(len(payload)) > portableRecordReadLimit {
+		return TrustAnchor{}, fmt.Errorf("trust anchor exceeds %d bytes", portableRecordReadLimit)
 	}
 	var anchor TrustAnchor
 	if err := decodeStrictRecord(payload, &anchor); err != nil {

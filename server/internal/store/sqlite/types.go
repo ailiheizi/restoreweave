@@ -568,7 +568,13 @@ type IndexGeneration struct {
 	NamespaceRootID string
 	DBPath          string
 	Dimension       string
-	CreatedAt       time.Time
+	// ConfigDigest and ProviderProfileDigest bind this disposable projection
+	// to the effective host configuration and the immutable provider/profile
+	// that produced it. Empty values mean a legacy, unbound row.
+	ConfigDigest          string
+	ProviderProfileDigest string
+	SemanticSpace         string
+	CreatedAt             time.Time
 }
 
 type ProcessorArtifactState string
@@ -831,30 +837,37 @@ type DescriptionDocument struct {
 	BodyDigest      string
 	SourceRef       string
 	ProducerProfile string
-	Confidence      *float64
-	Coverage        *float64
-	Visibility      string
-	Accepted        bool
-	Revision        int64
-	PredecessorID   string
-	Metadata        json.RawMessage
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	// ConfigDigest binds this revision to the resolved host configuration.
+	// ProducerProfileDigest identifies the immutable producer/profile input;
+	// both are distinct from the durable body digest.
+	ConfigDigest          string
+	ProducerProfileDigest string
+	Confidence            *float64
+	Coverage              *float64
+	Visibility            string
+	Accepted              bool
+	Revision              int64
+	PredecessorID         string
+	Metadata              json.RawMessage
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
 }
 
 // SemanticSegment is an ordered chunk of a document. Segment text and its
 // provenance are durable; an embedding generation may be deleted/rebuilt.
 type SemanticSegment struct {
-	ID          string
-	WorkspaceID string
-	DocumentID  string
-	SubjectRef  string
-	Ordinal     int64
-	Text        string
-	TextDigest  string
-	Language    string
-	Section     string
-	SourceSpan  json.RawMessage
-	Metadata    json.RawMessage
-	CreatedAt   time.Time
+	ID                        string
+	WorkspaceID               string
+	DocumentID                string
+	SubjectRef                string
+	DocumentRevision          int64
+	Ordinal                   int64
+	Text                      string
+	TextDigest                string
+	Language                  string
+	Section                   string
+	SourceSpan                json.RawMessage
+	Metadata                  json.RawMessage
+	SegmentationProfileDigest string
+	CreatedAt                 time.Time
 }

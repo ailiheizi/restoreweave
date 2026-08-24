@@ -279,16 +279,19 @@ func (s *Store) InsertIndexGeneration(ctx context.Context, record *IndexGenerati
 		record.CreatedAt = recordTime(record.CreatedAt, tx.now)
 		return insertOne(ctx, tx.tx, `
 INSERT INTO index_generations(
-    generation_id, workspace_id, snapshot_ref, namespace_root_id, db_path, dimension, created_at_ns
-) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`,
+    generation_id, workspace_id, snapshot_ref, namespace_root_id, db_path, dimension,
+    config_digest, provider_profile_digest, semantic_space, created_at_ns
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`,
 			record.ID, record.WorkspaceID, record.SnapshotRef, record.NamespaceRootID,
-			record.DBPath, record.Dimension, record.CreatedAt.UnixNano())
+			record.DBPath, record.Dimension, record.ConfigDigest,
+			record.ProviderProfileDigest, record.SemanticSpace, record.CreatedAt.UnixNano())
 	})
 }
 
 func (s *Store) GetIndexGeneration(ctx context.Context, generationID string) (IndexGeneration, error) {
 	return scanIndexGeneration(s.db.QueryRowContext(ctx, `
-SELECT generation_id, workspace_id, snapshot_ref, namespace_root_id, db_path, dimension, created_at_ns
+SELECT generation_id, workspace_id, snapshot_ref, namespace_root_id, db_path, dimension,
+       config_digest, provider_profile_digest, semantic_space, created_at_ns
 FROM index_generations WHERE generation_id = ?`, generationID))
 }
 
@@ -297,7 +300,8 @@ func (s *Store) LatestIndexGeneration(ctx context.Context, workspaceID, dimensio
 		dimension = "lexical-metadata-fts"
 	}
 	query := `
-SELECT generation_id, workspace_id, snapshot_ref, namespace_root_id, db_path, dimension, created_at_ns
+SELECT generation_id, workspace_id, snapshot_ref, namespace_root_id, db_path, dimension,
+       config_digest, provider_profile_digest, semantic_space, created_at_ns
 FROM index_generations WHERE dimension = ?`
 	args := []any{dimension}
 	if workspaceID != "" {
@@ -377,7 +381,8 @@ func scanIndexGeneration(scanner rowScanner) (IndexGeneration, error) {
 	var created int64
 	if err := scanner.Scan(
 		&record.ID, &record.WorkspaceID, &record.SnapshotRef,
-		&record.NamespaceRootID, &record.DBPath, &record.Dimension, &created,
+		&record.NamespaceRootID, &record.DBPath, &record.Dimension,
+		&record.ConfigDigest, &record.ProviderProfileDigest, &record.SemanticSpace, &created,
 	); err != nil {
 		return record, rowError("index generation", err)
 	}

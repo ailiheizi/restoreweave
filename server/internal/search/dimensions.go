@@ -1,6 +1,9 @@
 package search
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -26,6 +29,7 @@ const (
 	ProviderLexicalFTS5   = "query.lexical.fts5.v1"
 	ProviderAcousticFix   = "query.acoustic.fixture.v1"
 	ProviderSemanticFix   = "query.semantic.fixture.v1"
+	ProviderSemanticONNX  = "query.semantic.onnx-bge-zvec.v1"
 	ProviderMultimodalFix = "query.multimodal.fixture.v1"
 	ProviderBrokerFuse    = "query.broker.fuse.v1"
 	ProviderGraphCatalog  = "query.graph.catalog.v1"
@@ -33,6 +37,7 @@ const (
 	ScoreGraphExact       = "relation-exact"
 	ScoreAcousticExact    = "fixture-exact"
 	ScoreSemanticExact    = "fixture-exact"
+	ScoreSemanticCosine   = "cosine-similarity"
 	ScoreMultimodalExact  = "fixture-exact"
 	ScoreComponentUnion   = "component-union"
 	CapabilityKindBroker  = "query-broker"
@@ -96,6 +101,146 @@ type QueryRequest struct {
 	Fuse         []string
 }
 
+// IndexBinding identifies the host configuration and immutable provider
+// profiles that produced disposable index generations. Empty bindings are
+// reserved for low-level fixture harnesses; a daemon must provide ConfigDigest.
+type IndexBinding struct {
+	ConfigDigest            string
+	LexicalProfileDigest    string
+	SemanticProfileDigest   string
+	MultimodalProfileDigest string
+	AcousticProfileDigest   string
+	GraphProfileDigest      string
+	SemanticSpace           string
+	MultimodalSemanticSpace string
+	SemanticManifest        EmbeddingGenerationManifest
+	MultimodalManifest      EmbeddingGenerationManifest
+}
+
+// EmbeddingGenerationManifest is the immutable identity of one embedding
+// generation. Its digest is stored in IndexGeneration.ProviderProfileDigest;
+// changing any runtime, model, preprocessing, vector, distance, index/query,
+// provider, or host-config field therefore creates a different generation.
+type EmbeddingGenerationManifest struct {
+	RuntimeDigest       string `json:"runtime_digest"`
+	ModelDigest         string `json:"model_digest"`
+	TokenizerDigest     string `json:"tokenizer_digest"`
+	PreprocessingDigest string `json:"preprocessing_digest"`
+	Pooling             string `json:"pooling"`
+	Normalization       string `json:"normalization"`
+	ElementType         string `json:"element_type"`
+	Dimension           int    `json:"dimension"`
+	VectorSchema        string `json:"vector_schema"`
+	SemanticSpace       string `json:"semantic_space"`
+	Distance            string `json:"distance"`
+	IndexConfig         string `json:"index_config"`
+	QueryConfig         string `json:"query_config"`
+	ProviderDigest      string `json:"provider_digest"`
+	ConfigDigest        string `json:"config_digest"`
+}
+
+// ErrInvalidEmbeddingGenerationManifest identifies a binding that cannot
+// safely describe output-affecting embedding generation parameters.
+var ErrInvalidEmbeddingGenerationManifest = errors.New("invalid embedding generation manifest")
+
+// Validate rejects incomplete manifests before they can identify a
+// production generation. Empty values are not meaningful defaults: the
+// selected profile must state every fact that can change produced vectors or
+// their retrieval semantics.
+func (m EmbeddingGenerationManifest) Validate() error {
+	fields := []struct {
+		name  string
+		value string
+	}{
+		{"runtime_digest", m.RuntimeDigest},
+		{"model_digest", m.ModelDigest},
+		{"tokenizer_digest", m.TokenizerDigest},
+		{"preprocessing_digest", m.PreprocessingDigest},
+		{"pooling", m.Pooling},
+		{"normalization", m.Normalization},
+		{"element_type", m.ElementType},
+		{"vector_schema", m.VectorSchema},
+		{"semantic_space", m.SemanticSpace},
+		{"distance", m.Distance},
+		{"index_config", m.IndexConfig},
+		{"query_config", m.QueryConfig},
+		{"provider_digest", m.ProviderDigest},
+		{"config_digest", m.ConfigDigest},
+	}
+	missing := make([]string, 0, len(fields)+1)
+	for _, field := range fields {
+		if strings.TrimSpace(field.value) == "" {
+			missing = append(missing, field.name)
+		}
+	}
+	if m.Dimension <= 0 {
+		missing = append(missing, "dimension")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%w: missing %s", ErrInvalidEmbeddingGenerationManifest, strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+// CanonicalDigest returns a stable digest over the ordered manifest fields.
+// Struct JSON encoding is deterministic here because the manifest has no
+// maps or unordered collections. An incomplete manifest has no usable
+// canonical identity and returns an empty digest.
+func (m EmbeddingGenerationManifest) CanonicalDigest() string {
+	if err := m.Validate(); err != nil {
+		return ""
+	}
+	payload, _ := json.Marshal(m)
+	h := sha256.Sum256(append([]byte("restoreweave.embedding-generation-manifest.v1\n"), payload...))
+	return "sha256:" + hex.EncodeToString(h[:])
+}
+
+// FixtureIndexBinding returns the explicit deterministic binding used by
+// qualification harnesses. It is not a production semantic capability.
+func FixtureIndexBinding(configDigest string) IndexBinding {
+	semanticManifest := EmbeddingGenerationManifest{
+		RuntimeDigest: "fixture-runtime", ModelDigest: "fixture-model",
+		TokenizerDigest: "fixture-tokenizer", PreprocessingDigest: "fixture-preprocessing",
+		Pooling: "mean", Normalization: "l2", ElementType: "float32", Dimension: 512,
+		VectorSchema: "fixture-vector-v1", SemanticSpace: SemanticFixtureProfileV1,
+		Distance: "cosine", IndexConfig: "fixture-index-v1", QueryConfig: "fixture-query-v1",
+		ProviderDigest: ProfileDigest(DimensionSemantic, SemanticFixtureProfileV1),
+		ConfigDigest:   strings.TrimSpace(configDigest),
+	}
+	multimodalManifest := semanticManifest
+	multimodalManifest.SemanticSpace = MultimodalFixtureProfileV1
+	multimodalManifest.ProviderDigest = ProfileDigest(DimensionMultimodal, MultimodalFixtureProfileV1)
+	return IndexBinding{
+		ConfigDigest:            strings.TrimSpace(configDigest),
+		LexicalProfileDigest:    ProfileDigest(DimensionLexical, LexicalProfileV1),
+		SemanticProfileDigest:   semanticManifest.CanonicalDigest(),
+		MultimodalProfileDigest: multimodalManifest.CanonicalDigest(),
+		AcousticProfileDigest:   ProfileDigest(DimensionAcoustic, AcousticFixtureProfileV1),
+		GraphProfileDigest:      ProfileDigest(DimensionGraph, GraphProfileV1),
+		SemanticSpace:           SemanticFixtureProfileV1,
+		MultimodalSemanticSpace: MultimodalFixtureProfileV1,
+		SemanticManifest:        semanticManifest,
+		MultimodalManifest:      multimodalManifest,
+	}
+}
+
+// ProfileDigest returns a stable provider/profile identity for an index
+// dimension. It is intentionally separate from config_digest: changing the
+// host configuration creates new work, while this digest records which
+// immutable retrieval implementation produced the bytes.
+func ProfileDigest(dimension, profile string) string {
+	h := sha256.Sum256([]byte("restoreweave.index-profile.v1\n" + strings.TrimSpace(dimension) + "\n" + strings.TrimSpace(profile)))
+	return "sha256:" + hex.EncodeToString(h[:])
+}
+
+const (
+	LexicalProfileV1           = "fts5-metadata-v1"
+	GraphProfileV1             = "graph-catalog-v1"
+	AcousticFixtureProfileV1   = "acoustic-fixture-v1"
+	SemanticFixtureProfileV1   = "semantic-fixture-v1"
+	MultimodalFixtureProfileV1 = "multimodal-fixture-v1"
+)
+
 // Filters are typed structured constraints applied on top of the free-text
 // MATCH expression. Empty fields are absent constraints. Times are
 // milliseconds since the Unix epoch so the command surface can pass them as
@@ -149,11 +294,12 @@ func (f FieldCoverage) Present(field string) bool {
 // ProviderReadiness says which QueryProviders this process has wired.
 // A ready acoustic provider can still degrade when no generation exists.
 type ProviderReadiness struct {
-	Lexical    bool
-	Acoustic   bool
-	Semantic   bool
-	Multimodal bool
-	Graph      bool
+	Lexical      bool
+	Acoustic     bool
+	Semantic     bool
+	SemanticReal bool
+	Multimodal   bool
+	Graph        bool
 }
 
 // DeclaredDimensions returns every discovery dimension the contract names.
@@ -171,10 +317,17 @@ func DeclaredDimensions(ready ProviderReadiness) []Dimension {
 		acousticNotes = "disposable fixture-fingerprint generation over admitted FINGERPRINT artifacts; not Chromaprint, not SHA-256, not recovery authority"
 	}
 	semanticState := "UNAVAILABLE"
+	semanticProvider := ProviderSemanticFix
+	semanticScore := ScoreSemanticExact
 	semanticNotes := "real embedding model and vector IndexProvider are not wired (" + SemanticIndexUnavailableReason + "); fixture embeddings require explicit opt-in"
 	if ready.Semantic {
 		semanticState = "AVAILABLE"
 		semanticNotes = "explicitly enabled fixture-embedding generation over admitted ENRICH artifacts; not a model runtime, not SHA-256, not recovery authority"
+		if ready.SemanticReal {
+			semanticProvider = ProviderSemanticONNX
+			semanticScore = ScoreSemanticCosine
+			semanticNotes = "host-owned local ONNX/BGE embedding plus in-process zvec generation over durable semantic segments; disposable index, not recovery authority"
+		}
 	}
 	multimodalState := "UNAVAILABLE"
 	multimodalNotes := "real multimodal model and vector IndexProvider are not wired; fixture CLIP-class search requires explicit opt-in"
@@ -208,10 +361,10 @@ func DeclaredDimensions(ready ProviderReadiness) []Dimension {
 		},
 		{
 			ID:             DimensionSemantic,
-			Provider:       ProviderSemanticFix,
+			Provider:       semanticProvider,
 			State:          semanticState,
 			Version:        "1",
-			ScoreSemantics: ScoreSemanticExact,
+			ScoreSemantics: semanticScore,
 			Notes:          semanticNotes,
 		},
 		{
@@ -309,7 +462,25 @@ func LexicalCoverageFields() []string {
 func IndexerReadiness(idx *Indexer) ProviderReadiness {
 	ready := idx != nil && idx.Store != nil && idx.Engine != nil
 	fixtures := ready && idx.EnableFixtureDimensions
-	return ProviderReadiness{Lexical: ready, Acoustic: fixtures, Semantic: fixtures, Multimodal: fixtures, Graph: ready}
+	providerReady := ready
+	if ready {
+		if health, ok := idx.SemanticProvider.(interface{ SemanticReady() bool }); ok {
+			providerReady = health.SemanticReady()
+		}
+	}
+	zvecReady := false
+	if ready && idx.SemanticZvec != nil {
+		if health, ok := idx.SemanticZvec.(ZvecGenerationReadiness); ok {
+			zvecReady = health.ZvecReady(idx.SemanticLibraryPath, idx.SemanticLibraryDigest, idx.SemanticManifest)
+		}
+	}
+	realSemantic := ready && providerReady && idx.SemanticProvider != nil && idx.SemanticZvec != nil &&
+		zvecReady &&
+		idx.SemanticManifest.Validate() == nil && strings.TrimSpace(idx.SemanticLibraryPath) != "" &&
+		strings.TrimSpace(idx.SemanticLibraryDigest) != "" && idx.semanticIndexReady.Load() && !idx.semanticUnavailable.Load()
+	fixtureSemantic := fixtures && (idx.SemanticManifest == (EmbeddingGenerationManifest{}) ||
+		idx.SemanticManifest.SemanticSpace == SemanticFixtureProfileV1)
+	return ProviderReadiness{Lexical: ready, Acoustic: fixtures, Semantic: fixtureSemantic || realSemantic, SemanticReal: realSemantic, Multimodal: fixtures, Graph: ready}
 }
 
 // NormalizeFuse accepts two or more declared dimension IDs. Duplicates drop.

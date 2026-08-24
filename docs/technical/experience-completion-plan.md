@@ -1,5 +1,9 @@
 # Experience Completion Plan
 
+> **Retired adapter plan.** The historical OpenSubsonic, OPDS, and Inbox
+> compatibility surface was removed from the daemon. This document is kept as
+> historical context only; it is not an implementation queue or release gate.
+
 > **Status:** Archived optional-adapter experiment, reclassified 2026-08-19. D1–D5 record interface and request-sequence harness coverage only; they are not a completed user experience, live-client qualification, or `RW-MVP-1` progress. D6 is a closed non-goal, not a completed feature. All adapter feature work is maintenance-only until [Core MVP Execution Plan](core-mvp-execution-plan.md) closes. This document adds no product requirement or release gate.
 
 This file now preserves the completed adapter experiments and their limits. It is not an active implementation queue. Do not embed a media server, extend these adapters ahead of core work, or wait for live FUSE to prove the catalog.

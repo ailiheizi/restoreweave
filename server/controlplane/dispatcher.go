@@ -29,6 +29,9 @@ type Dispatcher struct {
 	catalogPath       string
 	socketPath        string
 	configDigest      string
+	indexBinding      search.IndexBinding
+	vectorPath        string
+	semanticBinding   semanticIndexerBinding
 	now               func() time.Time
 	exact             *exact.Service
 	search            *search.Indexer
@@ -40,6 +43,17 @@ type Dispatcher struct {
 	unimplemented     []string
 }
 
+// semanticIndexerBinding is a host-owned runtime handoff. It is deliberately
+// not persisted or exposed through the command ABI; a missing binding keeps
+// the default daemon's semantic capability unavailable.
+type semanticIndexerBinding struct {
+	provider      search.SemanticEmbeddingProvider
+	zvec          search.ZvecGenerationDriver
+	libraryPath   string
+	libraryDigest string
+	manifest      search.EmbeddingGenerationManifest
+}
+
 // DispatcherOption configures optional exact-lane handlers.
 type DispatcherOption func(*Dispatcher)
 
@@ -48,6 +62,46 @@ type DispatcherOption func(*Dispatcher)
 func WithConfigDigest(digest string) DispatcherOption {
 	return func(d *Dispatcher) {
 		d.configDigest = strings.TrimSpace(digest)
+		// The effective config is authoritative when both options are used.
+		// This keeps option order deterministic and prevents a stale binding
+		// digest from being attached to a current daemon profile.
+		d.indexBinding.ConfigDigest = d.configDigest
+	}
+}
+
+// WithIndexBinding binds daemon-created index generations to the resolved
+// configuration and immutable provider/profile identities.
+func WithIndexBinding(binding search.IndexBinding) DispatcherOption {
+	return func(d *Dispatcher) {
+		if strings.TrimSpace(d.configDigest) != "" {
+			binding.ConfigDigest = d.configDigest
+		}
+		d.indexBinding = binding
+		if strings.TrimSpace(d.configDigest) == "" {
+			d.configDigest = strings.TrimSpace(binding.ConfigDigest)
+		}
+	}
+}
+
+// WithVectorPath binds disposable search generations to the persisted vector
+// location selected by the operator profile. Daemon callers should always
+// provide this path; the repository-relative fallback below is retained for
+// low-level harnesses that construct a dispatcher without resolved config.
+func WithVectorPath(path string) DispatcherOption {
+	return func(d *Dispatcher) {
+		d.vectorPath = strings.TrimSpace(path)
+	}
+}
+
+// WithSemanticIndexerBinding installs an already-admitted semantic worker and
+// zvec driver. The caller remains responsible for process proof, bundle
+// admission, and native-library digest validation before invoking this option.
+func WithSemanticIndexerBinding(provider search.SemanticEmbeddingProvider, zvec search.ZvecGenerationDriver, libraryPath, libraryDigest string, manifest search.EmbeddingGenerationManifest) DispatcherOption {
+	return func(d *Dispatcher) {
+		d.semanticBinding = semanticIndexerBinding{
+			provider: provider, zvec: zvec, libraryPath: strings.TrimSpace(libraryPath),
+			libraryDigest: strings.TrimSpace(libraryDigest), manifest: manifest,
+		}
 	}
 }
 
@@ -81,6 +135,16 @@ func WithExactDir(store *sqlite.Store, repoDir string) (DispatcherOption, error)
 		return nil, err
 	}
 	return WithExact(&exact.Service{Store: store, Repo: repo}), nil
+}
+
+// WarmSemanticGeneration reopens a previously built real semantic index for
+// one workspace after process restart. It does not rebuild or mutate durable
+// descriptions and annotations.
+func (d *Dispatcher) WarmSemanticGeneration(ctx context.Context, workspaceID string) error {
+	if d == nil || d.search == nil {
+		return search.ErrUnavailable
+	}
+	return d.search.WarmSemanticGeneration(ctx, workspaceID)
 }
 
 // NewDispatcher wires the control plane to the opened catalog. catalogPath is
@@ -144,11 +208,38 @@ func NewDispatcher(store *sqlite.Store, catalogPath, socketPath string, opts ...
 		implemented[command.OpContentRead] = true
 		implemented[command.OpContentClose] = true
 		if dispatcher.search == nil && dispatcher.exact.Repo != nil {
-			dir := filepath.Join(dispatcher.exact.Repo.Root(), "indexes")
+			dir := dispatcher.vectorPath
+			if dir == "" {
+				dir = filepath.Join(dispatcher.exact.Repo.Root(), "indexes")
+			}
+			binding := dispatcher.indexBinding
+			semantic := dispatcher.semanticBinding
+			if strings.TrimSpace(binding.ConfigDigest) == "" {
+				binding.ConfigDigest = dispatcher.configDigest
+			}
+			if binding.SemanticManifest == (search.EmbeddingGenerationManifest{}) && semantic.manifest != (search.EmbeddingGenerationManifest{}) {
+				binding.SemanticManifest = semantic.manifest
+				binding.SemanticProfileDigest = semantic.manifest.CanonicalDigest()
+				binding.SemanticSpace = semantic.manifest.SemanticSpace
+			}
 			dispatcher.search = &search.Indexer{
 				Store:                   store,
 				Engine:                  &search.Engine{Dir: dir},
 				EnableFixtureDimensions: dispatcher.fixtureDimensions,
+				ConfigDigest:            binding.ConfigDigest,
+				LexicalProfileDigest:    binding.LexicalProfileDigest,
+				SemanticProfileDigest:   binding.SemanticProfileDigest,
+				MultimodalProfileDigest: binding.MultimodalProfileDigest,
+				AcousticProfileDigest:   binding.AcousticProfileDigest,
+				GraphProfileDigest:      binding.GraphProfileDigest,
+				SemanticSpace:           binding.SemanticSpace,
+				MultimodalSemanticSpace: binding.MultimodalSemanticSpace,
+				SemanticManifest:        binding.SemanticManifest,
+				MultimodalManifest:      binding.MultimodalManifest,
+				SemanticProvider:        dispatcher.semanticBinding.provider,
+				SemanticZvec:            dispatcher.semanticBinding.zvec,
+				SemanticLibraryPath:     dispatcher.semanticBinding.libraryPath,
+				SemanticLibraryDigest:   dispatcher.semanticBinding.libraryDigest,
 			}
 		}
 		if dispatcher.search != nil && dispatcher.fixtureDimensions {
@@ -409,6 +500,11 @@ func (d *Dispatcher) handleCapabilityList(env command.Envelope, started time.Tim
 		},
 	)
 	for _, dimension := range search.DeclaredDimensions(search.IndexerReadiness(d.search)) {
+		if dimension.ID == search.DimensionSemantic && dimension.State == command.CapabilityUnavailable && d.search != nil {
+			if failure := strings.TrimSpace(d.search.SemanticFailure()); failure != "" {
+				dimension.Notes += "; latest rebuild failed: " + failure
+			}
+		}
 		capabilities = append(capabilities, command.Capability{
 			Kind:    search.CapabilityKindDimension,
 			ID:      dimension.ID,

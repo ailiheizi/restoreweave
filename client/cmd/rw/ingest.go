@@ -437,15 +437,23 @@ func newRecoveryCommand(env *clientEnv) *cobra.Command {
 					return err
 				}
 				out := cmd.OutOrStdout()
-				fmt.Fprintf(out, "token schema:      %s\n", data.TokenSchema)
+				fmt.Fprintf(out, "token set schema:  %s\n", data.TokenSetSchema)
 				fmt.Fprintf(out, "snapshot:          %s\n", data.SnapshotRef)
+				fmt.Fprintf(out, "domain:            %s\n", data.PublicationDomain)
 				fmt.Fprintf(out, "subject:           %s\n", data.SubjectRef)
-				fmt.Fprintf(out, "reference id:      %s\n", data.RecoveryReferenceID)
-				fmt.Fprintf(out, "expected digest:   %s\n", data.ExpectedContentID)
-				fmt.Fprintf(out, "expected length:   %d\n", data.ExpectedLength)
-				fmt.Fprintf(out, "commit:            %s\n", data.PublicationCommitRef)
-				fmt.Fprintf(out, "anchor:            %s\n", data.TrustAnchorRef)
-				fmt.Fprintf(out, "token digest:      %s\n", data.TokenDigest)
+				fmt.Fprintf(out, "outcome:           %s\n", data.ProtectionOutcome)
+				fmt.Fprintf(out, "tokens:            %d\n", len(data.Tokens))
+				for index, token := range data.Tokens {
+					fmt.Fprintf(out, "token %d schema:     %s\n", index+1, token.TokenSchema)
+					fmt.Fprintf(out, "token %d reference:  %s (%s)\n", index+1, token.RecoveryReferenceID, token.ReferenceKind)
+					fmt.Fprintf(out, "token %d claim:      %s\n", index+1, token.ProtectionClaim)
+					fmt.Fprintf(out, "token %d digest:     %s\n", index+1, token.TokenDigest)
+				}
+				if data.Unprotected != nil {
+					fmt.Fprintf(out, "unprotected:       %s\n", data.Unprotected.ProtectionOutcome)
+					fmt.Fprintf(out, "unprotected record: %s\n", data.Unprotected.RecordDigest)
+				}
+				fmt.Fprintf(out, "set digest:        %s\n", data.TokenSetDigest)
 				return nil
 			})
 		}).Command)

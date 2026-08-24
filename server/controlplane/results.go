@@ -64,12 +64,23 @@ func failed(env command.Envelope, started time.Time, reason command.Reason) comm
 func unknownExternalOutcomeResult(env command.Envelope, started time.Time, err error) command.Result {
 	reason := newReason(ReasonCodeUnknownExternalOutcome, err.Error())
 	reason.Retryable = false
+	arguments := map[string]any{
+		"state":       "NEEDS_RECONCILIATION",
+		"reason_code": ReasonCodeNeedsReconciliation,
+	}
+	if env.Operation == command.OpPlanApply {
+		var input map[string]any
+		if json.Unmarshal(env.Input, &input) == nil {
+			for _, key := range []string{"workspace_id", "plan_id", "plan_ref", "plan_digest"} {
+				if value, ok := input[key]; ok {
+					arguments[key] = value
+				}
+			}
+		}
+	}
 	reason.Resolution = &command.Resolution{
-		Action: "reconcile",
-		Arguments: map[string]any{
-			"state":       "NEEDS_RECONCILIATION",
-			"reason_code": ReasonCodeNeedsReconciliation,
-		},
+		Action:    command.OpPlanApply,
+		Arguments: arguments,
 	}
 	reason.Details = map[string]any{"state": "NEEDS_RECONCILIATION"}
 	return command.NewResult(env, command.StatusUnknownExternalOutcome, started, time.Now().UTC(), nil, reason)

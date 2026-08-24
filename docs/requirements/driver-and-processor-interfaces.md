@@ -400,7 +400,25 @@ Receipt:
 
 `OpenProfileWithCompression` admits only `directory-cas-dev-v1 + identity-v1` and `local-zstd-v1 + zstd-v1`. Both implement payload and portable-record interfaces; the zstd driver transparently decodes payloads before callers hash or read them, while signed prepared/commit JSON remains uncompressed. `DescribeProfile` supplies status-only tuple metadata without making it a new storage requirement for third-party drivers. The repository root has a fail-closed profile marker so the two physical formats cannot be reinterpreted in place.
 
-This is not full conformance with section 9. It does not yet expose placement estimation, capacity, GC/reachability, repair, encryption/key state, backend placement references, dependency closure, or a complete placement receipt. The signed payload aggregate separately binds repository identity, logical content IDs, and logical lengths. `StoredBytes` remains unsigned telemetry so backend recompression or relocation cannot change portable content identity.
+This is not full conformance with section 9. Core-owned raw and local-zstd
+drivers additionally expose an optional capability/health report that states
+their embedded reader dependency, whole-file chunking, `NONE` encryption,
+`NOT_REQUIRED` key state, and explicitly unknown capacity; the clean-install
+read-only wrapper removes write and repair capability. That report does not
+add placement estimation, reachability/GC, encryption/key management,
+backend placement references, dependency closure, or a complete placement
+receipt. The signed payload aggregate separately binds repository identity,
+logical content IDs, and logical lengths. `StoredBytes` remains unsigned
+telemetry so backend recompression or relocation cannot change portable content
+identity.
+
+They also expose read-only `ValidateTarget` and `EstimatePlacement` seams. The
+former checks an existing profile marker and repository identity without
+initializing or adopting state. The latter consumes a candidate stream,
+independently computes its SHA-256 identity, and returns a non-receipt estimate;
+raw storage is exact for its profile and zstd reports the measured compressed
+candidate bytes. Neither operation mutates the repository or authorizes a
+placement.
 
 ## 10. IndexProvider and QueryProvider contracts
 

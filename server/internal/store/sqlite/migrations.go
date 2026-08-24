@@ -1515,6 +1515,45 @@ CREATE TABLE export_manifests (
 PRAGMA user_version = 19;
 `,
 	},
+	{
+		version: 20,
+		name:    "index_generation_profile_binding",
+		sql: `
+ALTER TABLE index_generations ADD COLUMN config_digest TEXT NOT NULL DEFAULT '';
+ALTER TABLE index_generations ADD COLUMN provider_profile_digest TEXT NOT NULL DEFAULT '';
+ALTER TABLE index_generations ADD COLUMN semantic_space TEXT NOT NULL DEFAULT '';
+
+PRAGMA user_version = 20;
+`,
+	},
+	{
+		version: 21,
+		name:    "description_profile_binding",
+		sql: `
+ALTER TABLE description_documents ADD COLUMN config_digest TEXT NOT NULL DEFAULT '';
+ALTER TABLE description_documents ADD COLUMN producer_profile_digest TEXT NOT NULL DEFAULT '';
+ALTER TABLE semantic_segments ADD COLUMN document_revision INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE semantic_segments ADD COLUMN segmentation_profile_digest TEXT NOT NULL DEFAULT '';
+
+-- Existing immutable rows predate the explicit bindings. Config/profile
+-- identities remain empty in the catalog until a host republishes a revision;
+-- portable export derives the deterministic fallback for legacy rows without
+-- mutating their authoritative body.
+DROP TRIGGER semantic_segments_no_update;
+UPDATE semantic_segments
+SET document_revision = COALESCE((SELECT revision FROM description_documents
+    WHERE description_documents.workspace_id = semantic_segments.workspace_id
+      AND description_documents.description_document_id = semantic_segments.description_document_id), 1),
+    segmentation_profile_digest = 'sha256:6234b18c290a6aa3ecd73419b2039693b9f2961143d8a4d4d9ba1491bf1a8ad9'
+WHERE segmentation_profile_digest = '';
+CREATE TRIGGER semantic_segments_no_update
+BEFORE UPDATE ON semantic_segments BEGIN
+    SELECT RAISE(ABORT, 'semantic segments are immutable');
+END;
+
+PRAGMA user_version = 21;
+`,
+	},
 }
 
 func (s *Store) migrate(ctx context.Context) error {

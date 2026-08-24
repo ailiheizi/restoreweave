@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -15,6 +16,140 @@ import (
 	"github.com/ailiheizi/restoreweave/server/internal/scanner"
 	"github.com/ailiheizi/restoreweave/server/internal/store/sqlite"
 )
+
+type payloadPlacementResponseLossRepo struct {
+	*repository.Dir
+	lost bool
+}
+
+type payloadPlacementFailureRepo struct{ *repository.Dir }
+
+// dishonestPayloadReadbackRepo accepts the expected object but exposes
+// different bytes through the reader used by the exact lane. The publication
+// helper must hash that stream instead of trusting Verify alone.
+type dishonestPayloadReadbackRepo struct {
+	*repository.Dir
+	contentID string
+	payload   []byte
+}
+
+func (r *dishonestPayloadReadbackRepo) Open(ctx context.Context, contentID string) (io.ReadCloser, error) {
+	if contentID == r.contentID {
+		return io.NopCloser(bytes.NewReader(append([]byte(nil), r.payload...))), nil
+	}
+	return r.Dir.Open(ctx, contentID)
+}
+
+func (r *payloadPlacementFailureRepo) PlaceExact(context.Context, string, io.Reader) (repository.Receipt, error) {
+	return repository.Receipt{}, errors.New("payload placement unavailable before commit")
+}
+
+func (r *payloadPlacementResponseLossRepo) PlaceExact(ctx context.Context, contentID string, body io.Reader) (repository.Receipt, error) {
+	receipt, err := r.Dir.PlaceExact(ctx, contentID, body)
+	if err == nil && !r.lost {
+		r.lost = true
+		return repository.Receipt{}, errors.New("response lost after exact payload placement")
+	}
+	return receipt, err
+}
+
+func TestIngestAdoptsExactPayloadAfterPlacementResponseLoss(t *testing.T) {
+	ctx := context.Background()
+	source := t.TempDir()
+	payload := []byte("payload placement response loss")
+	if err := os.WriteFile(filepath.Join(source, "payload.txt"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "catalog.sqlite"), sqlite.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	baseRepo, err := repository.OpenDir(filepath.Join(t.TempDir(), "repository"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := &payloadPlacementResponseLossRepo{Dir: baseRepo}
+	service := &Service{Store: store, Repo: repo}
+
+	result, err := service.Ingest(ctx, source)
+	if err != nil {
+		t.Fatalf("ingest after placement response loss: %v", err)
+	}
+	if result.LocalFiles != 1 || result.NewBytes != 0 {
+		t.Fatalf("placement recovery accounting = %+v", result)
+	}
+	digest := sha256.Sum256(payload)
+	contentID := "sha256:" + hex.EncodeToString(digest[:])
+	if err := repo.Verify(ctx, contentID); err != nil {
+		t.Fatalf("recovered payload readback: %v", err)
+	}
+}
+
+func TestIngestPayloadPlacementWithoutReadbackIsTypedUnknown(t *testing.T) {
+	ctx := context.Background()
+	source := t.TempDir()
+	payload := []byte("payload placement never committed")
+	if err := os.WriteFile(filepath.Join(source, "payload.txt"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "catalog.sqlite"), sqlite.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	baseRepo, err := repository.OpenDir(filepath.Join(t.TempDir(), "repository"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := &payloadPlacementFailureRepo{Dir: baseRepo}
+	service := &Service{Store: store, Repo: repo}
+
+	_, err = service.Ingest(ctx, source)
+	if !errors.Is(err, ErrUnknownExternalOutcome) || !errors.Is(err, ErrNeedsReconciliation) {
+		t.Fatalf("payload placement error = %v, want typed unknown reconciliation outcome", err)
+	}
+	var outcome *PayloadPlacementOutcomeError
+	if !errors.As(err, &outcome) || outcome.ContentID == "" {
+		t.Fatalf("payload placement outcome = %#v, err=%v", outcome, err)
+	}
+	if verifyErr := repo.Verify(ctx, outcome.ContentID); !errors.Is(verifyErr, repository.ErrNotFound) {
+		t.Fatalf("unexpected payload readback = %v", verifyErr)
+	}
+}
+
+func TestIngestRejectsDishonestPayloadReadbackBeforePublication(t *testing.T) {
+	ctx := context.Background()
+	source := t.TempDir()
+	payload := []byte("payload bytes that were placed")
+	if err := os.WriteFile(filepath.Join(source, "payload.txt"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(payload)
+	contentID := "sha256:" + hex.EncodeToString(digest[:])
+	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "catalog.sqlite"), sqlite.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	baseRepo, err := repository.OpenDir(filepath.Join(t.TempDir(), "repository"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong := append([]byte(nil), payload...)
+	wrong[0] ^= 0xff
+	repo := &dishonestPayloadReadbackRepo{Dir: baseRepo, contentID: contentID, payload: wrong}
+	service := &Service{Store: store, Repo: repo}
+
+	_, err = service.Ingest(ctx, source)
+	if !errors.Is(err, ErrUnknownExternalOutcome) || !errors.Is(err, ErrNeedsReconciliation) {
+		t.Fatalf("dishonest payload readback error = %v, want typed unknown reconciliation outcome", err)
+	}
+	var outcome *PayloadPlacementOutcomeError
+	if !errors.As(err, &outcome) || outcome.ContentID != contentID {
+		t.Fatalf("dishonest payload outcome = %#v, err=%v", outcome, err)
+	}
+}
 
 func TestIngestPlacesAndRestoresAfterCatalogLoss(t *testing.T) {
 	ctx := context.Background()

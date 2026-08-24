@@ -1,8 +1,8 @@
 // Package processor is the host-owned Processor seam: typed routes, opaque
 // handles, staging/seal/admit, and a bounded in-process RUN_STAGE pool.
 // Large bytes stay in host-owned handles. The legacy plugin category model
-// is not imported. Linux bubblewrap isolation is planned by
-// processor/sandbox (argv is tested on every OS; execution is Linux-only).
+// is not imported. Real semantic workers use an authenticated child process;
+// Linux may add bubblewrap isolation through processor/sandbox.
 // The protobuf/gRPC FD control plane lives in processor/rpc: length-prefixed
 // Unix protobuf frames, grpc-go wrapping of the same messages, and SCM_RIGHTS
 // for source/staging bytes. Default ingest remains in-process RUN_STAGE.

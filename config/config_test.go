@@ -37,6 +37,54 @@ func TestDefaultEnablesLocalSemanticProfile(t *testing.T) {
 	if cfg.Recovery.PublicationSigning != PublicationSigningLocalEd25519 || cfg.Recovery.PublicationDomain != DefaultPublicationDomain {
 		t.Fatalf("default recovery signing = %+v", cfg.Recovery)
 	}
+	if cfg.Descriptions.ProviderProfile != "" || cfg.Descriptions.Generate != "on_demand" {
+		t.Fatalf("default description profile = %+v", cfg.Descriptions)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("default config should validate with an unselected on-demand provider: %v", err)
+	}
+}
+
+func TestTOMLIsCanonicalAndPreservesExplicitFalse(t *testing.T) {
+	cfg := Default()
+	cfg.Storage.AllowLinkOnly = false
+	cfg.Storage.LinkOnlyRequiresConfirmation = false
+	cfg.Descriptions.Enabled = false
+	cfg.Descriptions.Generate = "disabled"
+	payload, err := MarshalTOML(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeTOML(strings.NewReader(string(payload)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Storage.AllowLinkOnly || decoded.Storage.LinkOnlyRequiresConfirmation || decoded.Descriptions.Enabled {
+		t.Fatalf("explicit false values were defaulted: %+v", decoded)
+	}
+	if !strings.Contains(string(payload), "[paths]") || strings.Contains(string(payload), "yaml") {
+		t.Fatalf("unexpected TOML payload: %s", payload)
+	}
+}
+
+func TestDefaultConfigPathUsesTOML(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if got := DefaultConfigPath(); filepath.Ext(got) != ".toml" {
+		t.Fatalf("default config path = %q, want TOML", got)
+	}
+}
+
+func TestDescriptionProviderIsRequiredOnlyForOnIngest(t *testing.T) {
+	onDemand := Default()
+	onDemand.Descriptions.ProviderProfile = ""
+	if err := Validate(onDemand); err != nil {
+		t.Fatalf("empty on-demand provider rejected: %v", err)
+	}
+	onIngest := onDemand
+	onIngest.Descriptions.Generate = "on_ingest"
+	if err := Validate(onIngest); err == nil || !strings.Contains(err.Error(), "on_ingest") {
+		t.Fatalf("empty on-ingest provider error = %v", err)
+	}
 }
 
 func TestStorageProfileTuples(t *testing.T) {

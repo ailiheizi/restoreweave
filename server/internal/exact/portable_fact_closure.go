@@ -3,6 +3,8 @@ package exact
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -57,6 +59,10 @@ type portableFactAttachment struct {
 	LogicalLength int64  `json:"logical_length"`
 	ReaderProfile string `json:"reader_profile"`
 	RepositoryID  string `json:"repository_id"`
+	// body is an in-process placement input only. It is deliberately omitted
+	// from the signed bundle; ContentID/LogicalLength are the authenticated
+	// portable attachment identity.
+	body []byte `json:"-"`
 }
 
 type subjectMappingPayload struct {
@@ -79,25 +85,27 @@ type subjectMappingPayload struct {
 }
 
 type descriptionPortablePayload struct {
-	ID               string                 `json:"id"`
-	WorkspaceID      string                 `json:"workspace_id"`
-	SubjectRef       string                 `json:"subject_ref"`
-	Kind             sqlite.DescriptionKind `json:"kind"`
-	Title            string                 `json:"title"`
-	Language         string                 `json:"language"`
-	BodyDigest       string                 `json:"body_digest"`
-	SourceRef        string                 `json:"source_ref"`
-	ProducerProfile  string                 `json:"producer_profile"`
-	Confidence       *float64               `json:"confidence,omitempty"`
-	Coverage         *float64               `json:"coverage,omitempty"`
-	Visibility       string                 `json:"visibility"`
-	Accepted         bool                   `json:"accepted"`
-	Revision         int64                  `json:"revision"`
-	PredecessorID    string                 `json:"predecessor_id,omitempty"`
-	Metadata         json.RawMessage        `json:"metadata"`
-	CreatedAt        time.Time              `json:"created_at"`
-	UpdatedAt        time.Time              `json:"updated_at"`
-	BodyAttachmentID string                 `json:"body_attachment_id"`
+	ID                    string                 `json:"id"`
+	WorkspaceID           string                 `json:"workspace_id"`
+	SubjectRef            string                 `json:"subject_ref"`
+	Kind                  sqlite.DescriptionKind `json:"kind"`
+	Title                 string                 `json:"title"`
+	Language              string                 `json:"language"`
+	BodyDigest            string                 `json:"body_digest"`
+	SourceRef             string                 `json:"source_ref"`
+	ProducerProfile       string                 `json:"producer_profile"`
+	ConfigDigest          string                 `json:"config_digest,omitempty"`
+	ProducerProfileDigest string                 `json:"producer_profile_digest,omitempty"`
+	Confidence            *float64               `json:"confidence,omitempty"`
+	Coverage              *float64               `json:"coverage,omitempty"`
+	Visibility            string                 `json:"visibility"`
+	Accepted              bool                   `json:"accepted"`
+	Revision              int64                  `json:"revision"`
+	PredecessorID         string                 `json:"predecessor_id,omitempty"`
+	Metadata              json.RawMessage        `json:"metadata"`
+	CreatedAt             time.Time              `json:"created_at"`
+	UpdatedAt             time.Time              `json:"updated_at"`
+	BodyAttachmentID      string                 `json:"body_attachment_id"`
 }
 
 type artifactPortablePayload struct {
@@ -124,9 +132,14 @@ type artifactPortablePayload struct {
 	BodyAttachmentID string                        `json:"body_attachment_id"`
 }
 
+type portableSemanticSourceSpan struct {
+	StartByte int `json:"start_byte"`
+	EndByte   int `json:"end_byte"`
+}
+
 var errPortableFactConflict = errors.New("conflicting portable fact closure")
 
-func (s *Service) publishPortableFactClosure(ctx context.Context, workspaceID, snapshotRef, parentDigest string) error {
+func (s *Service) publishPortableFactClosure(ctx context.Context, workspaceID, snapshotRef, parentDigest string) (retErr error) {
 	if !s.signedPublicationEnabled() {
 		return nil
 	}
@@ -143,7 +156,12 @@ func (s *Service) publishPortableFactClosure(ctx context.Context, workspaceID, s
 	if err != nil {
 		return err
 	}
-	defer func() { _ = lease.release() }()
+	ctx = lease.context()
+	defer func() {
+		if releaseErr := lease.release(); releaseErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("%w: %w: release portable fact publication lease: %v", ErrNeedsReconciliation, ErrPublicationLeaseRelease, releaseErr))
+		}
+	}()
 	publications, err := s.committedPublications(ctx)
 	if err != nil {
 		return err
@@ -161,7 +179,7 @@ func (s *Service) publishPortableFactClosure(ctx context.Context, workspaceID, s
 	if parent.Commit.TargetIdentity != driver.RepositoryIdentity() || parent.Commit.PublicationDomain != s.PublicationDomain || parent.Commit.SnapshotRef != snapshotRef || parent.Commit.ManifestDigest != parent.Manifest.ManifestDigest {
 		return errors.New("portable fact closure parent binding mismatch")
 	}
-	bundle, attachments, err := s.buildPortableFactBundle(ctx, workspaceID, parent.Manifest, driver.RepositoryIdentity())
+	bundle, attachments, err := s.buildPortableFactBundleUnplaced(ctx, workspaceID, parent.Manifest, driver.RepositoryIdentity())
 	if err != nil {
 		return err
 	}
@@ -188,8 +206,14 @@ func (s *Service) publishPortableFactClosure(ctx context.Context, workspaceID, s
 		}
 	}
 	for _, attachment := range attachments {
-		if err := s.Repo.Verify(ctx, attachment.ContentID); err != nil {
+		if err := s.validatePublicationFence(ctx, lease); err != nil {
+			return err
+		}
+		if _, err := placePortableAttachmentWithReadback(ctx, s.Repo, attachment); err != nil {
 			return fmt.Errorf("portable fact attachment %s: %w", attachment.AttachmentID, err)
+		}
+		if err := s.validatePublicationFence(ctx, lease); err != nil {
+			return err
 		}
 	}
 	processorDigest, err := s.admittedProcessorAttemptDigest(ctx, workspaceID, snapshotRef, parentDigest)
@@ -220,9 +244,15 @@ func (s *Service) publishPortableFactClosure(ctx context.Context, workspaceID, s
 	}
 	receipt, err := driver.PlaceRecord(ctx, repository.RecordPortableFactClosure, bytes.NewReader(payload))
 	if err != nil {
-		return err
+		return s.reconcileUnknownChildOutcome(ctx, driver, repository.RecordPortableFactClosure, payload, parent.Commit.PublicationID, snapshotRef, parentDigest, parent.Commit.PlanDigest, fmt.Errorf("place portable fact closure: %w", err))
 	}
-	return driver.VerifyRecord(ctx, receipt)
+	if err := driver.VerifyRecord(ctx, receipt); err != nil {
+		return s.reconcileUnknownChildOutcome(ctx, driver, repository.RecordPortableFactClosure, payload, parent.Commit.PublicationID, snapshotRef, parentDigest, parent.Commit.PlanDigest, fmt.Errorf("verify portable fact closure: %w", err))
+	}
+	if err := s.validatePublicationFence(ctx, lease); err != nil {
+		return s.reconcileUnknownChildOutcome(ctx, driver, repository.RecordPortableFactClosure, payload, parent.Commit.PublicationID, snapshotRef, parentDigest, parent.Commit.PlanDigest, err)
+	}
+	return nil
 }
 
 // PublishPortableFactClosure explicitly reconciles the current catalog facts
@@ -242,47 +272,51 @@ func (s *Service) admittedProcessorAttemptDigest(ctx context.Context, workspaceI
 	if len(artifacts) == 0 {
 		return "", nil
 	}
-	if s.TrustAnchor == nil || strings.TrimSpace(s.PublicationDomain) == "" {
-		return "", errors.New("processor closure discovery requires trust anchor and publication domain")
-	}
-	driver, err := s.publicationRecordDriver()
+	entries, err := s.processorAttemptClosureEntries(ctx, snapshotRef)
 	if err != nil {
 		return "", err
 	}
-	digests, err := driver.ListRecordDigests(ctx, repository.RecordProcessorAttemptClosure)
-	if err != nil {
-		return "", err
-	}
-	for _, digest := range digests {
-		payload, err := readRecord(ctx, driver, repository.RecordProcessorAttemptClosure, digest)
-		if err != nil {
-			return "", err
+	for index := len(entries) - 1; index >= 0; index-- {
+		entry := entries[index]
+		if entry.Envelope.Closure.ParentCommitDigest != parentDigest {
+			continue
 		}
-		if objectDigest := DigestBytes(payload); objectDigest != digest {
-			return "", errors.New("processor attempt closure object digest mismatch")
+		if entry.Envelope.Closure.WorkspaceID != workspaceID {
+			return "", errors.New("processor attempt closure workspace binding mismatch")
 		}
-		var envelope ProcessorAttemptClosureEnvelope
-		if err := decodeStrictRecord(payload, &envelope); err != nil {
-			return "", err
-		}
-		if envelope.Schema != ProcessorAttemptClosureEnvelopeSchemaV1 {
-			return "", errors.New("unsupported processor attempt closure envelope schema")
-		}
-		if envelope.Closure.ParentCommitDigest == parentDigest {
-			if err := envelope.Closure.Verify(*s.TrustAnchor); err != nil {
-				return "", err
-			}
-			// The portable-fact child binds the full signed envelope object,
-			// not the closure field alone. A reader resolves this object
-			// digest and re-verifies its envelope before accepting artifact
-			// descriptors.
-			return digest, nil
-		}
+		// The portable-fact child binds the full signed envelope object, not the
+		// closure field alone. The catalog-free reader resolves this object
+		// digest and re-verifies its envelope before accepting artifacts.
+		return entry.ObjectDigest, nil
 	}
 	return "", errors.New("admitted processor artifacts have no authenticated processor-attempt child")
 }
 
+func placePortableAttachmentWithReadback(ctx context.Context, repo repository.Driver, attachment portableFactAttachment) (repository.Receipt, error) {
+	if !validExactContentID(attachment.ContentID) || attachment.LogicalLength < 0 ||
+		int64(len(attachment.body)) != attachment.LogicalLength || DigestBytes(attachment.body) != attachment.ContentID {
+		return repository.Receipt{}, errors.New("portable attachment body identity is invalid")
+	}
+	return placeExactWithReadback(ctx, repo, attachment.ContentID, attachment.LogicalLength, bytes.NewReader(attachment.body))
+}
+
+// buildPortableFactBundle is retained for package-local callers that need a
+// materialized fixture. The publication path uses buildPortableFactBundleUnplaced
+// and performs attachment placement under its active publication lease.
 func (s *Service) buildPortableFactBundle(ctx context.Context, workspaceID string, manifest Manifest, repositoryID string) (portableFactBundle, []portableFactAttachment, error) {
+	bundle, attachments, err := s.buildPortableFactBundleUnplaced(ctx, workspaceID, manifest, repositoryID)
+	if err != nil {
+		return bundle, attachments, err
+	}
+	for _, attachment := range attachments {
+		if _, err := placePortableAttachmentWithReadback(ctx, s.Repo, attachment); err != nil {
+			return portableFactBundle{}, nil, err
+		}
+	}
+	return bundle, attachments, nil
+}
+
+func (s *Service) buildPortableFactBundleUnplaced(ctx context.Context, workspaceID string, manifest Manifest, repositoryID string) (portableFactBundle, []portableFactAttachment, error) {
 	snapshotRef := manifest.SnapshotRef
 	root, err := s.Store.GetNamespaceRootBySnapshotRef(ctx, snapshotRef)
 	if err != nil {
@@ -403,16 +437,18 @@ func (s *Service) buildPortableFactBundle(ctx context.Context, workspaceID strin
 			continue
 		}
 		bodyID := "attachment:description:" + doc.ID
-		bodyReceipt, e := s.Repo.Place(ctx, strings.NewReader(doc.Body))
-		if e != nil {
-			return bundle, nil, e
-		}
-		if bodyReceipt.ContentID != doc.BodyDigest || bodyReceipt.Bytes != int64(len(doc.Body)) {
+		bodyBytes := []byte(doc.Body)
+		bodyDigest := DigestBytes(bodyBytes)
+		if bodyDigest != doc.BodyDigest {
 			return bundle, nil, errors.New("description body attachment does not match its durable digest")
 		}
-		attachments = append(attachments, portableFactAttachment{AttachmentID: bodyID, Purpose: "DESCRIPTION_BODY", MediaType: "text/plain; charset=utf-8", ContentID: bodyReceipt.ContentID, LogicalLength: bodyReceipt.Bytes, ReaderProfile: "utf8-v1", RepositoryID: repositoryID})
-		payload := descriptionPortablePayload{ID: doc.ID, WorkspaceID: doc.WorkspaceID, SubjectRef: doc.SubjectRef, Kind: doc.Kind, Title: doc.Title, Language: doc.Language, BodyDigest: doc.BodyDigest, SourceRef: doc.SourceRef, ProducerProfile: doc.ProducerProfile, Confidence: doc.Confidence, Coverage: doc.Coverage, Visibility: doc.Visibility, Accepted: doc.Accepted, Revision: doc.Revision, PredecessorID: doc.PredecessorID, Metadata: doc.Metadata, CreatedAt: doc.CreatedAt, UpdatedAt: doc.UpdatedAt, BodyAttachmentID: bodyID}
-		if err := add("DESCRIPTION_REVISION", doc.ID, doc.SubjectRef, doc.Revision, doc.PredecessorID, payload, map[string]any{"source_ref": doc.SourceRef, "producer_profile": doc.ProducerProfile}); err != nil {
+		attachments = append(attachments, portableFactAttachment{AttachmentID: bodyID, Purpose: "DESCRIPTION_BODY", MediaType: "text/plain; charset=utf-8", ContentID: bodyDigest, LogicalLength: int64(len(bodyBytes)), ReaderProfile: "utf8-v1", RepositoryID: repositoryID, body: bodyBytes})
+		producerProfileDigest := doc.ProducerProfileDigest
+		if strings.TrimSpace(doc.ConfigDigest) == "" || strings.TrimSpace(producerProfileDigest) == "" {
+			return bundle, nil, errors.New("description revision lacks authenticated config or producer profile binding")
+		}
+		payload := descriptionPortablePayload{ID: doc.ID, WorkspaceID: doc.WorkspaceID, SubjectRef: doc.SubjectRef, Kind: doc.Kind, Title: doc.Title, Language: doc.Language, BodyDigest: doc.BodyDigest, SourceRef: doc.SourceRef, ProducerProfile: doc.ProducerProfile, ConfigDigest: doc.ConfigDigest, ProducerProfileDigest: producerProfileDigest, Confidence: doc.Confidence, Coverage: doc.Coverage, Visibility: doc.Visibility, Accepted: doc.Accepted, Revision: doc.Revision, PredecessorID: doc.PredecessorID, Metadata: doc.Metadata, CreatedAt: doc.CreatedAt, UpdatedAt: doc.UpdatedAt, BodyAttachmentID: bodyID}
+		if err := add("DESCRIPTION_REVISION", doc.ID, doc.SubjectRef, doc.Revision, doc.PredecessorID, payload, map[string]any{"source_ref": doc.SourceRef, "producer_profile": doc.ProducerProfile, "config_digest": doc.ConfigDigest, "producer_profile_digest": producerProfileDigest}); err != nil {
 			return bundle, nil, err
 		}
 		segments, e := s.Store.ListSemanticSegments(ctx, workspaceID, doc.ID)
@@ -420,7 +456,7 @@ func (s *Service) buildPortableFactBundle(ctx context.Context, workspaceID strin
 			return bundle, nil, e
 		}
 		for _, segment := range segments {
-			if err := add("SEMANTIC_SEGMENT", segment.ID, segment.SubjectRef, segment.Ordinal+1, "", segment, map[string]any{"description_document_id": doc.ID}); err != nil {
+			if err := add("SEMANTIC_SEGMENT", segment.ID, segment.SubjectRef, segment.Ordinal+1, "", segment, map[string]any{"description_document_id": doc.ID, "document_revision": segment.DocumentRevision, "segmentation_profile_digest": segment.SegmentationProfileDigest}); err != nil {
 				return bundle, nil, err
 			}
 		}
@@ -434,14 +470,12 @@ func (s *Service) buildPortableFactBundle(ctx context.Context, workspaceID strin
 			return bundle, nil, errors.New("processor artifact subject is absent from snapshot")
 		}
 		bodyID := "attachment:artifact:" + artifact.ID
-		receipt, e := s.Repo.Place(ctx, strings.NewReader(artifact.Body))
-		if e != nil {
-			return bundle, nil, e
-		}
-		if receipt.ContentID != artifact.Digest || receipt.Bytes != artifact.ByteLength {
+		bodyBytes := append([]byte(nil), artifact.Body...)
+		bodyDigest := DigestBytes(bodyBytes)
+		if bodyDigest != artifact.Digest || int64(len(bodyBytes)) != artifact.ByteLength {
 			return bundle, nil, errors.New("processor artifact attachment does not match its durable digest")
 		}
-		attachments = append(attachments, portableFactAttachment{AttachmentID: bodyID, Purpose: "PROCESSOR_ARTIFACT_BODY", MediaType: artifact.MediaType, ContentID: receipt.ContentID, LogicalLength: receipt.Bytes, ReaderProfile: "artifact:" + artifact.SchemaRef, RepositoryID: repositoryID})
+		attachments = append(attachments, portableFactAttachment{AttachmentID: bodyID, Purpose: "PROCESSOR_ARTIFACT_BODY", MediaType: artifact.MediaType, ContentID: bodyDigest, LogicalLength: int64(len(bodyBytes)), ReaderProfile: "artifact:" + artifact.SchemaRef, RepositoryID: repositoryID, body: bodyBytes})
 		payload := artifactPortablePayload{ID: artifact.ID, WorkspaceID: artifact.WorkspaceID, SubjectRef: artifact.SubjectRef, SnapshotRef: artifact.SnapshotRef, RouteDigest: artifact.RouteDigest, Stage: artifact.Stage, CapabilityID: artifact.CapabilityID, SchemaRef: artifact.SchemaRef, State: artifact.State, AuthorityClass: artifact.AuthorityClass, LifecycleClass: artifact.LifecycleClass, MediaType: artifact.MediaType, ByteLength: artifact.ByteLength, Digest: artifact.Digest, AttemptID: artifact.AttemptID, FenceToken: artifact.FenceToken, ProducerDigest: artifact.ProducerDigest, Envelope: artifact.Envelope, CreatedAt: artifact.CreatedAt, UpdatedAt: artifact.UpdatedAt, BodyAttachmentID: bodyID}
 		if err := add("PROCESSOR_ARTIFACT_DESCRIPTOR", artifact.ID, artifact.SubjectRef, 1, "", payload, map[string]any{"attempt_id": artifact.AttemptID, "producer_digest": artifact.ProducerDigest}); err != nil {
 			return bundle, nil, err
@@ -505,7 +539,8 @@ func listPortableFactClosures(ctx context.Context, repo repository.Driver, drive
 		if err := envelope.Closure.Verify(anchor); err != nil {
 			return nil, err
 		}
-		if envelope.Closure.CanonicalizationProfile != "encoding/json-compact-v1" ||
+		if envelope.Closure.BundleSchema != PortableFactBundleSchemaV1 ||
+			envelope.Closure.CanonicalizationProfile != "encoding/json-compact-v1" ||
 			!sameStrings(envelope.Closure.RequiredReaderDependencies, portableFactReaderDependencies(repo)) {
 			return nil, errors.New("portable fact closure reader dependencies are unavailable")
 		}
@@ -536,20 +571,8 @@ func listPortableFactClosures(ctx context.Context, repo repository.Driver, drive
 			if attachment.RepositoryID != driver.RepositoryIdentity() || !validExactContentID(attachment.ContentID) || attachment.LogicalLength < 0 {
 				return nil, errors.New("portable fact attachment descriptor is invalid")
 			}
-			if err := repo.Verify(ctx, attachment.ContentID); err != nil {
-				return nil, err
-			}
-			body, err := repo.Open(ctx, attachment.ContentID)
-			if err != nil {
-				return nil, err
-			}
-			length, readErr := io.Copy(io.Discard, body)
-			closeErr := body.Close()
-			if readErr != nil {
-				return nil, readErr
-			}
-			if closeErr != nil || length != attachment.LogicalLength {
-				return nil, fmt.Errorf("portable fact attachment %s length mismatch", attachment.AttachmentID)
+			if err := verifyExactObjectReadback(ctx, repo, attachment.ContentID, attachment.LogicalLength); err != nil {
+				return nil, fmt.Errorf("portable fact attachment %s: %w", attachment.AttachmentID, err)
 			}
 		}
 		if err := validateProcessorAttachmentChild(ctx, driver, anchor, envelope.Closure, bundle); err != nil {
@@ -576,6 +599,9 @@ func listPortableFactClosures(ctx context.Context, repo repository.Driver, drive
 		if err != nil || envelope.Closure.PredecessorClosureDigest != previousDigest {
 			return nil, errors.New("portable fact closure predecessor mismatch")
 		}
+		if envelope.Closure.SignedAt.Before(result[i-1].Closure.SignedAt) {
+			return nil, errors.New("portable fact closure signed time is not monotonic")
+		}
 	}
 	return result, nil
 }
@@ -588,6 +614,39 @@ func portableFactReaderDependencies(repo repository.Driver) []string {
 		"restoreweave-reader:portable-fact-v1",
 		"signature:ed25519-v1",
 	}
+}
+
+// verifyExactObjectReadback authenticates the bytes returned by the reader
+// itself. Repository.Verify is useful backend evidence, but cannot substitute
+// for hashing the stream that a clean reader will consume.
+func verifyExactObjectReadback(ctx context.Context, repo repository.Driver, contentID string, expectedLength int64) error {
+	if repo == nil {
+		return errors.New("repository is required")
+	}
+	if !validExactContentID(contentID) || expectedLength < 0 {
+		return errors.New("exact object identity is invalid")
+	}
+	body, err := repo.Open(ctx, contentID)
+	if err != nil {
+		return err
+	}
+	digest := sha256.New()
+	length, readErr := io.Copy(digest, body)
+	closeErr := body.Close()
+	if readErr != nil {
+		return readErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if length != expectedLength {
+		return fmt.Errorf("length mismatch: got %d want %d", length, expectedLength)
+	}
+	got := repository.AlgorithmSHA256 + ":" + hex.EncodeToString(digest.Sum(nil))
+	if got != contentID {
+		return fmt.Errorf("digest mismatch: got %s want %s", got, contentID)
+	}
+	return nil
 }
 
 // ListPortableFactClosures reads the authenticated complete-state fact child
@@ -627,6 +686,8 @@ func validatePortableFactRecords(bundle portableFactBundle) error {
 	attachments := make(map[string]struct{}, len(bundle.Attachments))
 	attachmentByID := make(map[string]portableFactAttachment, len(bundle.Attachments))
 	usedAttachments := make(map[string]struct{}, len(bundle.Attachments))
+	namespaceRootID := ""
+	sourceID := ""
 	for _, attachment := range bundle.Attachments {
 		if _, exists := attachments[attachment.AttachmentID]; exists || strings.TrimSpace(attachment.AttachmentID) == "" ||
 			strings.TrimSpace(attachment.Purpose) == "" || strings.TrimSpace(attachment.MediaType) == "" ||
@@ -643,6 +704,19 @@ func validatePortableFactRecords(bundle portableFactBundle) error {
 			if err := decodeStrictRecord(record.Payload, &mapping); err != nil || mapping.WorkspaceID != bundle.WorkspaceID || mapping.NamespaceEntryID != record.StableSubjectRef || mapping.NamespaceRootID == "" || mapping.SourceID == "" || len(mapping.RawPath) == 0 || len(mapping.RawName) == 0 || mapping.DisplayName == "" || mapping.EntryType == "" || mapping.Protection.Mode == "" || mapping.Protection.Outcome == "" || mapping.SelectedRepresentationRefs == nil {
 				return errors.New("portable subject mapping is incomplete")
 			}
+			if record.RecordID != mapping.NamespaceEntryID || !sameStrings(mapping.SelectedRepresentationRefs, portableSelectedRepresentationRefs(mapping.Protection)) {
+				return errors.New("portable subject mapping identity or representation set is invalid")
+			}
+			if namespaceRootID == "" {
+				namespaceRootID = mapping.NamespaceRootID
+			} else if mapping.NamespaceRootID != namespaceRootID {
+				return errors.New("portable subject mappings use multiple namespace roots")
+			}
+			if sourceID == "" {
+				sourceID = mapping.SourceID
+			} else if mapping.SourceID != sourceID {
+				return errors.New("portable subject mappings use multiple sources")
+			}
 			if _, exists := mappings[record.StableSubjectRef]; exists {
 				return errors.New("portable subject mapping is duplicated")
 			}
@@ -658,28 +732,38 @@ func validatePortableFactRecords(bundle portableFactBundle) error {
 		}
 		switch record.RecordKind {
 		case "METADATA_FACT":
-			var value map[string]json.RawMessage
-			if err := json.Unmarshal(record.Payload, &value); err != nil || len(value) == 0 {
+			if portableCaptureFactRecord(record) {
+				var value ManifestPortableFact
+				if err := decodeStrictRecord(record.Payload, &value); err != nil || strings.TrimSpace(value.Name) == "" || !validPortableFactState(value.State) || strings.TrimSpace(value.SourceProfile) == "" || strings.TrimSpace(value.Authority) == "" || value.CapturedAt.IsZero() || strings.TrimSpace(value.CaptureTimeBasis) == "" || len(value.Value) == 0 || !json.Valid(value.Value) || value.ProvenanceDigest == "" {
+					return errors.New("portable captured fact payload is invalid")
+				}
+				if err := validatePortableFactValue(value); err != nil {
+					return fmt.Errorf("portable captured fact payload: %w", err)
+				}
+				break
+			}
+			var value sqlite.MetadataFact
+			if err := decodeStrictRecord(record.Payload, &value); err != nil || value.ID != record.RecordID || value.WorkspaceID != bundle.WorkspaceID || value.WorkspaceID != record.WorkspaceID || value.SubjectRef != record.StableSubjectRef || value.Revision != record.Revision {
 				return errors.New("portable metadata fact payload is invalid")
 			}
 		case "ANNOTATION_REVISION":
 			var value sqlite.AnnotationRevision
-			if err := decodeStrictRecord(record.Payload, &value); err != nil || value.ID != record.RecordID || value.SubjectRef != record.StableSubjectRef || value.Revision != record.Revision || value.PredecessorID != record.PredecessorRecordID {
+			if err := decodeStrictRecord(record.Payload, &value); err != nil || value.ID != record.RecordID || value.WorkspaceID != bundle.WorkspaceID || value.SubjectRef != record.StableSubjectRef || value.Revision != record.Revision || value.PredecessorID != record.PredecessorRecordID || !validExactContentID(value.BodyDigest) || DigestBytes([]byte(value.Body)) != value.BodyDigest {
 				return errors.New("portable annotation revision payload is invalid")
 			}
 		case "DESCRIPTION_REVISION":
 			var value descriptionPortablePayload
-			if err := decodeStrictRecord(record.Payload, &value); err != nil || value.ID != record.RecordID || value.SubjectRef != record.StableSubjectRef || value.Revision != record.Revision || value.PredecessorID != record.PredecessorRecordID || !validExactContentID(value.BodyDigest) {
+			if err := decodeStrictRecord(record.Payload, &value); err != nil || value.ID != record.RecordID || value.WorkspaceID != bundle.WorkspaceID || value.SubjectRef != record.StableSubjectRef || value.Revision != record.Revision || value.PredecessorID != record.PredecessorRecordID || !validExactContentID(value.BodyDigest) || strings.TrimSpace(value.BodyAttachmentID) == "" || strings.TrimSpace(value.ConfigDigest) == "" || strings.TrimSpace(value.ProducerProfileDigest) == "" {
 				return errors.New("portable description revision payload is invalid")
 			}
 		case "SEMANTIC_SEGMENT":
 			var value sqlite.SemanticSegment
-			if err := decodeStrictRecord(record.Payload, &value); err != nil || value.ID != record.RecordID || value.SubjectRef != record.StableSubjectRef {
+			if err := decodeStrictRecord(record.Payload, &value); err != nil || value.ID != record.RecordID || value.WorkspaceID != bundle.WorkspaceID || value.SubjectRef != record.StableSubjectRef || strings.TrimSpace(value.DocumentID) == "" || value.DocumentRevision < 1 || value.Ordinal < 0 || record.Revision != value.Ordinal+1 || strings.TrimSpace(value.Text) == "" || strings.TrimSpace(value.Language) == "" || !validExactContentID(value.TextDigest) || DigestBytes([]byte(value.Text)) != value.TextDigest || strings.TrimSpace(value.SegmentationProfileDigest) == "" {
 				return errors.New("portable semantic segment payload is invalid")
 			}
 		case "PROCESSOR_ARTIFACT_DESCRIPTOR":
 			var value artifactPortablePayload
-			if err := decodeStrictRecord(record.Payload, &value); err != nil || value.ID != record.RecordID || value.SubjectRef != record.StableSubjectRef || !validExactContentID(value.Digest) || value.ByteLength < 0 {
+			if err := decodeStrictRecord(record.Payload, &value); err != nil || value.ID != record.RecordID || value.WorkspaceID != bundle.WorkspaceID || value.SubjectRef != record.StableSubjectRef || strings.TrimSpace(value.SchemaRef) == "" || strings.TrimSpace(value.MediaType) == "" || !validExactContentID(value.Digest) || value.ByteLength < 0 || strings.TrimSpace(value.BodyAttachmentID) == "" {
 				return errors.New("portable processor artifact descriptor is invalid")
 			}
 		default:
@@ -692,10 +776,18 @@ func validatePortableFactRecords(bundle portableFactBundle) error {
 		if err := json.Unmarshal(record.Payload, &fields); err != nil {
 			return err
 		}
-		if raw, ok := fields["body_attachment_id"]; ok {
+		requiresBodyAttachment := record.RecordKind == "DESCRIPTION_REVISION" || record.RecordKind == "PROCESSOR_ARTIFACT_DESCRIPTOR"
+		raw, hasBodyAttachment := fields["body_attachment_id"]
+		if requiresBodyAttachment && !hasBodyAttachment {
+			return fmt.Errorf("portable fact %s is missing its body attachment", record.RecordKind)
+		}
+		if hasBodyAttachment {
 			var attachmentID string
 			if err := json.Unmarshal(raw, &attachmentID); err != nil {
 				return err
+			}
+			if strings.TrimSpace(attachmentID) == "" {
+				return fmt.Errorf("portable fact %s has an empty body attachment", record.RecordKind)
 			}
 			if _, exists := attachments[attachmentID]; !exists {
 				return fmt.Errorf("portable fact body attachment %q is missing", attachmentID)
@@ -713,13 +805,13 @@ func validatePortableFactRecords(bundle portableFactBundle) error {
 			}
 			if record.RecordKind == "DESCRIPTION_REVISION" {
 				var description descriptionPortablePayload
-				if err := decodeStrictRecord(record.Payload, &description); err != nil || attachment.ContentID != description.BodyDigest {
+				if err := decodeStrictRecord(record.Payload, &description); err != nil || attachment.ContentID != description.BodyDigest || attachment.MediaType != "text/plain; charset=utf-8" || attachment.ReaderProfile != "utf8-v1" {
 					return errors.New("description body attachment digest is not bound")
 				}
 			}
 			if record.RecordKind == "PROCESSOR_ARTIFACT_DESCRIPTOR" {
 				var artifact artifactPortablePayload
-				if err := decodeStrictRecord(record.Payload, &artifact); err != nil || attachment.ContentID != artifact.Digest || attachment.LogicalLength != artifact.ByteLength {
+				if err := decodeStrictRecord(record.Payload, &artifact); err != nil || attachment.ContentID != artifact.Digest || attachment.LogicalLength != artifact.ByteLength || attachment.MediaType != artifact.MediaType || attachment.ReaderProfile != "artifact:"+artifact.SchemaRef {
 					return errors.New("processor artifact body attachment digest is not bound")
 				}
 			}
@@ -727,6 +819,187 @@ func validatePortableFactRecords(bundle portableFactBundle) error {
 	}
 	if len(usedAttachments) != len(attachments) {
 		return errors.New("portable fact bundle contains an unreferenced attachment")
+	}
+	if err := validatePortableRevisionChains(bundle); err != nil {
+		return err
+	}
+	return validatePortableSemanticSegments(bundle)
+}
+
+func portableCaptureFactRecord(record portableFactRecord) bool {
+	return record.RecordKind == "METADATA_FACT" && strings.Contains(record.RecordID, ":capture:")
+}
+
+func portableSelectedRepresentationRefs(protection ManifestProtection) []string {
+	selected := make(map[string]struct{})
+	if protection.LocalRepresentationID != "" {
+		selected[protection.LocalRepresentationID] = struct{}{}
+	}
+	for _, reference := range protection.RecoveryReferences {
+		if reference.RepresentationID != "" {
+			selected[reference.RepresentationID] = struct{}{}
+		}
+	}
+	refs := make([]string, 0, len(selected))
+	for reference := range selected {
+		refs = append(refs, reference)
+	}
+	sort.Strings(refs)
+	return refs
+}
+
+func validatePortableSemanticSegments(bundle portableFactBundle) error {
+	descriptions := make(map[string]descriptionPortablePayload)
+	segmentsByDocument := make(map[string][]sqlite.SemanticSegment)
+	for _, record := range bundle.Records {
+		switch record.RecordKind {
+		case "DESCRIPTION_REVISION":
+			var description descriptionPortablePayload
+			if err := decodeStrictRecord(record.Payload, &description); err != nil {
+				return err
+			}
+			descriptions[record.RecordID] = description
+		case "SEMANTIC_SEGMENT":
+			var segment sqlite.SemanticSegment
+			if err := decodeStrictRecord(record.Payload, &segment); err != nil {
+				return err
+			}
+			if strings.TrimSpace(segment.DocumentID) == "" || segment.DocumentRevision < 1 || segment.Ordinal < 0 ||
+				record.Revision != segment.Ordinal+1 || record.PredecessorRecordID != "" ||
+				strings.TrimSpace(segment.Text) == "" || !validExactContentID(segment.TextDigest) ||
+				segment.TextDigest != DigestBytes([]byte(segment.Text)) || strings.TrimSpace(segment.SegmentationProfileDigest) == "" {
+				return errors.New("portable semantic segment identity, ordinal, or text digest is invalid")
+			}
+			var provenance struct {
+				DescriptionDocumentID     string `json:"description_document_id"`
+				DocumentRevision          int64  `json:"document_revision"`
+				SegmentationProfileDigest string `json:"segmentation_profile_digest"`
+			}
+			if err := decodeStrictRecord(record.Provenance, &provenance); err != nil || provenance.DescriptionDocumentID != segment.DocumentID || provenance.DocumentRevision != segment.DocumentRevision || provenance.SegmentationProfileDigest != segment.SegmentationProfileDigest {
+				return errors.New("portable semantic segment provenance is invalid")
+			}
+			var span portableSemanticSourceSpan
+			if err := decodeStrictRecord(segment.SourceSpan, &span); err != nil || span.StartByte < 0 || span.EndByte <= span.StartByte || span.EndByte-span.StartByte != len([]byte(segment.Text)) {
+				return errors.New("portable semantic segment source span is invalid")
+			}
+			segmentsByDocument[segment.DocumentID] = append(segmentsByDocument[segment.DocumentID], segment)
+		}
+	}
+	for documentID, segments := range segmentsByDocument {
+		description, exists := descriptions[documentID]
+		if !exists {
+			return fmt.Errorf("portable semantic segments reference missing description %q", documentID)
+		}
+		sort.Slice(segments, func(i, j int) bool { return segments[i].Ordinal < segments[j].Ordinal })
+		var body strings.Builder
+		previousEnd := 0
+		profileDigest := ""
+		for ordinal, segment := range segments {
+			if segment.Ordinal != int64(ordinal) {
+				return fmt.Errorf("portable semantic segments for description %q are not contiguous", documentID)
+			}
+			if segment.SubjectRef != description.SubjectRef || segment.WorkspaceID != description.WorkspaceID || segment.DocumentRevision != description.Revision {
+				return fmt.Errorf("portable semantic segment for description %q crosses workspace or subject", documentID)
+			}
+			if profileDigest == "" {
+				profileDigest = segment.SegmentationProfileDigest
+			} else if profileDigest != segment.SegmentationProfileDigest {
+				return fmt.Errorf("portable semantic segments for description %q use conflicting segmentation profiles", documentID)
+			}
+			var span portableSemanticSourceSpan
+			if err := decodeStrictRecord(segment.SourceSpan, &span); err != nil || span.StartByte != previousEnd {
+				return fmt.Errorf("portable semantic segments for description %q have a discontinuous source span", documentID)
+			}
+			previousEnd = span.EndByte
+			body.WriteString(segment.Text)
+		}
+		if DigestBytes([]byte(body.String())) != description.BodyDigest {
+			return fmt.Errorf("portable semantic segments for description %q do not reconstruct its body", documentID)
+		}
+	}
+	return nil
+}
+
+type portableRevisionLink struct {
+	recordID      string
+	workspaceID   string
+	subjectRef    string
+	logicalID     string
+	kind          string
+	revision      int64
+	predecessorID string
+}
+
+func validatePortableRevisionChains(bundle portableFactBundle) error {
+	for _, recordKind := range []string{"ANNOTATION_REVISION", "DESCRIPTION_REVISION"} {
+		byID := make(map[string]portableRevisionLink)
+		successorByPredecessor := make(map[string]string)
+		for _, record := range bundle.Records {
+			if record.RecordKind != recordKind {
+				continue
+			}
+			if _, exists := byID[record.RecordID]; exists {
+				return fmt.Errorf("portable %s record ID %q is duplicated", strings.ToLower(recordKind), record.RecordID)
+			}
+			link := portableRevisionLink{
+				recordID: record.RecordID, workspaceID: record.WorkspaceID,
+				subjectRef: record.StableSubjectRef, revision: record.Revision,
+			}
+			switch recordKind {
+			case "ANNOTATION_REVISION":
+				var value sqlite.AnnotationRevision
+				if err := decodeStrictRecord(record.Payload, &value); err != nil {
+					return err
+				}
+				if strings.TrimSpace(value.AnnotationID) == "" {
+					return errors.New("portable annotation revision lacks logical annotation identity")
+				}
+				link.logicalID = value.AnnotationID
+				link.predecessorID = value.PredecessorID
+			case "DESCRIPTION_REVISION":
+				var value descriptionPortablePayload
+				if err := decodeStrictRecord(record.Payload, &value); err != nil {
+					return err
+				}
+				if strings.TrimSpace(value.ID) == "" || strings.TrimSpace(string(value.Kind)) == "" {
+					return errors.New("portable description revision lacks logical identity")
+				}
+				link.kind = string(value.Kind)
+				link.predecessorID = value.PredecessorID
+			}
+			byID[record.RecordID] = link
+		}
+		for _, link := range byID {
+			if link.revision == 1 {
+				if link.predecessorID != "" {
+					return fmt.Errorf("portable %s revision 1 has a predecessor", strings.ToLower(recordKind))
+				}
+				continue
+			}
+			if link.revision < 1 || link.predecessorID == "" {
+				return fmt.Errorf("portable %s revision %d lacks a predecessor", strings.ToLower(recordKind), link.revision)
+			}
+			predecessor, exists := byID[link.predecessorID]
+			if !exists {
+				return fmt.Errorf("portable %s revision %q has an orphan predecessor %q", strings.ToLower(recordKind), link.recordID, link.predecessorID)
+			}
+			if predecessor.revision != link.revision-1 {
+				return fmt.Errorf("portable %s revision %q predecessor is revision %d, want %d", strings.ToLower(recordKind), link.recordID, predecessor.revision, link.revision-1)
+			}
+			if predecessor.workspaceID != link.workspaceID || predecessor.subjectRef != link.subjectRef {
+				return fmt.Errorf("portable %s revision %q predecessor crosses workspace or subject", strings.ToLower(recordKind), link.recordID)
+			}
+			if recordKind == "ANNOTATION_REVISION" && predecessor.logicalID != link.logicalID {
+				return fmt.Errorf("portable annotation revision %q predecessor belongs to another annotation", link.recordID)
+			}
+			if recordKind == "DESCRIPTION_REVISION" && predecessor.kind != link.kind {
+				return fmt.Errorf("portable description revision %q predecessor belongs to another logical document", link.recordID)
+			}
+			if successor, exists := successorByPredecessor[link.predecessorID]; exists && successor != link.recordID {
+				return fmt.Errorf("portable %s predecessor %q has multiple successors", strings.ToLower(recordKind), link.predecessorID)
+			}
+			successorByPredecessor[link.predecessorID] = link.recordID
+		}
 	}
 	return nil
 }
@@ -740,11 +1013,13 @@ func validatePortableFactRecordsAgainstManifest(bundle portableFactBundle, manif
 	}
 
 	expectedByPath := make(map[string]ManifestEntry, len(manifest.Entries))
+	seenManifestPaths := make(map[string]struct{}, len(manifest.Entries))
 	for _, entry := range manifest.Entries {
 		key := portableRawPathKey(entry.RawPath)
-		if _, exists := expectedByPath[key]; exists {
+		if _, exists := seenManifestPaths[key]; exists {
 			return errors.New("portable manifest contains duplicate raw paths")
 		}
+		seenManifestPaths[key] = struct{}{}
 		// The namespace root directory is provenance, not a mapped subject:
 		// buildPortableFactBundle maps the subtree below the root, so the root
 		// entry itself is intentionally absent from SUBJECT_MAPPING records.
@@ -764,6 +1039,15 @@ func validatePortableFactRecordsAgainstManifest(bundle portableFactBundle, manif
 		}
 		seenLogical[logicalKey] = struct{}{}
 		recordsByID[record.RecordKind+"\x00"+record.RecordID] = append(recordsByID[record.RecordKind+"\x00"+record.RecordID], record)
+		if record.RecordKind == "DESCRIPTION_REVISION" {
+			var description descriptionPortablePayload
+			if err := decodeStrictRecord(record.Payload, &description); err != nil {
+				return err
+			}
+			if strings.TrimSpace(description.ConfigDigest) == "" || description.ConfigDigest != manifest.ConfigDigest {
+				return fmt.Errorf("portable description %q config binding differs from manifest", record.RecordID)
+			}
+		}
 		if record.RecordKind != "SUBJECT_MAPPING" {
 			continue
 		}
@@ -940,7 +1224,8 @@ func validateProcessorAttachmentChild(ctx context.Context, driver repository.Rec
 		return errors.New("portable processor-attempt child binding mismatch")
 	}
 	attempts, err := validateProcessorAttemptBundle(envelope.Bundle, closure.WorkspaceID, closure.SnapshotRef)
-	if err != nil || DigestBytes(envelope.Bundle) != envelope.Closure.AttemptBundleDigest ||
+	if err != nil || attempts.Schema != envelope.Closure.AttemptBundleSchema ||
+		DigestBytes(envelope.Bundle) != envelope.Closure.AttemptBundleDigest ||
 		int64(len(envelope.Bundle)) != envelope.Closure.AttemptBundleLength ||
 		int64(len(attempts.Attempts)) != envelope.Closure.AttemptCount {
 		return errors.New("portable processor-attempt bundle binding mismatch")

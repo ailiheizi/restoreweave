@@ -126,6 +126,14 @@ func TestOpenProfileReadOnlyRejectsWrites(t *testing.T) {
 		_, err := readonly.PlaceExact(ctx, "sha256:0000000000000000000000000000000000000000000000000000000000000000", bytes.NewBufferString("new"))
 		return err
 	})
+	assertReadOnly("Repair", func() error {
+		repairer, ok := readonly.(RepairDriver)
+		if !ok {
+			return errors.New("read-only driver does not expose repair contract")
+		}
+		_, err := repairer.Repair(ctx, "sha256:0000000000000000000000000000000000000000000000000000000000000000", bytes.NewBufferString("new"))
+		return err
+	})
 	assertReadOnly("PlaceRecord", func() error {
 		_, err := readonly.PlaceRecord(ctx, RecordPublicationCommit, bytes.NewBufferString("new"))
 		return err

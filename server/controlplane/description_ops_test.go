@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/ailiheizi/restoreweave/client/command"
+	"github.com/ailiheizi/restoreweave/server/internal/store/sqlite"
 	"github.com/ailiheizi/restoreweave/server/testutil"
 )
 
@@ -192,6 +193,77 @@ func TestDescriptionSegmentationDoesNotPersistWhitespaceOnlyChunks(t *testing.T)
 	}
 	if segments[0].start != 0 || segments[len(segments)-1].end != len(body) {
 		t.Fatalf("segments do not cover body: first=%+v last=%+v", segments[0], segments[len(segments)-1])
+	}
+}
+
+func TestDescriptionCreateBindsConfigAndProfileIdentities(t *testing.T) {
+	store := testutil.OpenStore(t, ":memory:")
+	configDigest := "sha256:description-config-v1"
+	dispatcher := NewDispatcher(store, "catalog.sqlite", "/tmp/rw.sock", WithConfigDigest(configDigest))
+	seed := testutil.SeedNamespace(t, store)
+	result := dispatcher.Handle(context.Background(), mustEnvelope(t, command.OpDescriptionCreate, map[string]any{
+		"workspace_id":     seed.WorkspaceID,
+		"subject_ref":      seed.FileEntryID,
+		"kind":             "USER",
+		"body":             "bound description",
+		"producer_profile": "operator-v1",
+	}))
+	if result.Status != command.StatusSucceeded {
+		t.Fatalf("description.create status = %q: %+v", result.Status, result.Reasons)
+	}
+	var data command.DescriptionCreateData
+	if err := json.Unmarshal(result.Data, &data); err != nil {
+		t.Fatal(err)
+	}
+	if data.Document.ConfigDigest != configDigest || data.Document.ProducerProfileDigest == "" {
+		t.Fatalf("description binding = %+v", data.Document)
+	}
+	if len(data.Document.Segments) != 1 || data.Document.Segments[0].DocumentRevision != data.Document.Revision || data.Document.Segments[0].SegmentationProfileDigest != sqlite.DescriptionSegmentationProfileDigestV1 {
+		t.Fatalf("segment binding = %+v", data.Document.Segments)
+	}
+	got, err := store.GetDescriptionDocument(context.Background(), seed.WorkspaceID, data.Document.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ConfigDigest != configDigest || got.ProducerProfileDigest != data.Document.ProducerProfileDigest {
+		t.Fatalf("stored description binding = %+v", got)
+	}
+}
+
+func TestDescriptionConfigSwitchCreatesBoundSuccessor(t *testing.T) {
+	store := testutil.OpenStore(t, ":memory:")
+	seed := testutil.SeedNamespace(t, store)
+	ctx := context.Background()
+	firstDispatcher := NewDispatcher(store, "catalog.sqlite", "/tmp/rw-a.sock", WithConfigDigest("sha256:description-config-a"))
+	first := firstDispatcher.Handle(ctx, mustEnvelope(t, command.OpDescriptionCreate, map[string]any{
+		"workspace_id": seed.WorkspaceID, "subject_ref": seed.FileEntryID,
+		"kind": "USER", "body": "first revision", "producer_profile": "operator-v1",
+	}))
+	if first.Status != command.StatusSucceeded {
+		t.Fatalf("first description.create status = %q: %+v", first.Status, first.Reasons)
+	}
+	var firstData command.DescriptionCreateData
+	if err := json.Unmarshal(first.Data, &firstData); err != nil {
+		t.Fatal(err)
+	}
+	secondDispatcher := NewDispatcher(store, "catalog.sqlite", "/tmp/rw-b.sock", WithConfigDigest("sha256:description-config-b"))
+	second := secondDispatcher.Handle(ctx, mustEnvelope(t, command.OpDescriptionCreate, map[string]any{
+		"workspace_id": seed.WorkspaceID, "subject_ref": seed.FileEntryID,
+		"kind": "USER", "body": "second revision", "producer_profile": "operator-v1",
+		"predecessor_id": firstData.Document.ID,
+	}))
+	if second.Status != command.StatusSucceeded {
+		t.Fatalf("second description.create status = %q: %+v", second.Status, second.Reasons)
+	}
+	var secondData command.DescriptionCreateData
+	if err := json.Unmarshal(second.Data, &secondData); err != nil {
+		t.Fatal(err)
+	}
+	if firstData.Document.ConfigDigest == secondData.Document.ConfigDigest || firstData.Document.Revision != 1 || secondData.Document.Revision != 2 {
+		t.Fatalf("config switch did not create distinct bound revisions: first=%+v second=%+v", firstData.Document, secondData.Document)
+	}
+	if firstData.Document.Segments[0].SegmentationProfileDigest != secondData.Document.Segments[0].SegmentationProfileDigest {
+		t.Fatalf("segmentation profile unexpectedly changed: first=%+v second=%+v", firstData.Document.Segments, secondData.Document.Segments)
 	}
 }
 

@@ -100,6 +100,47 @@ func TestZstdDirDetectsTruncationAndCorruption(t *testing.T) {
 	}
 }
 
+func TestZstdDirRepairReplacesCorruptObject(t *testing.T) {
+	ctx := context.Background()
+	root := filepath.Join(t.TempDir(), "repo")
+	repo, err := OpenZstdDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("zstd repair payload "), 128)
+	receipt, err := repo.Place(ctx, bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := blobPath(root, receipt.ContentID)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data[len(data)/2] ^= 0xff
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Verify(ctx, receipt.ContentID); err == nil {
+		t.Fatal("corrupt zstd object verified before repair")
+	}
+	if _, err := repo.Repair(ctx, receipt.ContentID, bytes.NewReader(payload)); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Verify(ctx, receipt.ContentID); err != nil {
+		t.Fatal(err)
+	}
+	body, err := repo.Open(ctx, receipt.ContentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, readErr := io.ReadAll(body)
+	_ = body.Close()
+	if readErr != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("repaired zstd readback = %d bytes, err=%v", len(got), readErr)
+	}
+}
+
 func TestZstdDirRelocationAndProfileMismatch(t *testing.T) {
 	ctx := context.Background()
 	root := filepath.Join(t.TempDir(), "repo")

@@ -19,6 +19,7 @@ const (
 	PreparedClosureSchemaV1         = "org.restoreweave.prepared-closure.v1"
 	PublicationCommitSchemaV1       = "org.restoreweave.publication-commit.v1"
 	ProcessorAttemptClosureSchemaV1 = "org.restoreweave.processor-attempt-closure.v1"
+	ProcessorAttemptClosureSchemaV2 = "org.restoreweave.processor-attempt-closure.v2"
 	PortableFactClosureSchemaV1     = "org.restoreweave.portable-fact-closure.v1"
 	RecoverySignatureDomainV1       = "org.restoreweave.rw-mvp-1.recovery.v1"
 
@@ -172,25 +173,27 @@ type PublicationCommitRecord struct {
 // of post-publication processor attempts without making those attempts part
 // of the exact publication transaction.
 type ProcessorAttemptClosureRecord struct {
-	Schema              string    `json:"schema"`
-	SignatureDomain     string    `json:"signature_domain"`
-	RecordKind          string    `json:"record_kind"`
-	WorkspaceID         string    `json:"workspace_id"`
-	PublicationID       string    `json:"publication_id"`
-	PublicationDomain   string    `json:"publication_domain"`
-	SnapshotRef         string    `json:"snapshot_ref"`
-	ManifestDigest      string    `json:"manifest_digest"`
-	ParentCommitDigest  string    `json:"parent_commit_digest"`
-	AttemptBundleSchema string    `json:"attempt_bundle_schema"`
-	AttemptBundleDigest string    `json:"attempt_bundle_digest"`
-	AttemptBundleLength int64     `json:"attempt_bundle_length"`
-	AttemptCount        int64     `json:"attempt_count"`
-	TargetIdentity      string    `json:"target_identity"`
-	WriterIdentity      string    `json:"writer_identity"`
-	KeyID               string    `json:"key_id"`
-	FenceToken          uint64    `json:"fence_token"`
-	SignedAt            time.Time `json:"signed_at"`
-	Signature           []byte    `json:"signature,omitempty"`
+	Schema                   string    `json:"schema"`
+	SignatureDomain          string    `json:"signature_domain"`
+	RecordKind               string    `json:"record_kind"`
+	WorkspaceID              string    `json:"workspace_id"`
+	PublicationID            string    `json:"publication_id"`
+	PublicationDomain        string    `json:"publication_domain"`
+	SnapshotRef              string    `json:"snapshot_ref"`
+	ManifestDigest           string    `json:"manifest_digest"`
+	ParentCommitDigest       string    `json:"parent_commit_digest"`
+	ClosureSequence          uint64    `json:"closure_sequence,omitempty"`
+	PredecessorClosureDigest string    `json:"predecessor_closure_digest,omitempty"`
+	AttemptBundleSchema      string    `json:"attempt_bundle_schema"`
+	AttemptBundleDigest      string    `json:"attempt_bundle_digest"`
+	AttemptBundleLength      int64     `json:"attempt_bundle_length"`
+	AttemptCount             int64     `json:"attempt_count"`
+	TargetIdentity           string    `json:"target_identity"`
+	WriterIdentity           string    `json:"writer_identity"`
+	KeyID                    string    `json:"key_id"`
+	FenceToken               uint64    `json:"fence_token"`
+	SignedAt                 time.Time `json:"signed_at"`
+	Signature                []byte    `json:"signature,omitempty"`
 }
 
 // PortableFactClosureRecord is a signed complete-state child of one committed
@@ -427,7 +430,7 @@ func (record PublicationCommitRecord) Verify(anchor TrustAnchor) error {
 }
 
 func (record ProcessorAttemptClosureRecord) validate() error {
-	if record.Schema != ProcessorAttemptClosureSchemaV1 || record.RecordKind != ProcessorAttemptClosureKind {
+	if (record.Schema != ProcessorAttemptClosureSchemaV1 && record.Schema != ProcessorAttemptClosureSchemaV2) || record.RecordKind != ProcessorAttemptClosureKind {
 		return fmt.Errorf("%w: processor attempt closure schema or kind is invalid", ErrRecoveryRecordInvalid)
 	}
 	if record.SignatureDomain != RecoverySignatureDomainV1 {
@@ -450,6 +453,21 @@ func (record ProcessorAttemptClosureRecord) validate() error {
 	if !validExactContentID(record.ManifestDigest) || !validExactContentID(record.ParentCommitDigest) ||
 		!validExactContentID(record.AttemptBundleDigest) {
 		return fmt.Errorf("%w: processor attempt closure digests are invalid", ErrRecoveryRecordInvalid)
+	}
+	if record.Schema == ProcessorAttemptClosureSchemaV1 {
+		if record.ClosureSequence != 0 || record.PredecessorClosureDigest != "" {
+			return fmt.Errorf("%w: v1 processor attempt closure cannot declare successor lineage", ErrRecoveryRecordInvalid)
+		}
+	} else {
+		if record.ClosureSequence == 0 {
+			return fmt.Errorf("%w: processor attempt closure sequence must be positive", ErrRecoveryRecordInvalid)
+		}
+		if record.ClosureSequence == 1 && record.PredecessorClosureDigest != "" {
+			return fmt.Errorf("%w: processor attempt closure sequence one cannot have a predecessor", ErrRecoveryRecordInvalid)
+		}
+		if record.ClosureSequence > 1 && !validExactContentID(record.PredecessorClosureDigest) {
+			return fmt.Errorf("%w: processor attempt closure predecessor digest is invalid", ErrRecoveryRecordInvalid)
+		}
 	}
 	if record.AttemptBundleLength == 0 || record.AttemptCount < 0 || record.FenceToken == 0 || record.SignedAt.IsZero() {
 		return fmt.Errorf("%w: attempt bundle size/count, fence, and signed time are invalid", ErrRecoveryRecordInvalid)
@@ -509,6 +527,9 @@ func (record PortableFactClosureRecord) validate() error {
 	}
 	if !validExactContentID(record.ManifestDigest) || !validExactContentID(record.ParentCommitDigest) || !validExactContentID(record.BundleDigest) {
 		return fmt.Errorf("%w: portable fact closure digest is invalid", ErrRecoveryRecordInvalid)
+	}
+	if record.BundleSchema != PortableFactBundleSchemaV1 {
+		return fmt.Errorf("%w: unsupported portable fact bundle schema %q", ErrRecoveryRecordInvalid, record.BundleSchema)
 	}
 	if record.ProcessorAttemptDigest != "" && !validExactContentID(record.ProcessorAttemptDigest) {
 		return fmt.Errorf("%w: portable fact processor-attempt digest is invalid", ErrRecoveryRecordInvalid)

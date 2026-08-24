@@ -52,6 +52,19 @@ or safety gates, keep it outside the core queue.
 - The operational catalog and every search index are rebuildable projections.
   Repository objects plus authenticated portable recovery records are the
   recovery authority.
+- Keep the physical core small: one configured SQLite catalog may hold the
+  durable metadata and rebuildable search tables; the content repository holds
+  file bytes and admitted representations. Do not add a second live metadata
+  or recovery database merely to mirror the logical layers. Signed portable
+  recovery records are backup artifacts emitted from the catalog/publication,
+  not another operational service.
+- Do not add complexity for hypothetical failures. Add a new durable store,
+  service, or recovery mechanism only when a concrete user workflow requires
+  it and an executable test demonstrates the need.
+- Experimental RWKV/Transformer compression is never enabled silently. Until
+  its exact-reversible profile is qualified, it remains opt-in and must show a
+  clear warning that missing database/recovery backups or decoder dependencies
+  can make compressed data unrecoverable.
 - Storage, catalog, vector, and recovery locations come from persisted config.
   They never implicitly use a client process's current directory. `.` is an
   input source only when the user explicitly supplies it.
@@ -84,13 +97,15 @@ discovery, view/export, and GC semantics belong to the content-store contract.
 
 ## Current Implementation Lock
 
-The active gate is Phase 3, Recovery Closure. Work in this order:
+The admitted Phase 3 Recovery Closure profile is implemented and tested for
+the stated development scope. It is not release-qualified. Work in this order:
 
 1. Complete the admitted xattr/ACL/sparse/detection fact profile and bind
    description, annotation, processor-artifact, and portable subject-mapping
-   records into the authenticated closure. Terminal processor attempts already
-   use a signed post-commit child; do not enable retry or reprocessing until an
-   explicit signed successor lineage is defined and tested.
+   records into the authenticated closure. Terminal processor attempts use a
+   signed complete-state successor chain. Do not enable automatic retry or
+   reprocessing until the async worker also binds retry intent, idempotency,
+   reconciliation, and retry ceilings to that tested lineage.
 2. Complete independently retained trust-anchor handling and the clean-install
    import/reader workflow.
 3. Add cross-process publication fencing or leases and unknown-outcome
@@ -105,12 +120,14 @@ qualifies simple recoverable storage savings. Phase 6 supplies SavedView and
 ExportManifest ergonomics. Phase 7 supplies packaging, migration, backup,
 upgrade, performance, and full release qualification.
 
-Until Phase 3 closes, do not add:
+The following remain outside the core queue:
 
 - FUSE, mount, SMB, NFS, WebDAV, or S3 gateway behavior;
 - an OpenList fork, dependency, or alternate core;
-- new Inbox, OpenSubsonic, OPDS, MCP, REST, WebUI, player, or domain-reader
-  surfaces; the portable Phase 3 recovery reader is required core work;
+- new Inbox, OpenSubsonic, OPDS, player, or domain-reader surfaces; the
+  portable Phase 3 recovery reader is required core work. A bounded local
+  `/api/v1` adapter and browser client may call the typed dispatcher, but they
+  must not add a second policy, job, catalog, or recovery state machine;
 - new acoustic, graph, multimodal, or other index dimensions;
 - RWKV, Transformer, arithmetic, or other neural codec implementations;
 - automatic external download/reacquisition, source deletion, or destructive

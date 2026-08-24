@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
 
+	exactcore "github.com/ailiheizi/restoreweave/server/internal/exact"
 	"github.com/ailiheizi/restoreweave/server/internal/identify"
 	"github.com/ailiheizi/restoreweave/server/internal/repository"
 	"github.com/ailiheizi/restoreweave/server/internal/store/sqlite"
@@ -37,6 +39,16 @@ type Host struct {
 	pool   *pool
 	byCap  map[string]Processor
 	detect *identify.Detector
+}
+
+type attemptContext struct {
+	fenceToken           int64
+	retryJobID           string
+	retryOwner           string
+	retryAttempt         int64
+	retryIdempotencyKey  string
+	retryLeaseToken      string
+	predecessorAttemptID string
 }
 
 type Report struct {
@@ -68,8 +80,16 @@ type SubjectIssue struct {
 // PublicationIssuesError lets the exact lane expose per-subject degradation
 // while keeping publication successful and independently recoverable.
 type PublicationIssuesError struct {
-	Count  int
-	Issues []SubjectIssue
+	Count        int
+	Issues       []SubjectIssue
+	retryTargets []exactcore.ProcessorRetryTarget
+}
+
+func (e *PublicationIssuesError) ProcessorRetryTargets() []exactcore.ProcessorRetryTarget {
+	if e == nil {
+		return nil
+	}
+	return append([]exactcore.ProcessorRetryTarget(nil), e.retryTargets...)
 }
 
 func (e *PublicationIssuesError) Error() string {
@@ -171,7 +191,201 @@ func (h *Host) ProcessPublication(ctx context.Context, workspaceID, snapshotRef,
 	if report.IssueCount == 0 {
 		return nil
 	}
-	return &PublicationIssuesError{Count: report.IssueCount, Issues: append([]SubjectIssue(nil), report.Issues...)}
+	targets, targetErr := h.processorRetryTargets(ctx, workspaceID, snapshotRef, report.Issues)
+	if targetErr != nil {
+		return targetErr
+	}
+	return &PublicationIssuesError{Count: report.IssueCount, Issues: append([]SubjectIssue(nil), report.Issues...), retryTargets: targets}
+}
+
+// RetryPublication reruns only the explicitly fenced terminal failures named
+// by the retry job. Successful and inapplicable nodes are never rerun.
+func (h *Host) RetryPublication(ctx context.Context, workspaceID, snapshotRef, rootID string, invocation exactcore.ProcessorRetryInvocation) error {
+	if h == nil || h.Store == nil || h.Repo == nil {
+		return ErrUnavailable
+	}
+	if invocation.JobID == "" || invocation.Owner == "" || invocation.Attempt < 1 || invocation.IdempotencyKey == "" ||
+		invocation.LeaseToken == "" || invocation.FenceToken < 1 || len(invocation.Targets) == 0 {
+		return errors.New("processor retry invocation is incomplete")
+	}
+	nodes, err := h.Store.ListNamespaceSubtree(ctx, workspaceID, rootID, "")
+	if err != nil {
+		return err
+	}
+	entries := make(map[string]sqlite.NamespaceEntry, len(nodes))
+	for _, node := range nodes {
+		entries[node.Entry.ID] = node.Entry
+	}
+	attempts, err := h.Store.ListProcessorAttempts(ctx, workspaceID, snapshotRef)
+	if err != nil {
+		return err
+	}
+	latest := make(map[string]sqlite.ProcessorAttempt)
+	for _, attempt := range attempts {
+		key := processorAttemptKey(attempt.SubjectRef, attempt.RouteDigest, attempt.Stage, attempt.CapabilityID)
+		latest[key] = attempt
+	}
+	var issues []SubjectIssue
+	for _, target := range invocation.Targets {
+		key := processorAttemptKey(target.SubjectRef, target.RouteDigest, target.Stage, target.CapabilityID)
+		previous, ok := latest[key]
+		if !ok {
+			return fmt.Errorf("processor retry target %s has no terminal predecessor", target.SubjectRef)
+		}
+		if previous.Status == string(StatusSucceeded) || previous.Status == string(StatusInapplicable) {
+			continue
+		}
+		if previous.ID != target.PredecessorAttemptID && !retryAttemptBelongsToJob(previous.Provenance, invocation.JobID, invocation.IdempotencyKey) {
+			return errors.New("processor retry target has an unrelated terminal successor")
+		}
+		if retryAttemptAlreadyRecorded(previous.Provenance, invocation.JobID, invocation.Attempt, invocation.IdempotencyKey) {
+			issues = append(issues, SubjectIssue{
+				SubjectRef: previous.SubjectRef, Stage: Stage(previous.Stage), Capability: previous.CapabilityID,
+				Status: ResultStatus(previous.Status), ReasonCode: previous.ReasonCode, Message: previous.Reason,
+			})
+			continue
+		}
+		if err := h.Store.ValidateJobLease(ctx, workspaceID, invocation.JobID, invocation.Owner, invocation.LeaseToken, invocation.FenceToken, h.opts.Now().UTC()); err != nil {
+			return fmt.Errorf("validate processor retry lease: %w", err)
+		}
+		entry, ok := entries[target.SubjectRef]
+		if !ok {
+			return errors.New("processor retry target is outside the published namespace root")
+		}
+		source, err := openSource(ctx, h.Repo, entry.ContentID, h.opts.MaxSourceBytes)
+		if err != nil {
+			return err
+		}
+		probe, err := source.ReadAll(ctx)
+		if err != nil {
+			source.Close()
+			return err
+		}
+		identified, err := h.detect.Detect(ctx, entry.DisplayName, probe)
+		if err != nil {
+			source.Close()
+			return err
+		}
+		classification := ClassificationRecord{State: identified.State, Evidence: identified.Evidence}
+		route := buildProcessingRoute(classification)
+		if route.Digest() != target.RouteDigest {
+			source.Close()
+			return errors.New("processor retry route changed from authenticated predecessor")
+		}
+		var node *RouteNode
+		for index := range route.Nodes {
+			candidate := &route.Nodes[index]
+			if string(candidate.Stage) == target.Stage && candidate.CapabilityID == target.CapabilityID {
+				node = candidate
+				break
+			}
+		}
+		if node == nil {
+			source.Close()
+			return errors.New("processor retry node is absent from authenticated route")
+		}
+		proc, ok := h.byCap[node.CapabilityID]
+		if !ok {
+			source.Close()
+			return errors.New("processor retry capability is unavailable")
+		}
+		status, runErr := h.admitNode(ctx, workspaceID, snapshotRef, entry, source, classification, route, *node, proc, attemptContext{
+			fenceToken: invocation.FenceToken, retryJobID: invocation.JobID,
+			retryOwner:   invocation.Owner,
+			retryAttempt: invocation.Attempt, retryIdempotencyKey: invocation.IdempotencyKey,
+			retryLeaseToken: invocation.LeaseToken, predecessorAttemptID: previous.ID,
+		})
+		source.Close()
+		if status == StatusFailed || status == StatusCancelled || runErr != nil {
+			message := "processor retry did not produce an admitted artifact"
+			if runErr != nil {
+				message = runErr.Error()
+			}
+			issues = append(issues, SubjectIssue{
+				SubjectRef: entry.ID, ContentID: entry.ContentID, DisplayName: entry.DisplayName,
+				Stage: node.Stage, Capability: node.CapabilityID, Status: status,
+				ReasonCode: "PROCESSOR_RETRY_FAILED", Message: message,
+			})
+		}
+	}
+	if len(issues) == 0 {
+		return nil
+	}
+	targets, err := h.processorRetryTargets(ctx, workspaceID, snapshotRef, issues)
+	if err != nil {
+		return err
+	}
+	return &PublicationIssuesError{Count: len(issues), Issues: issues, retryTargets: targets}
+}
+
+func retryAttemptBelongsToJob(provenance json.RawMessage, jobID, idempotencyKey string) bool {
+	var value struct {
+		RetryJobID          string `json:"retry_job_id"`
+		RetryIdempotencyKey string `json:"retry_idempotency_key"`
+	}
+	return json.Unmarshal(provenance, &value) == nil && value.RetryJobID == jobID && value.RetryIdempotencyKey == idempotencyKey
+}
+
+func processorAttemptKey(subject, route, stage, capability string) string {
+	return subject + "\x00" + route + "\x00" + stage + "\x00" + capability
+}
+
+func retryAttemptAlreadyRecorded(provenance json.RawMessage, jobID string, attempt int64, idempotencyKey string) bool {
+	var value struct {
+		RetryJobID          string `json:"retry_job_id"`
+		RetryAttempt        int64  `json:"retry_attempt"`
+		RetryIdempotencyKey string `json:"retry_idempotency_key"`
+	}
+	return json.Unmarshal(provenance, &value) == nil && value.RetryJobID == jobID &&
+		value.RetryAttempt == attempt && value.RetryIdempotencyKey == idempotencyKey
+}
+
+func (h *Host) processorRetryTargets(ctx context.Context, workspaceID, snapshotRef string, issues []SubjectIssue) ([]exactcore.ProcessorRetryTarget, error) {
+	attempts, err := h.Store.ListProcessorAttempts(ctx, workspaceID, snapshotRef)
+	if err != nil {
+		return nil, err
+	}
+	latest := make(map[string]sqlite.ProcessorAttempt)
+	for _, attempt := range attempts {
+		key := processorAttemptKey(attempt.SubjectRef, attempt.RouteDigest, attempt.Stage, attempt.CapabilityID)
+		latest[key] = attempt
+	}
+	targets := make([]exactcore.ProcessorRetryTarget, 0, len(issues))
+	seen := make(map[string]struct{})
+	for _, issue := range issues {
+		if issue.SubjectRef == "" || issue.Stage == "" || issue.Capability == "" ||
+			(issue.Status != StatusFailed && issue.Status != StatusCancelled) {
+			continue
+		}
+		for key, attempt := range latest {
+			if attempt.SubjectRef != issue.SubjectRef || attempt.Stage != string(issue.Stage) || attempt.CapabilityID != issue.Capability ||
+				(attempt.Status != string(StatusFailed) && attempt.Status != string(StatusCancelled)) {
+				continue
+			}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			targets = append(targets, exactcore.ProcessorRetryTarget{
+				SubjectRef: attempt.SubjectRef, RouteDigest: attempt.RouteDigest, Stage: attempt.Stage,
+				CapabilityID: attempt.CapabilityID, PredecessorAttemptID: attempt.ID, ReasonCode: attempt.ReasonCode,
+			})
+		}
+	}
+	sort.Slice(targets, func(i, j int) bool {
+		a, b := targets[i], targets[j]
+		if a.SubjectRef != b.SubjectRef {
+			return a.SubjectRef < b.SubjectRef
+		}
+		if a.RouteDigest != b.RouteDigest {
+			return a.RouteDigest < b.RouteDigest
+		}
+		if a.Stage != b.Stage {
+			return a.Stage < b.Stage
+		}
+		return a.CapabilityID < b.CapabilityID
+	})
+	return targets, nil
 }
 
 func (h *Host) Process(ctx context.Context, workspaceID, snapshotRef, rootID string) (Report, error) {
@@ -306,7 +520,7 @@ func (h *Host) processEntry(ctx context.Context, workspaceID, snapshotRef string
 			}
 			continue
 		}
-		status, err := h.admitNode(ctx, workspaceID, snapshotRef, entry, source, classification, route, node, proc)
+		status, err := h.admitNode(ctx, workspaceID, snapshotRef, entry, source, classification, route, node, proc, attemptContext{fenceToken: 1})
 		if err != nil && status == "" {
 			status = StatusFailed
 		}
@@ -335,7 +549,10 @@ func (h *Host) processEntry(ctx context.Context, workspaceID, snapshotRef string
 	return last, issues, nil
 }
 
-func (h *Host) admitNode(ctx context.Context, workspaceID, snapshotRef string, entry sqlite.NamespaceEntry, source *SourceHandle, classification ClassificationRecord, route Route, node RouteNode, proc Processor) (status ResultStatus, err error) {
+func (h *Host) admitNode(ctx context.Context, workspaceID, snapshotRef string, entry sqlite.NamespaceEntry, source *SourceHandle, classification ClassificationRecord, route Route, node RouteNode, proc Processor, attemptCtx attemptContext) (status ResultStatus, err error) {
+	if attemptCtx.fenceToken < 1 {
+		return StatusFailed, errors.New("processor attempt fence token must be positive")
+	}
 	var attemptID string
 	var processorReason string
 	var admittedArtifact *sqlite.ProcessorArtifact
@@ -357,7 +574,7 @@ func (h *Host) admitNode(ctx context.Context, workspaceID, snapshotRef string, e
 			artifact = nil
 		}
 		if recordErr := h.recordProcessorAttemptWithArtifact(context.WithoutCancel(ctx), attemptID, workspaceID, snapshotRef,
-			entry, classification, route, node, status, reasonCode, reason, startedAt, artifact); recordErr != nil {
+			entry, classification, route, node, status, reasonCode, reason, startedAt, artifact, attemptCtx); recordErr != nil {
 			status = StatusFailed
 			if err == nil {
 				err = recordErr
@@ -381,7 +598,7 @@ func (h *Host) admitNode(ctx context.Context, workspaceID, snapshotRef string, e
 
 	result, runErr := proc.RunStage(ctx, Invocation{
 		AttemptID:      attemptID,
-		FenceToken:     1,
+		FenceToken:     attemptCtx.fenceToken,
 		Route:          route,
 		Node:           node,
 		Classification: classification,
@@ -418,7 +635,7 @@ func (h *Host) admitNode(ctx context.Context, workspaceID, snapshotRef string, e
 		"route":             route,
 		"capability_id":     node.CapabilityID,
 		"attempt_id":        attemptID,
-		"fence_token":       1,
+		"fence_token":       attemptCtx.fenceToken,
 		"source_content_id": entry.ContentID,
 	})
 	if err != nil {
@@ -445,7 +662,7 @@ func (h *Host) admitNode(ctx context.Context, workspaceID, snapshotRef string, e
 		Digest:         digest,
 		Body:           string(body),
 		AttemptID:      attemptID,
-		FenceToken:     1,
+		FenceToken:     attemptCtx.fenceToken,
 		ProducerDigest: ProducerDigest(node.CapabilityID),
 		Envelope:       envelope,
 		CreatedAt:      h.opts.Now().UTC(),
@@ -482,21 +699,29 @@ func (h *Host) recordProcessorAttempt(ctx context.Context, attemptID, workspaceI
 	entry sqlite.NamespaceEntry, classification ClassificationRecord, route Route, node RouteNode,
 	status ResultStatus, reasonCode, reason string, startedAt time.Time) error {
 	return h.recordProcessorAttemptWithArtifact(ctx, attemptID, workspaceID, snapshotRef, entry,
-		classification, route, node, status, reasonCode, reason, startedAt, nil)
+		classification, route, node, status, reasonCode, reason, startedAt, nil, attemptContext{fenceToken: 1})
 }
 
 func (h *Host) recordProcessorAttemptWithArtifact(ctx context.Context, attemptID, workspaceID, snapshotRef string,
 	entry sqlite.NamespaceEntry, classification ClassificationRecord, route Route, node RouteNode,
-	status ResultStatus, reasonCode, reason string, startedAt time.Time, artifact *sqlite.ProcessorArtifact) error {
-	provenance, err := json.Marshal(map[string]any{
+	status ResultStatus, reasonCode, reason string, startedAt time.Time, artifact *sqlite.ProcessorArtifact, attemptCtx attemptContext) error {
+	provenanceFields := map[string]any{
 		"attempt_id":        attemptID,
 		"source_content_id": entry.ContentID,
 		"display_name":      entry.DisplayName,
 		"classification":    classification,
 		"route":             route,
 		"processor_digest":  ProducerDigest(node.CapabilityID),
-		"fence_token":       1,
-	})
+		"fence_token":       attemptCtx.fenceToken,
+	}
+	if attemptCtx.retryJobID != "" {
+		provenanceFields["retry_job_id"] = attemptCtx.retryJobID
+		provenanceFields["retry_attempt"] = attemptCtx.retryAttempt
+		provenanceFields["retry_idempotency_key"] = attemptCtx.retryIdempotencyKey
+		provenanceFields["retry_lease_token"] = attemptCtx.retryLeaseToken
+		provenanceFields["predecessor_attempt_id"] = attemptCtx.predecessorAttemptID
+	}
+	provenance, err := json.Marshal(provenanceFields)
 	if err != nil {
 		return fmt.Errorf("encode processor attempt provenance: %w", err)
 	}
@@ -517,12 +742,18 @@ func (h *Host) recordProcessorAttemptWithArtifact(ctx context.Context, attemptID
 		ReasonCode:      reasonCode,
 		Reason:          reason,
 		Provenance:      provenance,
-		FenceToken:      1,
+		FenceToken:      attemptCtx.fenceToken,
 		ProcessorDigest: ProducerDigest(node.CapabilityID),
 		CreatedAt:       startedAt,
 		FinishedAt:      h.opts.Now().UTC(),
 	}
 	return h.Store.Update(ctx, func(tx *sqlite.Tx) error {
+		if attemptCtx.retryJobID != "" {
+			if err := tx.ValidateJobLease(ctx, workspaceID, attemptCtx.retryJobID, attemptCtx.retryOwner,
+				attemptCtx.retryLeaseToken, attemptCtx.fenceToken, h.opts.Now().UTC()); err != nil {
+				return fmt.Errorf("validate processor retry lease before publication: %w", err)
+			}
+		}
 		if err := tx.InsertProcessorAttempt(ctx, attempt); err != nil {
 			return err
 		}

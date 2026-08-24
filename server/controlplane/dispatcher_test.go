@@ -3,9 +3,13 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ailiheizi/restoreweave/client/command"
+	"github.com/ailiheizi/restoreweave/server/internal/exact"
+	"github.com/ailiheizi/restoreweave/server/internal/repository"
 	"github.com/ailiheizi/restoreweave/server/internal/search"
 	"github.com/ailiheizi/restoreweave/server/internal/store/sqlite"
 	"github.com/ailiheizi/restoreweave/server/testutil"
@@ -16,6 +20,105 @@ func newTestDispatcher(t *testing.T) (*Dispatcher, *sqlite.Store) {
 	store := testutil.OpenStore(t, ":memory:")
 	dispatcher := NewDispatcher(store, "/catalog/harness.sqlite", "/tmp/restoreweave/harness.sock")
 	return dispatcher, store
+}
+
+func TestDispatcherBindsDaemonIndexerToResolvedProfile(t *testing.T) {
+	store := testutil.OpenStore(t, ":memory:")
+	repo, err := repository.OpenDir(filepath.Join(t.TempDir(), "repository"))
+	if err != nil {
+		t.Fatalf("open repository: %v", err)
+	}
+	binding := search.FixtureIndexBinding("sha256:config-a")
+	dispatcher := NewDispatcher(store, "catalog.sqlite", "/tmp/rw.sock",
+		WithConfigDigest(binding.ConfigDigest), WithIndexBinding(binding), WithExact(&exact.Service{
+			Store: store,
+			Repo:  repo,
+		}))
+	if dispatcher.search == nil {
+		t.Fatal("daemon dispatcher did not create an indexer")
+	}
+	if dispatcher.search.ConfigDigest != binding.ConfigDigest ||
+		dispatcher.search.LexicalProfileDigest != binding.LexicalProfileDigest ||
+		dispatcher.search.SemanticProfileDigest != binding.SemanticProfileDigest ||
+		dispatcher.search.SemanticSpace != binding.SemanticSpace {
+		t.Fatalf("indexer binding = %+v, want %+v", dispatcher.search, binding)
+	}
+
+	// The effective config digest remains authoritative regardless of option
+	// order, so a stale binding cannot select another config lineage.
+	stale := binding
+	stale.ConfigDigest = "sha256:stale-config"
+	for _, opts := range [][]DispatcherOption{
+		{WithConfigDigest(binding.ConfigDigest), WithIndexBinding(stale)},
+		{WithIndexBinding(stale), WithConfigDigest(binding.ConfigDigest)},
+	} {
+		candidate := NewDispatcher(store, "catalog.sqlite", "/tmp/rw.sock",
+			append(opts, WithExact(&exact.Service{Store: store, Repo: repo}))...)
+		if candidate.search == nil || candidate.search.ConfigDigest != binding.ConfigDigest ||
+			candidate.search.LexicalProfileDigest != binding.LexicalProfileDigest ||
+			candidate.search.SemanticProfileDigest != binding.SemanticProfileDigest ||
+			candidate.search.SemanticSpace != binding.SemanticSpace {
+			t.Fatalf("option order produced binding %+v, want %+v", candidate.search, binding)
+		}
+	}
+}
+
+func TestDispatcherUsesConfiguredVectorPath(t *testing.T) {
+	store := testutil.OpenStore(t, ":memory:")
+	repoRoot := filepath.Join(t.TempDir(), "repository")
+	vectorRoot := filepath.Join(t.TempDir(), "vectors")
+	repo, err := repository.OpenDir(repoRoot)
+	if err != nil {
+		t.Fatalf("open repository: %v", err)
+	}
+	dispatcher := NewDispatcher(store, "catalog.sqlite", "/tmp/rw.sock",
+		WithVectorPath(vectorRoot), WithExact(&exact.Service{Store: store, Repo: repo}))
+	if dispatcher.search == nil || dispatcher.search.Engine == nil {
+		t.Fatal("dispatcher did not create search engine")
+	}
+	if dispatcher.search.Engine.Dir != vectorRoot {
+		t.Fatalf("search engine dir = %q, want configured vector path %q", dispatcher.search.Engine.Dir, vectorRoot)
+	}
+	if dispatcher.search.Engine.Dir == filepath.Join(repoRoot, "indexes") {
+		t.Fatal("search engine unexpectedly uses repository-relative indexes")
+	}
+}
+
+type dispatcherSemanticProvider struct{}
+
+func (dispatcherSemanticProvider) Embed(context.Context, search.SemanticEmbeddingRequest) ([]search.SemanticVector, error) {
+	return nil, nil
+}
+
+type dispatcherSemanticZvec struct{}
+
+func (dispatcherSemanticZvec) Build(context.Context, search.ZvecGenerationSpec, []search.ZvecSegment) (search.ZvecGenerationReceipt, error) {
+	return search.ZvecGenerationReceipt{}, nil
+}
+
+func (dispatcherSemanticZvec) Open(context.Context, search.ZvecGenerationSpec) (search.ZvecGeneration, error) {
+	return nil, nil
+}
+
+func TestDispatcherWiresAdmittedSemanticBinding(t *testing.T) {
+	store := testutil.OpenStore(t, ":memory:")
+	repo, err := repository.OpenDir(filepath.Join(t.TempDir(), "repository"))
+	if err != nil {
+		t.Fatalf("open repository: %v", err)
+	}
+	manifest := search.EmbeddingGenerationManifest{
+		RuntimeDigest: "runtime", ModelDigest: "model", TokenizerDigest: "tokenizer", PreprocessingDigest: "preprocess",
+		Pooling: "cls", Normalization: "l2", ElementType: "float32", Dimension: 512,
+		VectorSchema: "float32:512", SemanticSpace: "space", Distance: "cosine", IndexConfig: "index", QueryConfig: "query",
+		ProviderDigest: "provider", ConfigDigest: "config",
+	}
+	dispatcher := NewDispatcher(store, "catalog.sqlite", "/tmp/rw.sock",
+		WithConfigDigest(manifest.ConfigDigest),
+		WithSemanticIndexerBinding(dispatcherSemanticProvider{}, dispatcherSemanticZvec{}, "/explicit/libzvec.dylib", "sha256:"+strings.Repeat("a", 64), manifest),
+		WithExact(&exact.Service{Store: store, Repo: repo}))
+	if dispatcher.search == nil || dispatcher.search.SemanticProvider == nil || dispatcher.search.SemanticZvec == nil || dispatcher.search.SemanticManifest != manifest {
+		t.Fatalf("semantic binding was not wired: %+v", dispatcher.search)
+	}
 }
 
 func mustEnvelope(t *testing.T, operation string, input any) command.Envelope {

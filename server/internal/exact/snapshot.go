@@ -158,6 +158,29 @@ type PortableUnsupportedValue struct {
 	CaptureReported bool   `json:"capture_reported,omitempty"`
 }
 
+type PortableXAttr struct {
+	Name  string `json:"name"`
+	Value []byte `json:"value"`
+}
+
+type PortableXAttrValue struct {
+	State      string          `json:"state"`
+	Attributes []PortableXAttr `json:"attributes"`
+	ReasonCode string          `json:"reason_code,omitempty"`
+}
+
+type PortableACLRecord struct {
+	Name string `json:"name"`
+	Raw  []byte `json:"raw"`
+}
+
+type PortableACLValue struct {
+	State      string              `json:"state"`
+	Format     string              `json:"format,omitempty"`
+	Records    []PortableACLRecord `json:"records"`
+	ReasonCode string              `json:"reason_code,omitempty"`
+}
+
 func validPortableFactState(state PortableFactState) bool {
 	switch state {
 	case PortableFactObserved, PortableFactUnobserved, PortableFactUnsupported,
@@ -253,8 +276,65 @@ func validatePortableFactValue(fact ManifestPortableFact) error {
 	switch fact.Name {
 	case PortableFactSparseExtents:
 		return unsupported(PortableFactUnsupported, PortableFactNotApplicable, PortableFactInconsistent)
-	case PortableFactACLs, PortableFactAlternateStreams, PortableFactFlags, PortableFactResourceForks, PortableFactXAttrs:
+	case PortableFactAlternateStreams, PortableFactFlags, PortableFactResourceForks:
 		return unsupported(PortableFactUnsupported)
+	case PortableFactXAttrs:
+		var value PortableXAttrValue
+		if err := decodePortableFactValue(fact.Value, &value); err != nil {
+			return err
+		}
+		if value.State == "" {
+			return validateLegacyUnsupportedFact(fact)
+		}
+		if err := validatePortableExtendedState(fact.State, value.State, value.ReasonCode, fact.Name); err != nil {
+			return err
+		}
+		seen := make(map[string]struct{}, len(value.Attributes))
+		previousName := ""
+		for _, attribute := range value.Attributes {
+			if strings.TrimSpace(attribute.Name) == "" {
+				return errors.New("xattr has an empty name")
+			}
+			if previousName != "" && attribute.Name <= previousName {
+				return errors.New("xattrs are not in stable name order")
+			}
+			if _, exists := seen[attribute.Name]; exists {
+				return fmt.Errorf("xattr %q is duplicated", attribute.Name)
+			}
+			seen[attribute.Name] = struct{}{}
+			previousName = attribute.Name
+		}
+		return nil
+	case PortableFactACLs:
+		var value PortableACLValue
+		if err := decodePortableFactValue(fact.Value, &value); err != nil {
+			return err
+		}
+		if value.State == "" {
+			return validateLegacyUnsupportedFact(fact)
+		}
+		if err := validatePortableExtendedState(fact.State, value.State, value.ReasonCode, fact.Name); err != nil {
+			return err
+		}
+		if value.State == "OBSERVED" && strings.TrimSpace(value.Format) == "" {
+			return errors.New("observed ACL lacks a format profile")
+		}
+		seen := make(map[string]struct{}, len(value.Records))
+		previousName := ""
+		for _, record := range value.Records {
+			if strings.TrimSpace(record.Name) == "" || len(record.Raw) == 0 {
+				return errors.New("ACL record is incomplete")
+			}
+			if previousName != "" && record.Name <= previousName {
+				return errors.New("ACL records are not in stable name order")
+			}
+			if _, exists := seen[record.Name]; exists {
+				return fmt.Errorf("ACL record %q is duplicated", record.Name)
+			}
+			seen[record.Name] = struct{}{}
+			previousName = record.Name
+		}
+		return nil
 	case PortableFactSparseIndication:
 		var value PortableSparseIndicationValue
 		if err := decodePortableFactValue(fact.Value, &value); err != nil {
@@ -263,7 +343,7 @@ func validatePortableFactValue(fact ManifestPortableFact) error {
 		if value.LogicalBytes < 0 || value.AllocatedBytes < 0 {
 			return errors.New("sparse byte counts cannot be negative")
 		}
-		want := PortableFactInconsistent
+		var want PortableFactState
 		switch value.State {
 		case "NOT_APPLICABLE":
 			want = PortableFactNotApplicable
@@ -271,6 +351,8 @@ func validatePortableFactValue(fact ManifestPortableFact) error {
 			want = PortableFactUnobserved
 		case "NOT_INDICATED", "ALLOCATION_BELOW_LOGICAL_SIZE":
 			want = PortableFactObserved
+		default:
+			return fmt.Errorf("unknown sparse state %q", value.State)
 		}
 		if fact.State != want {
 			return fmt.Errorf("state %q conflicts with sparse state %q", fact.State, value.State)
@@ -296,7 +378,7 @@ func validatePortableFactValue(fact ManifestPortableFact) error {
 		if err := decodePortableFactValue(fact.Value, &value); err != nil {
 			return err
 		}
-		want := PortableFactInconsistent
+		var want PortableFactState
 		switch value.State {
 		case "NOT_APPLICABLE":
 			want = PortableFactNotApplicable
@@ -304,6 +386,8 @@ func validatePortableFactValue(fact ManifestPortableFact) error {
 			want = PortableFactUnobserved
 		case "SINGLE_LINK", "MULTIPLE_LINKS":
 			want = PortableFactObserved
+		default:
+			return fmt.Errorf("unknown hard-link state %q", value.State)
 		}
 		if fact.State != want {
 			return fmt.Errorf("state %q conflicts with hard-link state %q", fact.State, value.State)
@@ -340,6 +424,44 @@ func validatePortableFactValue(fact ManifestPortableFact) error {
 	default:
 		return fmt.Errorf("unknown portable fact name %q", fact.Name)
 	}
+}
+
+func validateLegacyUnsupportedFact(fact ManifestPortableFact) error {
+	var value PortableUnsupportedValue
+	if err := decodePortableFactValue(fact.Value, &value); err != nil {
+		return err
+	}
+	if fact.State != PortableFactUnsupported || strings.TrimSpace(value.ReasonCode) == "" {
+		return errors.New("legacy unsupported fact is not explicitly degraded")
+	}
+	return nil
+}
+
+func validatePortableExtendedState(factState PortableFactState, valueState, reason, name string) error {
+	if strings.TrimSpace(reason) == "" && valueState != "OBSERVED" {
+		return fmt.Errorf("%s degraded state lacks a reason code", name)
+	}
+	switch valueState {
+	case "OBSERVED":
+		if factState != PortableFactObserved {
+			return fmt.Errorf("%s observed value has fact state %q", name, factState)
+		}
+	case "UNOBSERVED":
+		if factState != PortableFactUnobserved {
+			return fmt.Errorf("%s unobserved value has fact state %q", name, factState)
+		}
+	case "UNSUPPORTED":
+		if factState != PortableFactUnsupported {
+			return fmt.Errorf("%s unsupported value has fact state %q", name, factState)
+		}
+	case "INCONSISTENT":
+		if factState != PortableFactInconsistent {
+			return fmt.Errorf("%s inconsistent value has fact state %q", name, factState)
+		}
+	default:
+		return fmt.Errorf("%s has unknown state %q", name, valueState)
+	}
+	return nil
 }
 
 func validateManifestFacts(manifest Manifest) error {
@@ -438,7 +560,18 @@ type ManifestExternalLocator struct {
 func (manifest Manifest) canonicalForDigest() ([]byte, error) {
 	copy := manifest
 	copy.ManifestDigest = ""
-	return json.Marshal(copy)
+	encoded, err := json.Marshal(copy)
+	if err != nil {
+		return nil, err
+	}
+	// Normalize JSON string encoding before hashing so invalid UTF-8 display
+	// paths have the same digest before and after persistence.
+	var normalized Manifest
+	if err := json.Unmarshal(encoded, &normalized); err != nil {
+		return nil, err
+	}
+	normalized.ManifestDigest = ""
+	return json.Marshal(normalized)
 }
 
 func (manifest Manifest) Digest() (string, error) {

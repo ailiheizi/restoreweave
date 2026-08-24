@@ -3,6 +3,7 @@ package search
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 )
 
@@ -81,6 +82,73 @@ func TestEngineQueryFilteredTypedStructuredFilters(t *testing.T) {
 	hits, err = engine.QueryFiltered(ctx, path, "", nil, Filters{Suffix: ".TXT"})
 	if err != nil || len(hits) != 1 {
 		t.Fatalf("suffix hits = %+v err=%v", hits, err)
+	}
+}
+
+func TestEngineQueryFilteredLanguageIsCaseInsensitiveExactAndFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	engine := &Engine{Dir: t.TempDir()}
+	path, err := engine.Build(ctx, "idx_testlanguage000000000000000000", []Document{
+		{SubjectID: "subject-en", Name: "english.txt", Language: "EN"},
+		{SubjectID: "subject-zh", Name: "chinese.txt", Language: "zh"},
+		{SubjectID: "subject-missing", Name: "missing.txt"},
+		{SubjectID: "subject-empty", Name: "empty.txt", Language: "  "},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	hits, err := engine.QueryFiltered(ctx, path, "", nil, Filters{Language: " en "})
+	if err != nil {
+		t.Fatalf("language query: %v", err)
+	}
+	if len(hits) != 1 || hits[0].SubjectID != "subject-en" {
+		t.Fatalf("language hits = %+v, want only subject-en", hits)
+	}
+
+	hits, err = engine.QueryFiltered(ctx, path, "", nil, Filters{Language: "ZH"})
+	if err != nil {
+		t.Fatalf("wrong-language query: %v", err)
+	}
+	if len(hits) != 1 || hits[0].SubjectID != "subject-zh" {
+		t.Fatalf("wrong-language hits = %+v, want only subject-zh", hits)
+	}
+}
+
+func TestEngineQueryFilteredPagesPastRejectedCandidatesAndBoundsOutput(t *testing.T) {
+	ctx := context.Background()
+	engine := &Engine{Dir: t.TempDir()}
+	docs := make([]Document, 0, 1002)
+	for i := 0; i < 1001; i++ {
+		docs = append(docs, Document{
+			SubjectID: fmt.Sprintf("subject-en-%04d", i),
+			Name:      fmt.Sprintf("english-%04d.txt", i),
+			Language:  "en",
+		})
+	}
+	docs = append(docs, Document{SubjectID: "subject-zh-last", Name: "chinese.txt", Language: "zh"})
+	path, err := engine.Build(ctx, "idx_testfilteredpaging00000000000000", docs)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	// The only matching row sits beyond the first 1000 candidates. Filtering
+	// must continue to the next page instead of reporting a false negative.
+	hits, err := engine.QueryFiltered(ctx, path, "", nil, Filters{Language: "zh"})
+	if err != nil {
+		t.Fatalf("paged language query: %v", err)
+	}
+	if len(hits) != 1 || hits[0].SubjectID != "subject-zh-last" {
+		t.Fatalf("paged language hits = %+v, want subject-zh-last", hits)
+	}
+
+	// Candidate paging does not remove the bounded result contract.
+	hits, err = engine.QueryFiltered(ctx, path, "", nil, Filters{Language: "en"})
+	if err != nil {
+		t.Fatalf("bounded language query: %v", err)
+	}
+	if len(hits) != 1000 {
+		t.Fatalf("bounded language hits = %d, want 1000", len(hits))
 	}
 }
 

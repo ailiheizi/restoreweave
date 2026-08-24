@@ -22,9 +22,10 @@ const (
 	RecordProcessorAttemptClosure RecordRole = "PROCESSOR_ATTEMPT_CLOSURE"
 	RecordPortableFactClosure     RecordRole = "PORTABLE_FACT_CLOSURE"
 
-	recoveryDirName        = "recovery"
-	repositoryIdentityFile = "repository.identity"
-	maxRecordBytes         = int64(16 << 20)
+	recoveryDirName          = "recovery"
+	repositoryIdentityFile   = "repository.identity"
+	repositoryEncryptionFile = "repository.encryption"
+	maxRecordBytes           = int64(16 << 20)
 )
 
 // RecordRole distinguishes portable recovery metadata from payload objects.
@@ -130,7 +131,7 @@ func (repo *Dir) OpenRecord(ctx context.Context, role RecordRole, digest string)
 	if err != nil {
 		return nil, err
 	}
-	file, err := os.Open(path)
+	file, err := openRepositoryFile(repo.root, path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("%w: %s/%s", ErrNotFound, role, digest)
 	}
@@ -184,12 +185,20 @@ func (repo *Dir) ListRecordDigests(ctx context.Context, role RecordRole) ([]stri
 			return nil
 		}
 		name := entry.Name()
-		if entry.Type().IsRegular() && len(name) == 64 {
-			candidate := AlgorithmSHA256 + ":" + name
-			if _, err := parseContentID(candidate); err == nil {
-				digests = append(digests, candidate)
-			}
+		if entry.Type()&os.ModeSymlink != 0 || !entry.Type().IsRegular() {
+			return fmt.Errorf("portable record %q is not a regular file", path)
 		}
+		if len(name) != 64 {
+			return fmt.Errorf("portable record %q has invalid digest name", path)
+		}
+		candidate := AlgorithmSHA256 + ":" + name
+		if _, err := parseContentID(candidate); err != nil {
+			return fmt.Errorf("portable record %q has invalid digest: %w", path, err)
+		}
+		if prefix := filepath.Base(filepath.Dir(path)); prefix != name[:hexPrefixLen] {
+			return fmt.Errorf("portable record %q is in prefix directory %q, want %q", path, prefix, name[:hexPrefixLen])
+		}
+		digests = append(digests, candidate)
 		return nil
 	})
 	if errors.Is(err, os.ErrNotExist) {

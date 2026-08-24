@@ -719,6 +719,46 @@ FROM jobs ORDER BY updated_at_ns DESC, job_id DESC LIMIT ?`, limit)
 	return jobs, nil
 }
 
+// ListClaimableJobs returns bounded retry work whose lease is absent or has
+// expired. Claiming remains a separate fenced transaction.
+func (s *Store) ListClaimableJobs(ctx context.Context, kind string, now time.Time, limit int) ([]Job, error) {
+	if err := requireText("job kind", kind); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 100 {
+		return nil, errors.New("claimable job limit must be between 1 and 100")
+	}
+	now = now.UTC()
+	rows, err := s.db.QueryContext(ctx, `
+SELECT job_id, workspace_id, plan_id, kind, state, input_json, checkpoint_json,
+       result_json, error_code, attempt, max_attempts, lease_owner, lease_token,
+       fencing_token, lease_until_ns, cancellation_asked, revision,
+       created_at_ns, updated_at_ns
+FROM jobs
+WHERE kind = ?
+  AND state IN ('QUEUED', 'RUNNING', 'NEEDS_RECONCILIATION')
+  AND attempt < max_attempts
+  AND (lease_until_ns IS NULL OR lease_until_ns <= ?)
+ORDER BY created_at_ns, job_id
+LIMIT ?`, kind, now.UnixNano(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("list claimable jobs: %w", err)
+	}
+	defer rows.Close()
+	jobs := make([]Job, 0, limit)
+	for rows.Next() {
+		job, err := scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate claimable jobs: %w", err)
+	}
+	return jobs, nil
+}
+
 func (s *Store) GetJob(ctx context.Context, workspaceID, jobID string) (Job, error) {
 	return scanJob(s.db.QueryRowContext(ctx, `
 SELECT job_id, workspace_id, plan_id, kind, state, input_json, checkpoint_json,
@@ -818,6 +858,7 @@ SELECT state, revision FROM jobs WHERE workspace_id = ? AND job_id = ?`,
 UPDATE jobs SET
     state = ?, checkpoint_json = ?, result_json = ?, error_code = ?,
     attempt = ?, cancellation_asked = ?, revision = revision + 1,
+	lease_owner = '', lease_token = '', lease_until_ns = NULL,
     updated_at_ns = ?
 WHERE workspace_id = ? AND job_id = ? AND revision = ?`,
 		update.State, string(checkpoint), string(resultJSON), update.ErrorCode,
@@ -870,7 +911,7 @@ UPDATE jobs SET
     fencing_token = fencing_token + 1, lease_until_ns = ?,
     attempt = attempt + 1, revision = revision + 1, updated_at_ns = ?
 WHERE workspace_id = ? AND job_id = ? AND revision = ?
-  AND state IN ('QUEUED', 'RUNNING')
+  AND state IN ('QUEUED', 'RUNNING', 'NEEDS_RECONCILIATION')
   AND attempt < max_attempts
   AND (lease_until_ns IS NULL OR lease_until_ns <= ?)
 RETURNING fencing_token`,
@@ -883,6 +924,76 @@ RETURNING fencing_token`,
 		return 0, fmt.Errorf("acquire job lease: %w", err)
 	}
 	return fencingToken, nil
+}
+
+func (s *Store) ValidateJobLease(ctx context.Context, workspaceID, jobID, owner, leaseToken string, fencingToken int64, now time.Time) error {
+	if fencingToken < 1 {
+		return errors.New("job fencing token must be positive")
+	}
+	var found int
+	err := s.db.QueryRowContext(ctx, `
+SELECT 1 FROM jobs
+WHERE workspace_id = ? AND job_id = ? AND state = 'RUNNING'
+  AND lease_owner = ? AND lease_token = ? AND fencing_token = ?
+  AND lease_until_ns > ?`, workspaceID, jobID, owner, leaseToken, fencingToken, now.UTC().UnixNano()).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrConflict
+	}
+	if err != nil {
+		return fmt.Errorf("validate job lease: %w", err)
+	}
+	return nil
+}
+
+// RenewJobLease extends one still-active lease without changing its fencing
+// token or job revision. An expired or superseded lease cannot be revived.
+func (s *Store) RenewJobLease(ctx context.Context, workspaceID, jobID, owner, leaseToken string, fencingToken int64, now, until time.Time) error {
+	if fencingToken < 1 {
+		return errors.New("job fencing token must be positive")
+	}
+	now = now.UTC()
+	until = until.UTC()
+	if !until.After(now) {
+		return errors.New("job lease renewal must expire after renewal time")
+	}
+	result, err := s.db.ExecContext(ctx, `
+UPDATE jobs SET lease_until_ns = ?, updated_at_ns = ?
+WHERE workspace_id = ? AND job_id = ? AND state = 'RUNNING'
+  AND lease_owner = ? AND lease_token = ? AND fencing_token = ?
+  AND lease_until_ns > ?`, until.UnixNano(), now.UnixNano(), workspaceID, jobID,
+		owner, leaseToken, fencingToken, now.UnixNano())
+	if err != nil {
+		return fmt.Errorf("renew job lease: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("renew job lease: %w", err)
+	}
+	if changed != 1 {
+		return ErrConflict
+	}
+	return nil
+}
+
+// ValidateJobLease checks a publication lease inside the caller's write
+// transaction so takeover cannot race validation and the protected write.
+func (tx *Tx) ValidateJobLease(ctx context.Context, workspaceID, jobID, owner, leaseToken string, fencingToken int64, now time.Time) error {
+	if fencingToken < 1 {
+		return errors.New("job fencing token must be positive")
+	}
+	var found int
+	err := tx.tx.QueryRowContext(ctx, `
+SELECT 1 FROM jobs
+WHERE workspace_id = ? AND job_id = ? AND state = 'RUNNING'
+  AND lease_owner = ? AND lease_token = ? AND fencing_token = ?
+  AND lease_until_ns > ?`, workspaceID, jobID, owner, leaseToken, fencingToken, now.UTC().UnixNano()).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrConflict
+	}
+	if err != nil {
+		return fmt.Errorf("validate job lease: %w", err)
+	}
+	return nil
 }
 
 func (tx *Tx) AppendAuditEvent(ctx context.Context, event *AuditEvent) error {
@@ -1150,7 +1261,7 @@ func validJobTransition(from, to JobState) bool {
 		return to == JobRunning || to == JobWaitingApproval || to == JobCancelled
 	case JobRunning:
 		return to == JobWaitingApproval || to == JobSucceeded || to == JobFailed ||
-			to == JobCancelled || to == JobNeedsReconcile
+			to == JobCancelled || to == JobNeedsReconcile || to == JobQueued
 	case JobWaitingApproval:
 		return to == JobQueued || to == JobRunning || to == JobCancelled || to == JobFailed
 	case JobNeedsReconcile:

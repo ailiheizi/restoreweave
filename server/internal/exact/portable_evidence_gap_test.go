@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -58,6 +60,7 @@ func newPortableEvidenceFixture(t *testing.T) portableEvidenceFixture {
 		ID: documentID, WorkspaceID: result.WorkspaceID,
 		SubjectRef: subject, Kind: sqlite.DescriptionUser, Language: "en",
 		Body: "portable description", SourceRef: "user:portable-evidence",
+		ConfigDigest: result.ConfigDigest,
 	}
 	if err := fixture.store.InsertDescriptionDocument(ctx, document); err != nil {
 		t.Fatal(err)
@@ -70,6 +73,7 @@ func newPortableEvidenceFixture(t *testing.T) portableEvidenceFixture {
 		ID: segmentID, WorkspaceID: result.WorkspaceID,
 		DocumentID: document.ID, SubjectRef: subject, Ordinal: 0,
 		Text: document.Body, Language: "en", Section: "body",
+		SourceSpan: json.RawMessage(fmt.Sprintf(`{"start_byte":0,"end_byte":%d}`, len([]byte(document.Body)))),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -211,10 +215,19 @@ func TestPortableEvidenceIncludesAnnotationAndSemanticSegmentAfterRelocation(t *
 		}
 		mappings[portableRawPathKey(mapping.RawPath)] = mapping
 	}
-	if len(mappings) != len(manifest.Entries) {
-		t.Fatalf("relocated mappings = %d, want %d; manifest=%+v mappings=%+v", len(mappings), len(manifest.Entries), manifest.Entries, mappings)
+	wantMappings := 0
+	for _, entry := range manifest.Entries {
+		if !(entry.RelativePath == "." && portableRawPathKey(entry.RawPath) == ".") {
+			wantMappings++
+		}
+	}
+	if len(mappings) != wantMappings {
+		t.Fatalf("relocated mappings = %d, want %d", len(mappings), wantMappings)
 	}
 	for _, entry := range manifest.Entries {
+		if entry.RelativePath == "." && portableRawPathKey(entry.RawPath) == "." {
+			continue
+		}
 		mapping, ok := mappings[portableRawPathKey(entry.RawPath)]
 		if !ok || !bytes.Equal(mapping.RawPath, entry.RawPath) || !bytes.Equal(mapping.RawName, entry.RawName) || mapping.EntryType != entry.EntryType {
 			t.Fatalf("relocated mapping for %q does not round-trip manifest entry: %+v", entry.RelativePath, mapping)
@@ -366,7 +379,11 @@ func TestPortableEvidenceAllowsAdditionalDurableMetadataFact(t *testing.T) {
 		if subject == "" {
 			t.Fatal("subject mapping is unavailable")
 		}
-		payload, err := CanonicalJSON(map[string]any{"authority_class": "TEST", "value": "durable"})
+		payload, err := CanonicalJSON(sqlite.MetadataFact{
+			ID: "metadata:durable-extra", WorkspaceID: bundle.WorkspaceID, SubjectRef: subject,
+			Namespace: "test", Key: "value", Value: json.RawMessage(`"durable"`),
+			ValueType: "string", AuthorityClass: "TEST", SourceRef: "test:durable", Revision: 1,
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -381,6 +398,347 @@ func TestPortableEvidenceAllowsAdditionalDurableMetadataFact(t *testing.T) {
 	reader := &Service{Repo: evidence.fixture.repo, TrustAnchor: evidence.fixture.service.TrustAnchor, PublicationDomain: testPublicationDomain, RequireSignedPublication: true}
 	if _, err := reader.ListPortableFactClosures(context.Background(), evidence.result.SnapshotRef); err != nil {
 		t.Fatalf("additional durable metadata fact was rejected: %v", err)
+	}
+}
+
+func appendPortableMetadataFactForTest(t *testing.T, bundle *portableFactBundle) int {
+	t.Helper()
+	var subject string
+	for _, record := range bundle.Records {
+		if record.RecordKind == "SUBJECT_MAPPING" {
+			subject = record.StableSubjectRef
+			break
+		}
+	}
+	if subject == "" {
+		t.Fatal("subject mapping is unavailable")
+	}
+	value := sqlite.MetadataFact{
+		ID: "mdf:portable-extra", WorkspaceID: bundle.WorkspaceID, SubjectRef: subject,
+		Namespace: "test", Key: "value", Value: json.RawMessage(`"durable"`),
+		ValueType: "string", AuthorityClass: "TEST", SourceRef: "test:durable", Revision: 1,
+	}
+	payload, err := CanonicalJSON(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle.Records = append(bundle.Records, portableFactRecord{
+		Schema: PortableFactRecordSchemaV1, RecordKind: "METADATA_FACT", RecordID: value.ID,
+		WorkspaceID: bundle.WorkspaceID, SnapshotRef: bundle.SnapshotRef, StableSubjectRef: subject,
+		Revision: 1, PayloadDigest: DigestBytes(payload), PayloadLength: int64(len(payload)),
+		Provenance: json.RawMessage(`{"authority":"test"}`), Payload: payload,
+	})
+	return len(bundle.Records) - 1
+}
+
+func TestPortableEvidenceRejectsDurableMetadataIdentityDrift(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*sqlite.MetadataFact)
+	}{
+		{name: "id", mutate: func(value *sqlite.MetadataFact) { value.ID = "mdf:foreign" }},
+		{name: "workspace", mutate: func(value *sqlite.MetadataFact) { value.WorkspaceID = "workspace:foreign" }},
+		{name: "subject", mutate: func(value *sqlite.MetadataFact) { value.SubjectRef = "nse:foreign" }},
+		{name: "revision", mutate: func(value *sqlite.MetadataFact) { value.Revision = 2 }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			evidence := newPortableEvidenceFixture(t)
+			replacePortableFactBundleForTest(t, evidence.fixture, func(bundle *portableFactBundle) {
+				index := appendPortableMetadataFactForTest(t, bundle)
+				var value sqlite.MetadataFact
+				if err := decodeStrictRecord(bundle.Records[index].Payload, &value); err != nil {
+					t.Fatal(err)
+				}
+				test.mutate(&value)
+				rewritePortableRecordPayload(t, &bundle.Records[index], value)
+				sortPortableFactRecordsForTest(bundle)
+			})
+			reader := &Service{Repo: evidence.fixture.repo, TrustAnchor: evidence.fixture.service.TrustAnchor, PublicationDomain: testPublicationDomain, RequireSignedPublication: true}
+			if _, err := reader.ListPortableFactClosures(context.Background(), evidence.result.SnapshotRef); err == nil {
+				t.Fatalf("metadata %s drift was accepted", test.name)
+			}
+		})
+	}
+}
+
+func TestPortableEvidenceRejectsAnnotationBodyDigestDrift(t *testing.T) {
+	evidence := newPortableEvidenceFixture(t)
+	replacePortableFactBundleForTest(t, evidence.fixture, func(bundle *portableFactBundle) {
+		index := findPortableRecord(t, *bundle, "ANNOTATION_REVISION")
+		var value sqlite.AnnotationRevision
+		if err := decodeStrictRecord(bundle.Records[index].Payload, &value); err != nil {
+			t.Fatal(err)
+		}
+		value.BodyDigest = DigestBytes([]byte("different annotation body"))
+		rewritePortableRecordPayload(t, &bundle.Records[index], value)
+	})
+	reader := &Service{Repo: evidence.fixture.repo, TrustAnchor: evidence.fixture.service.TrustAnchor, PublicationDomain: testPublicationDomain, RequireSignedPublication: true}
+	if _, err := reader.ListPortableFactClosures(context.Background(), evidence.result.SnapshotRef); err == nil {
+		t.Fatal("annotation body digest drift was accepted")
+	}
+}
+
+func appendPortableMappingForConsistencyTest(t *testing.T, bundle *portableFactBundle, rootID, sourceID string) {
+	t.Helper()
+	index := findPortableRecord(t, *bundle, "SUBJECT_MAPPING")
+	record := bundle.Records[index]
+	var mapping subjectMappingPayload
+	if err := decodeStrictRecord(record.Payload, &mapping); err != nil {
+		t.Fatal(err)
+	}
+	mapping.NamespaceEntryID = "nse:portable-consistency"
+	mapping.NamespaceRootID = rootID
+	mapping.SourceID = sourceID
+	mapping.ParentSubjectRef = ""
+	mapping.RawPath = []byte("portable-consistency")
+	mapping.RawName = []byte("portable-consistency")
+	payload, err := CanonicalJSON(mapping)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.RecordID = mapping.NamespaceEntryID
+	record.StableSubjectRef = mapping.NamespaceEntryID
+	record.Payload = payload
+	record.PayloadDigest = DigestBytes(payload)
+	record.PayloadLength = int64(len(payload))
+	bundle.Records = append(bundle.Records, record)
+}
+
+func TestPortableEvidenceRejectsInconsistentMappingRootAndSource(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		rootID   string
+		sourceID string
+	}{
+		{name: "root", rootID: "root:foreign", sourceID: ""},
+		{name: "source", rootID: "", sourceID: "source:foreign"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			evidence := newPortableEvidenceFixture(t)
+			replacePortableFactBundleForTest(t, evidence.fixture, func(bundle *portableFactBundle) {
+				index := findPortableRecord(t, *bundle, "SUBJECT_MAPPING")
+				var mapping subjectMappingPayload
+				if err := decodeStrictRecord(bundle.Records[index].Payload, &mapping); err != nil {
+					t.Fatal(err)
+				}
+				if test.rootID == "" {
+					test.rootID = mapping.NamespaceRootID
+				}
+				if test.sourceID == "" {
+					test.sourceID = mapping.SourceID
+				}
+				appendPortableMappingForConsistencyTest(t, bundle, test.rootID, test.sourceID)
+				sortPortableFactRecordsForTest(bundle)
+			})
+			reader := &Service{Repo: evidence.fixture.repo, TrustAnchor: evidence.fixture.service.TrustAnchor, PublicationDomain: testPublicationDomain, RequireSignedPublication: true}
+			if _, err := reader.ListPortableFactClosures(context.Background(), evidence.result.SnapshotRef); err == nil {
+				t.Fatalf("inconsistent mapping %s was accepted", test.name)
+			}
+		})
+	}
+}
+
+func TestPortableEvidenceRejectsSelectedRepresentationDrift(t *testing.T) {
+	evidence := newPortableEvidenceFixture(t)
+	replacePortableFactBundleForTest(t, evidence.fixture, func(bundle *portableFactBundle) {
+		index := findPortableRecord(t, *bundle, "SUBJECT_MAPPING")
+		var mapping subjectMappingPayload
+		if err := decodeStrictRecord(bundle.Records[index].Payload, &mapping); err != nil {
+			t.Fatal(err)
+		}
+		mapping.SelectedRepresentationRefs = append(mapping.SelectedRepresentationRefs, "representation:unexpected")
+		rewritePortableRecordPayload(t, &bundle.Records[index], mapping)
+	})
+	reader := &Service{Repo: evidence.fixture.repo, TrustAnchor: evidence.fixture.service.TrustAnchor, PublicationDomain: testPublicationDomain, RequireSignedPublication: true}
+	if _, err := reader.ListPortableFactClosures(context.Background(), evidence.result.SnapshotRef); err == nil {
+		t.Fatal("selected representation drift was accepted")
+	}
+}
+
+func appendPortableAnnotationRevisionForTest(t *testing.T, bundle *portableFactBundle, predecessorIndex int, revision int64, predecessorID, subjectRef string) {
+	t.Helper()
+	previous := bundle.Records[predecessorIndex]
+	var value sqlite.AnnotationRevision
+	if err := decodeStrictRecord(previous.Payload, &value); err != nil {
+		t.Fatal(err)
+	}
+	value.ID = value.AnnotationID + "@" + strconv.FormatInt(revision, 10) + "-" + strconv.Itoa(len(bundle.Records))
+	value.Revision = revision
+	value.PredecessorID = predecessorID
+	value.SubjectRef = subjectRef
+	payload, err := CanonicalJSON(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle.Records = append(bundle.Records, portableFactRecord{
+		Schema: PortableFactRecordSchemaV1, RecordKind: "ANNOTATION_REVISION", RecordID: value.ID,
+		WorkspaceID: bundle.WorkspaceID, SnapshotRef: bundle.SnapshotRef, StableSubjectRef: subjectRef,
+		Revision: revision, PredecessorRecordID: predecessorID, PayloadDigest: DigestBytes(payload),
+		PayloadLength: int64(len(payload)), Provenance: append(json.RawMessage(nil), previous.Provenance...), Payload: payload,
+	})
+}
+
+func appendPortableDescriptionRevisionForTest(t *testing.T, bundle *portableFactBundle, predecessorIndex int, revision int64, predecessorID, subjectRef, kind string) {
+	t.Helper()
+	previous := bundle.Records[predecessorIndex]
+	var value descriptionPortablePayload
+	if err := decodeStrictRecord(previous.Payload, &value); err != nil {
+		t.Fatal(err)
+	}
+	value.ID = value.ID + "-successor-" + strconv.FormatInt(revision, 10) + "-" + strconv.Itoa(len(bundle.Records))
+	value.Revision = revision
+	value.PredecessorID = predecessorID
+	value.SubjectRef = subjectRef
+	value.Kind = sqlite.DescriptionKind(kind)
+	attachmentID := "attachment:description:successor:" + strconv.FormatInt(revision, 10) + ":" + strconv.Itoa(len(bundle.Records))
+	value.BodyAttachmentID = attachmentID
+	payload, err := CanonicalJSON(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle.Records = append(bundle.Records, portableFactRecord{
+		Schema: PortableFactRecordSchemaV1, RecordKind: "DESCRIPTION_REVISION", RecordID: value.ID,
+		WorkspaceID: bundle.WorkspaceID, SnapshotRef: bundle.SnapshotRef, StableSubjectRef: subjectRef,
+		Revision: revision, PredecessorRecordID: predecessorID, PayloadDigest: DigestBytes(payload),
+		PayloadLength: int64(len(payload)), Provenance: append(json.RawMessage(nil), previous.Provenance...), Payload: payload,
+	})
+	var previousPayload descriptionPortablePayload
+	if err := decodeStrictRecord(previous.Payload, &previousPayload); err != nil {
+		t.Fatal(err)
+	}
+	var previousAttachment portableFactAttachment
+	for _, attachment := range bundle.Attachments {
+		if attachment.AttachmentID == previousPayload.BodyAttachmentID {
+			previousAttachment = attachment
+			break
+		}
+	}
+	if previousAttachment.AttachmentID == "" {
+		t.Fatal("description predecessor attachment is unavailable")
+	}
+	previousAttachment.AttachmentID = attachmentID
+	bundle.Attachments = append(bundle.Attachments, previousAttachment)
+}
+
+func TestPortableEvidenceRejectsBrokenAnnotationAndDescriptionRevisionChains(t *testing.T) {
+	tests := []struct {
+		name   string
+		kind   string
+		mutate func(*portableFactBundle)
+	}{
+		{
+			name: "annotation revision one predecessor",
+			kind: "ANNOTATION_REVISION",
+			mutate: func(bundle *portableFactBundle) {
+				index := findPortableRecord(t, *bundle, "ANNOTATION_REVISION")
+				var value sqlite.AnnotationRevision
+				if err := decodeStrictRecord(bundle.Records[index].Payload, &value); err != nil {
+					t.Fatal(err)
+				}
+				value.PredecessorID = "annotation:orphan"
+				rewritePortableRecordPayload(t, &bundle.Records[index], value)
+				bundle.Records[index].PredecessorRecordID = value.PredecessorID
+			},
+		},
+		{
+			name: "annotation orphan",
+			kind: "ANNOTATION_REVISION",
+			mutate: func(bundle *portableFactBundle) {
+				index := findPortableRecord(t, *bundle, "ANNOTATION_REVISION")
+				appendPortableAnnotationRevisionForTest(t, bundle, index, 2, "annotation:orphan", bundle.Records[index].StableSubjectRef)
+			},
+		},
+		{
+			name: "annotation skipped revision",
+			kind: "ANNOTATION_REVISION",
+			mutate: func(bundle *portableFactBundle) {
+				index := findPortableRecord(t, *bundle, "ANNOTATION_REVISION")
+				appendPortableAnnotationRevisionForTest(t, bundle, index, 3, bundle.Records[index].RecordID, bundle.Records[index].StableSubjectRef)
+			},
+		},
+		{
+			name: "annotation cross subject",
+			kind: "ANNOTATION_REVISION",
+			mutate: func(bundle *portableFactBundle) {
+				index := findPortableRecord(t, *bundle, "ANNOTATION_REVISION")
+				appendPortableAnnotationRevisionForTest(t, bundle, index, 2, bundle.Records[index].RecordID, "nse_foreign_subject")
+			},
+		},
+		{
+			name: "annotation two successors",
+			kind: "ANNOTATION_REVISION",
+			mutate: func(bundle *portableFactBundle) {
+				index := findPortableRecord(t, *bundle, "ANNOTATION_REVISION")
+				predecessor := bundle.Records[index].RecordID
+				appendPortableAnnotationRevisionForTest(t, bundle, index, 2, predecessor, bundle.Records[index].StableSubjectRef)
+				appendPortableAnnotationRevisionForTest(t, bundle, index, 2, predecessor, bundle.Records[index].StableSubjectRef)
+			},
+		},
+		{
+			name: "description orphan",
+			kind: "DESCRIPTION_REVISION",
+			mutate: func(bundle *portableFactBundle) {
+				index := findPortableRecord(t, *bundle, "DESCRIPTION_REVISION")
+				appendPortableDescriptionRevisionForTest(t, bundle, index, 2, "description:orphan", bundle.Records[index].StableSubjectRef, "USER")
+			},
+		},
+		{
+			name: "description skipped revision",
+			kind: "DESCRIPTION_REVISION",
+			mutate: func(bundle *portableFactBundle) {
+				index := findPortableRecord(t, *bundle, "DESCRIPTION_REVISION")
+				appendPortableDescriptionRevisionForTest(t, bundle, index, 3, bundle.Records[index].RecordID, bundle.Records[index].StableSubjectRef, "USER")
+			},
+		},
+		{
+			name: "description cross subject",
+			kind: "DESCRIPTION_REVISION",
+			mutate: func(bundle *portableFactBundle) {
+				index := findPortableRecord(t, *bundle, "DESCRIPTION_REVISION")
+				appendPortableDescriptionRevisionForTest(t, bundle, index, 2, bundle.Records[index].RecordID, "nse_foreign_subject", "USER")
+			},
+		},
+		{
+			name: "description two successors",
+			kind: "DESCRIPTION_REVISION",
+			mutate: func(bundle *portableFactBundle) {
+				index := findPortableRecord(t, *bundle, "DESCRIPTION_REVISION")
+				predecessor := bundle.Records[index].RecordID
+				appendPortableDescriptionRevisionForTest(t, bundle, index, 2, predecessor, bundle.Records[index].StableSubjectRef, "USER")
+				appendPortableDescriptionRevisionForTest(t, bundle, index, 2, predecessor, bundle.Records[index].StableSubjectRef, "USER")
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			evidence := newPortableEvidenceFixture(t)
+			replacePortableFactBundleForTest(t, evidence.fixture, func(bundle *portableFactBundle) {
+				test.mutate(bundle)
+				sortPortableFactRecordsForTest(bundle)
+			})
+			reader := &Service{Repo: evidence.fixture.repo, TrustAnchor: evidence.fixture.service.TrustAnchor, PublicationDomain: testPublicationDomain, RequireSignedPublication: true}
+			if _, err := reader.ListPortableFactClosures(context.Background(), evidence.result.SnapshotRef); err == nil {
+				t.Fatalf("invalid %s revision chain was accepted", test.kind)
+			}
+		})
+	}
+}
+
+func TestPortableEvidenceAcceptsCompleteRevisionChains(t *testing.T) {
+	evidence := newPortableEvidenceFixture(t)
+	replacePortableFactBundleForTest(t, evidence.fixture, func(bundle *portableFactBundle) {
+		annotationIndex := findPortableRecord(t, *bundle, "ANNOTATION_REVISION")
+		annotationPredecessor := bundle.Records[annotationIndex].RecordID
+		appendPortableAnnotationRevisionForTest(t, bundle, annotationIndex, 2, annotationPredecessor, bundle.Records[annotationIndex].StableSubjectRef)
+		descriptionIndex := findPortableRecord(t, *bundle, "DESCRIPTION_REVISION")
+		descriptionPredecessor := bundle.Records[descriptionIndex].RecordID
+		appendPortableDescriptionRevisionForTest(t, bundle, descriptionIndex, 2, descriptionPredecessor, bundle.Records[descriptionIndex].StableSubjectRef, "USER")
+		sortPortableFactRecordsForTest(bundle)
+	})
+	reader := &Service{Repo: evidence.fixture.repo, TrustAnchor: evidence.fixture.service.TrustAnchor, PublicationDomain: testPublicationDomain, RequireSignedPublication: true}
+	if _, err := reader.ListPortableFactClosures(context.Background(), evidence.result.SnapshotRef); err != nil {
+		t.Fatalf("valid annotation/description revision chains were rejected: %v", err)
 	}
 }
 
@@ -464,6 +822,128 @@ func TestPortableEvidenceRejectsInnerRecordPayloadTamper(t *testing.T) {
 	reader := &Service{Repo: evidence.fixture.repo, TrustAnchor: evidence.fixture.service.TrustAnchor, PublicationDomain: testPublicationDomain, RequireSignedPublication: true}
 	if _, err := reader.ListPortableFactClosures(context.Background(), evidence.result.SnapshotRef); err == nil {
 		t.Fatal("tampered inner portable record was accepted")
+	}
+}
+
+func TestPortableEvidenceBindsSemanticSegmentsToDescriptionBody(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*portableFactBundle, int, *sqlite.SemanticSegment)
+	}{
+		{
+			name: "missing description",
+			mutate: func(_ *portableFactBundle, _ int, segment *sqlite.SemanticSegment) {
+				segment.DocumentID = "dsc_missing"
+			},
+		},
+		{
+			name: "nonzero first ordinal",
+			mutate: func(bundle *portableFactBundle, index int, segment *sqlite.SemanticSegment) {
+				segment.Ordinal = 1
+				bundle.Records[index].Revision = 2
+			},
+		},
+		{
+			name: "text differs from body",
+			mutate: func(_ *portableFactBundle, _ int, segment *sqlite.SemanticSegment) {
+				segment.Text = strings.Replace(segment.Text, "description", "descriptioN", 1)
+				segment.TextDigest = DigestBytes([]byte(segment.Text))
+			},
+		},
+		{
+			name: "wrong subject",
+			mutate: func(_ *portableFactBundle, _ int, segment *sqlite.SemanticSegment) {
+				segment.SubjectRef = "nse:foreign"
+			},
+		},
+		{
+			name: "text digest mismatch",
+			mutate: func(_ *portableFactBundle, _ int, segment *sqlite.SemanticSegment) {
+				segment.TextDigest = DigestBytes([]byte("different segment text"))
+			},
+		},
+		{
+			name: "document revision mismatch",
+			mutate: func(_ *portableFactBundle, _ int, segment *sqlite.SemanticSegment) {
+				segment.DocumentRevision++
+			},
+		},
+		{
+			name: "segmentation profile missing",
+			mutate: func(_ *portableFactBundle, _ int, segment *sqlite.SemanticSegment) {
+				segment.SegmentationProfileDigest = ""
+			},
+		},
+		{
+			name: "language missing",
+			mutate: func(_ *portableFactBundle, _ int, segment *sqlite.SemanticSegment) {
+				segment.Language = ""
+			},
+		},
+		{
+			name: "provenance document mismatch",
+			mutate: func(bundle *portableFactBundle, index int, _ *sqlite.SemanticSegment) {
+				bundle.Records[index].Provenance = json.RawMessage(`{"description_document_id":"dsc:foreign"}`)
+			},
+		},
+		{
+			name: "discontinuous source span",
+			mutate: func(_ *portableFactBundle, _ int, segment *sqlite.SemanticSegment) {
+				segment.SourceSpan = json.RawMessage(fmt.Sprintf(`{"start_byte":1,"end_byte":%d}`, len([]byte(segment.Text))+1))
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			evidence := newPortableEvidenceFixture(t)
+			replacePortableFactBundleForTest(t, evidence.fixture, func(bundle *portableFactBundle) {
+				index := findPortableRecord(t, *bundle, "SEMANTIC_SEGMENT")
+				var segment sqlite.SemanticSegment
+				if err := decodeStrictRecord(bundle.Records[index].Payload, &segment); err != nil {
+					t.Fatal(err)
+				}
+				test.mutate(bundle, index, &segment)
+				rewritePortableRecordPayload(t, &bundle.Records[index], segment)
+			})
+			reader := &Service{Repo: evidence.fixture.repo, TrustAnchor: evidence.fixture.service.TrustAnchor, PublicationDomain: testPublicationDomain, RequireSignedPublication: true}
+			if _, err := reader.ListPortableFactClosures(context.Background(), evidence.result.SnapshotRef); err == nil {
+				t.Fatalf("invalid semantic segment with %s was accepted", test.name)
+			}
+		})
+	}
+}
+
+func TestPortableEvidenceRejectsDescriptionProfileBindingLoss(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*descriptionPortablePayload)
+	}{
+		{name: "producer profile", mutate: func(description *descriptionPortablePayload) {
+			description.ProducerProfileDigest = ""
+		}},
+		{name: "config missing", mutate: func(description *descriptionPortablePayload) {
+			description.ConfigDigest = ""
+		}},
+		{name: "config drift", mutate: func(description *descriptionPortablePayload) {
+			description.ConfigDigest = "sha256:foreign-description-config"
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			evidence := newPortableEvidenceFixture(t)
+			replacePortableFactBundleForTest(t, evidence.fixture, func(bundle *portableFactBundle) {
+				index := findPortableRecord(t, *bundle, "DESCRIPTION_REVISION")
+				var description descriptionPortablePayload
+				if err := decodeStrictRecord(bundle.Records[index].Payload, &description); err != nil {
+					t.Fatal(err)
+				}
+				test.mutate(&description)
+				rewritePortableRecordPayload(t, &bundle.Records[index], description)
+			})
+			reader := &Service{Repo: evidence.fixture.repo, TrustAnchor: evidence.fixture.service.TrustAnchor, PublicationDomain: testPublicationDomain, RequireSignedPublication: true}
+			if _, err := reader.ListPortableFactClosures(context.Background(), evidence.result.SnapshotRef); err == nil {
+				t.Fatalf("portable description with %s binding was accepted", test.name)
+			}
+		})
 	}
 }
 
@@ -587,6 +1067,31 @@ func TestPortableEvidenceRejectsConflictingFactSuccessor(t *testing.T) {
 	}
 }
 
+func TestPortableEvidenceRejectsDescriptionWithoutBodyAttachment(t *testing.T) {
+	evidence := newPortableEvidenceFixture(t)
+	replacePortableFactBundleForTest(t, evidence.fixture, func(bundle *portableFactBundle) {
+		index := findPortableRecord(t, *bundle, "DESCRIPTION_REVISION")
+		var description descriptionPortablePayload
+		if err := decodeStrictRecord(bundle.Records[index].Payload, &description); err != nil {
+			t.Fatal(err)
+		}
+		attachmentID := description.BodyAttachmentID
+		description.BodyAttachmentID = ""
+		rewritePortableRecordPayload(t, &bundle.Records[index], description)
+		attachments := bundle.Attachments[:0]
+		for _, attachment := range bundle.Attachments {
+			if attachment.AttachmentID != attachmentID {
+				attachments = append(attachments, attachment)
+			}
+		}
+		bundle.Attachments = attachments
+	})
+	reader := &Service{Repo: evidence.fixture.repo, TrustAnchor: evidence.fixture.service.TrustAnchor, PublicationDomain: testPublicationDomain, RequireSignedPublication: true}
+	if _, err := reader.ListPortableFactClosures(context.Background(), evidence.result.SnapshotRef); err == nil {
+		t.Fatal("description without a body attachment was accepted")
+	}
+}
+
 func TestPortableEvidenceRejectsArtifactBodyLossAndTamper(t *testing.T) {
 	for _, tamper := range []bool{false, true} {
 		name := "missing"
@@ -623,6 +1128,41 @@ func TestPortableEvidenceRejectsArtifactBodyLossAndTamper(t *testing.T) {
 				t.Fatalf("%s artifact body was accepted", name)
 			}
 			assertArtifactReferenceExactRestore(t, fixture, result)
+		})
+	}
+}
+
+func TestPortableEvidenceRejectsAttachmentDescriptorIdentityDrift(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*portableFactAttachment)
+	}{
+		{name: "wrong length", mutate: func(attachment *portableFactAttachment) {
+			attachment.LogicalLength++
+		}},
+		{name: "wrong content digest", mutate: func(attachment *portableFactAttachment) {
+			attachment.ContentID = "sha256:" + strings.Repeat("0", 64)
+		}},
+		{name: "wrong repository", mutate: func(attachment *portableFactAttachment) {
+			attachment.RepositoryID = "repository:foreign"
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			evidence := newPortableEvidenceFixture(t)
+			replacePortableFactBundleForTest(t, evidence.fixture, func(bundle *portableFactBundle) {
+				for index := range bundle.Attachments {
+					if bundle.Attachments[index].Purpose == "DESCRIPTION_BODY" {
+						test.mutate(&bundle.Attachments[index])
+						return
+					}
+				}
+				t.Fatal("description attachment is unavailable")
+			})
+			reader := &Service{Repo: evidence.fixture.repo, TrustAnchor: evidence.fixture.service.TrustAnchor, PublicationDomain: testPublicationDomain, RequireSignedPublication: true}
+			if _, err := reader.ListPortableFactClosures(context.Background(), evidence.result.SnapshotRef); err == nil {
+				t.Fatal("portable attachment descriptor identity drift was accepted")
+			}
 		})
 	}
 }

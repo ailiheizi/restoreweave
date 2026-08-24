@@ -21,10 +21,14 @@ func (e resticEngine) repoDir(work string) string {
 }
 
 func (e resticEngine) env(work string) []string {
+	return e.envWithPassword(work, spikePassword)
+}
+
+func (e resticEngine) envWithPassword(work, password string) []string {
 	cache := filepath.Join(work, "restic-cache")
 	return append(os.Environ(),
 		"RESTIC_REPOSITORY="+e.repoDir(work),
-		"RESTIC_PASSWORD="+spikePassword,
+		"RESTIC_PASSWORD="+password,
 		"RESTIC_CACHE_DIR="+cache,
 	)
 }

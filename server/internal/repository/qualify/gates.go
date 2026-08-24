@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/ailiheizi/restoreweave/server/internal/repository"
 )
@@ -66,6 +67,65 @@ func DriverGates(ctx context.Context, repo repository.Driver, payload []byte) er
 	}
 	if second.StoredBytes != first.StoredBytes {
 		return fmt.Errorf("idempotent stored bytes = %d, want %d", second.StoredBytes, first.StoredBytes)
+	}
+	return nil
+}
+
+// EncryptedGates exercises the host-owned key boundary in addition to the
+// ordinary exact driver gates. It intentionally accepts providers from the
+// caller; qualification never stores or prints key material.
+func EncryptedGates(ctx context.Context, root, keyRef string, provider repository.KeyProvider, payload []byte) error {
+	repo, err := repository.OpenEncryptedZstdDir(root, keyRef, provider)
+	if err != nil {
+		return fmt.Errorf("open encrypted repository: %w", err)
+	}
+	if err := DriverGates(ctx, repo, payload); err != nil {
+		return fmt.Errorf("encrypted driver gates: %w", err)
+	}
+	if _, err := repository.OpenProfileReadOnly(repository.RepositoryProfileLocalZstdEncryptedV1, root); !errors.Is(err, repository.ErrKeyUnavailable) {
+		return fmt.Errorf("missing-key reader error = %v", err)
+	}
+	return nil
+}
+
+// RepairGates proves the explicit repair contract for directory-backed
+// profiles. Corruption is introduced only in this qualification harness; the
+// production driver never deletes or rewrites an object implicitly.
+func RepairGates(ctx context.Context, repo repository.Driver, payload []byte) error {
+	repairer, ok := repo.(repository.RepairDriver)
+	if !ok {
+		return errors.New("repository does not expose the explicit repair contract")
+	}
+	if strings.TrimSpace(repo.Root()) == "" || strings.HasPrefix(repo.Root(), ":") {
+		return errors.New("repair qualification requires a directory-backed repository")
+	}
+	want := contentID(payload)
+	if _, err := repo.PlaceExact(ctx, want, bytes.NewReader(payload)); err != nil {
+		return fmt.Errorf("place repair fixture: %w", err)
+	}
+	if err := CorruptStoredObject(repo.Root()); err != nil {
+		return fmt.Errorf("corrupt repair fixture: %w", err)
+	}
+	if _, err := repairer.Repair(ctx, want, bytes.NewReader(payload)); err != nil {
+		return fmt.Errorf("repair: %w", err)
+	}
+	if err := repo.Verify(ctx, want); err != nil {
+		return fmt.Errorf("verify after repair: %w", err)
+	}
+	body, err := repo.Open(ctx, want)
+	if err != nil {
+		return fmt.Errorf("open after repair: %w", err)
+	}
+	readback, readErr := io.ReadAll(body)
+	closeErr := body.Close()
+	if readErr != nil {
+		return readErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if !bytes.Equal(readback, payload) || contentID(readback) != want {
+		return errors.New("repair readback does not match the exact identity")
 	}
 	return nil
 }

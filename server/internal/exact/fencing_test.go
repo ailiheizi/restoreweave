@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,10 +17,140 @@ import (
 // controlledClock is a minimal mutable clock so tests can drive lease expiry
 // deterministically. Both the service and the store must share one instance.
 type controlledClock struct {
+	mu  sync.RWMutex
 	now time.Time
 }
 
-func (c *controlledClock) nowFn() time.Time { return c.now }
+func (c *controlledClock) nowFn() time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.now
+}
+
+func (c *controlledClock) set(now time.Time) {
+	c.mu.Lock()
+	c.now = now
+	c.mu.Unlock()
+}
+
+type observingPublicationFencer struct {
+	PublicationFencer
+	renewed chan struct{}
+	once    sync.Once
+	calls   atomic.Int32
+}
+
+type releaseFailingPublicationFencer struct {
+	PublicationFencer
+}
+
+func (f *releaseFailingPublicationFencer) Release(context.Context, string, string, string, int64, time.Time) error {
+	return errors.New("injected publication lease release failure")
+}
+
+func (f *observingPublicationFencer) Acquire(ctx context.Context, domain, owner, leaseToken string, now, until time.Time) (int64, error) {
+	token, err := f.PublicationFencer.Acquire(ctx, domain, owner, leaseToken, now, until)
+	if err == nil && f.calls.Add(1) > 1 {
+		f.once.Do(func() { close(f.renewed) })
+	}
+	return token, err
+}
+
+func TestPublicationFenceRenewsDuringLongPlacement(t *testing.T) {
+	previousInterval := publicationFenceRenewInterval
+	publicationFenceRenewInterval = 50 * time.Millisecond
+	t.Cleanup(func() { publicationFenceRenewInterval = previousInterval })
+
+	fixture := newSignedPublicationFixture(t, "long-fenced-child.txt", []byte("long fenced child"))
+	result := fixture.ingest(t, "sha256:long-fenced-child-plan")
+	addClosureTestAttempt(t, fixture, result)
+	clock := &controlledClock{now: time.Now().UTC().Add(time.Second)}
+	base := NewPublicationFencer(fixture.store, clock.nowFn)
+	fencer := &observingPublicationFencer{PublicationFencer: base, renewed: make(chan struct{})}
+	gate := &gatedChildRepository{Dir: fixture.repo, role: repository.RecordProcessorAttemptClosure, entered: make(chan struct{}), release: make(chan struct{})}
+	service := &Service{
+		Store: fixture.store, Repo: gate, SigningIdentity: fixture.service.SigningIdentity,
+		TrustAnchor: fixture.service.TrustAnchor, PublicationDomain: testPublicationDomain,
+		RequireSignedPublication: true, PublicationFencer: fencer, Now: clock.nowFn,
+	}
+	resultErr := make(chan error, 1)
+	go func() {
+		resultErr <- service.publishProcessorAttemptClosure(context.Background(), result.WorkspaceID, result.SnapshotRef, result.PublicationCommitDigest)
+	}()
+	select {
+	case <-gate.entered:
+	case err := <-resultErr:
+		t.Fatalf("publisher exited before gated placement: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("publisher did not reach gated placement")
+	}
+	clock.set(clock.nowFn().Add(4 * time.Minute))
+	select {
+	case <-fencer.renewed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("publication lease was not renewed")
+	}
+	// The original five-minute lease is expired, but the renewal above has
+	// extended it through this placement.
+	clock.set(clock.nowFn().Add(2 * time.Minute))
+	close(gate.release)
+	if err := <-resultErr; err != nil {
+		t.Fatalf("long placement lost its renewed lease: %v", err)
+	}
+}
+
+func TestRootPublicationReleaseFailureNeedsReconciliation(t *testing.T) {
+	fixture := newSignedPublicationFixture(t, "release-failure-root.txt", []byte("release failure root"))
+	manifest, err := writeManifest(fixture.repo.Root(), Manifest{
+		Schema: SnapshotSchemaV1, SnapshotRef: "release-failure-root-snapshot",
+		Binding: capture.BindingRecord{Schema: capture.SchemaBindingV1, Profile: capture.ProfileLocalTree, CaptureMode: "ROOTED_FD", BoundAt: time.Unix(1, 0).UTC()},
+		Entries: []ManifestEntry{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := NewPublicationFencer(fixture.store, fixture.service.Now)
+	fixture.service.PublicationFencer = &releaseFailingPublicationFencer{PublicationFencer: base}
+	_, err = fixture.service.publishRecoveryClosure(context.Background(), adopted{
+		snapshotRef: manifest.SnapshotRef, publicationID: "publication:release-failure-root",
+	}, manifest, placedSet{}, "sha256:release-failure-root-plan", "sha256:capture", "sha256:policy")
+	if !errors.Is(err, ErrNeedsReconciliation) || !errors.Is(err, ErrPublicationLeaseRelease) {
+		t.Fatalf("root release failure = %v, want reconciliation classification", err)
+	}
+	commits, err := fixture.service.committedPublications(context.Background())
+	if err != nil || len(commits) != 1 {
+		t.Fatalf("root publication count = %d, err=%v; want one commit", len(commits), err)
+	}
+}
+
+func TestProcessorAndPortableReleaseFailuresNeedReconciliation(t *testing.T) {
+	fixture := newSignedPublicationFixture(t, "release-failure-children.txt", []byte("release failure children"))
+	result := fixture.ingest(t, "sha256:release-failure-children-plan")
+	base := NewPublicationFencer(fixture.store, fixture.service.Now)
+	fixture.service.PublicationFencer = &releaseFailingPublicationFencer{PublicationFencer: base}
+	addClosureTestAttempt(t, fixture, result)
+	err := fixture.service.publishProcessorAttemptClosure(context.Background(), result.WorkspaceID, result.SnapshotRef, result.PublicationCommitDigest)
+	if !errors.Is(err, ErrNeedsReconciliation) || !errors.Is(err, ErrPublicationLeaseRelease) {
+		t.Fatalf("processor release failure = %v, want reconciliation classification", err)
+	}
+	processorClosures, err := fixture.service.ListProcessorAttemptClosures(context.Background(), result.SnapshotRef)
+	if err != nil || len(processorClosures) != 1 {
+		t.Fatalf("processor closure count = %d, err=%v; want one child", len(processorClosures), err)
+	}
+
+	evidence := newPortableEvidenceFixture(t)
+	insertRaceDescription(t, evidence.fixture, evidence.result, "release failure portable successor")
+	base = NewPublicationFencer(evidence.fixture.store, evidence.fixture.service.Now)
+	evidence.fixture.service.PublicationFencer = &releaseFailingPublicationFencer{PublicationFencer: base}
+	err = evidence.fixture.service.PublishPortableFactClosure(context.Background(), evidence.result.WorkspaceID, evidence.result.SnapshotRef, evidence.result.PublicationCommitDigest)
+	if !errors.Is(err, ErrNeedsReconciliation) || !errors.Is(err, ErrPublicationLeaseRelease) {
+		t.Fatalf("portable release failure = %v, want reconciliation classification", err)
+	}
+	portableClosures, err := evidence.fixture.service.ListPortableFactClosures(context.Background(), evidence.result.SnapshotRef)
+	if err != nil || len(portableClosures) != 3 {
+		t.Fatalf("portable closure count = %d, err=%v; want one successor", len(portableClosures), err)
+	}
+}
 
 func TestPublicationFenceSerializesConcurrentProcesses(t *testing.T) {
 	ctx := context.Background()
@@ -123,7 +255,7 @@ func TestPublicationFenceExpiryAllowsMonotonicTakeover(t *testing.T) {
 	}
 
 	// Advance past the 5-minute lease so process B can take over.
-	clock.now = clock.now.Add(DefaultPublicationFenceTTL + time.Second)
+	clock.set(clock.nowFn().Add(DefaultPublicationFenceTTL + time.Second))
 	leaseB, err := secondService.acquirePublicationFence(ctx)
 	if err != nil {
 		t.Fatalf("takeover after expiry: %v", err)
@@ -145,6 +277,96 @@ func TestPublicationFenceExpiryAllowsMonotonicTakeover(t *testing.T) {
 	}
 	if err := leaseB.release(); err != nil {
 		t.Fatalf("current lease release: %v", err)
+	}
+}
+
+func TestPublicationFenceReleaseSurvivesParentCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	path := filepath.Join(t.TempDir(), "catalog.sqlite")
+	store, err := sqlite.Open(ctx, path, sqlite.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	service := &Service{
+		Store: store, PublicationDomain: "workspace:cancel-release",
+		PublicationFencer: NewPublicationFencer(store, nil),
+	}
+	lease, err := service.acquirePublicationFence(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if err := lease.release(); err != nil {
+		t.Fatalf("release after parent cancellation: %v", err)
+	}
+	if err := service.fencer().Validate(context.Background(), service.publicationFenceDomain(), service.publicationOwner(), lease.leaseToken, lease.coordinationToken, service.now()); !errors.Is(err, sqlite.ErrConflict) {
+		t.Fatalf("released lease validation = %v, want ErrConflict", err)
+	}
+}
+
+func TestSignedPublicationFenceDoesNotReuseAbandonedLeaseCounter(t *testing.T) {
+	ctx := context.Background()
+	clock := &controlledClock{now: time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)}
+	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "catalog.sqlite"), sqlite.Options{Now: clock.nowFn})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	repo, err := repository.OpenDir(filepath.Join(t.TempDir(), "repository"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := testIdentity(t)
+	anchor, err := NewTrustAnchor(identity, testPublicationDomain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fencer := NewPublicationFencer(store, clock.nowFn)
+	holder := &Service{Store: store, Repo: repo, PublicationDomain: testPublicationDomain, PublicationFencer: fencer, Now: clock.nowFn}
+	first, err := holder.acquirePublicationFence(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.release(); err != nil {
+		t.Fatal(err)
+	}
+	clock.set(clock.nowFn().Add(DefaultPublicationFenceTTL + time.Second))
+	second, err := holder.acquirePublicationFence(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.coordinationToken != 2 {
+		t.Fatalf("abandoned lease counter = %d, want 2", second.coordinationToken)
+	}
+	if err := second.release(); err != nil {
+		t.Fatal(err)
+	}
+
+	manifest, err := writeManifest(repo.Root(), Manifest{
+		Schema: SnapshotSchemaV1, SnapshotRef: "abandoned-lease-snapshot",
+		Binding: capture.BindingRecord{Schema: capture.SchemaBindingV1, Profile: capture.ProfileLocalTree, CaptureMode: "ROOTED_FD", BoundAt: time.Unix(1, 0).UTC()},
+		Entries: []ManifestEntry{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &Service{Store: store, Repo: repo, SigningIdentity: &identity, TrustAnchor: &anchor,
+		PublicationDomain: testPublicationDomain, RequireSignedPublication: true,
+		PublicationFencer: fencer, Now: clock.nowFn}
+	publication, err := service.publishRecoveryClosure(ctx, adopted{
+		snapshotRef: manifest.SnapshotRef, publicationID: "publication:abandoned-lease",
+	}, manifest, placedSet{}, "sha256:abandoned-lease-plan", "sha256:abandoned-lease-capture", "sha256:abandoned-lease-policy")
+	if err != nil {
+		t.Fatalf("publish after abandoned lease: %v", err)
+	}
+	commits, err := listCommitMarkers(ctx, repo, anchor, testPublicationDomain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(commits) != 1 || commits[0].CommitDigest != publication.CommitDigest || commits[0].Commit.FenceToken != 3 {
+		t.Fatalf("publication fence after abandoned lease = %+v, want token 3", commits)
 	}
 }
 

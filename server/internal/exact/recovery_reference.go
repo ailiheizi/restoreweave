@@ -153,6 +153,9 @@ func (s *Service) BuildRecoveryReference(ctx context.Context, snapshotRef string
 	if len(reference.PortableFactClosures) > 0 {
 		reference.FactHealth = RecoveryFactHealthComplete
 	}
+	if err := validateReferenceFactChain(reference, *s.TrustAnchor); err != nil {
+		return RecoveryReference{}, err
+	}
 	if err := reference.validateShape(); err != nil {
 		return RecoveryReference{}, err
 	}
@@ -229,7 +232,7 @@ func LoadRecoveryReference(path string) (RecoveryReference, error) {
 	if strings.TrimSpace(path) == "" {
 		return reference, errors.New("recovery reference path is required")
 	}
-	file, err := os.Open(path)
+	file, err := openRecoveryInput(path)
 	if err != nil {
 		return reference, err
 	}
@@ -248,6 +251,9 @@ func LoadRecoveryReference(path string) (RecoveryReference, error) {
 // independently supplied anchor. It does not read a repository; callers that
 // need payload and attachment readback should use ValidateAgainstRepository.
 func (reference RecoveryReference) Validate(anchor TrustAnchor) error {
+	if err := anchor.validate(); err != nil {
+		return err
+	}
 	if err := reference.validateShape(); err != nil {
 		return err
 	}
@@ -293,6 +299,20 @@ func (reference RecoveryReference) ValidateAgainstRepository(ctx context.Context
 	if !sameStrings(reference.RequiredReaderDependencies, portableFactReaderDependencies(repo)) {
 		return errors.New("recovery reference reader dependencies are unavailable")
 	}
+	commits, err := listCommitMarkers(ctx, driver, anchor, reference.PublicationDomain)
+	if err != nil {
+		return fmt.Errorf("authenticated publication lineage is unavailable: %w", err)
+	}
+	committed := false
+	for _, candidate := range commits {
+		if candidate.CommitDigest == reference.PublicationCommitDigest {
+			committed = true
+			break
+		}
+	}
+	if !committed {
+		return errors.New("referenced publication commit is not in the authenticated lineage")
+	}
 	commitPayload, err := readRecoveryRecord(ctx, driver, repository.RecordPublicationCommit, reference.PublicationCommitDigest)
 	if err != nil {
 		return err
@@ -318,6 +338,11 @@ func (reference RecoveryReference) ValidateAgainstRepository(ctx context.Context
 	if err := validatePreparedEnvelope(driver, anchor, reference.PublicationCommit, reference.PreparedClosure, int64(len(preparedPayload))); err != nil {
 		return err
 	}
+	for _, object := range reference.PreparedClosure.PayloadReceipt.Objects {
+		if err := verifyExactObjectReadback(ctx, repo, object.ContentID, object.LogicalBytes); err != nil {
+			return fmt.Errorf("payload object %s: %w", object.ContentID, err)
+		}
+	}
 	for _, fact := range reference.PortableFactClosures {
 		payload, err := readRecoveryRecord(ctx, driver, repository.RecordPortableFactClosure, fact.RecordDigest)
 		if err != nil {
@@ -334,24 +359,17 @@ func (reference RecoveryReference) ValidateAgainstRepository(ctx context.Context
 		if err != nil {
 			return err
 		}
+		for _, attachment := range bundle.Attachments {
+			if attachment.RepositoryID != reference.Repository.RepositoryID {
+				return fmt.Errorf("portable fact attachment %s repository binding mismatch", attachment.AttachmentID)
+			}
+		}
 		if err := validateReferenceProcessorAttemptChild(ctx, driver, anchor, fact.Envelope.Closure, bundle); err != nil {
 			return fmt.Errorf("portable processor-attempt child: %w", err)
 		}
 		for _, attachment := range bundle.Attachments {
-			if err := repo.Verify(ctx, attachment.ContentID); err != nil {
+			if err := verifyExactObjectReadback(ctx, repo, attachment.ContentID, attachment.LogicalLength); err != nil {
 				return fmt.Errorf("portable fact attachment %s: %w", attachment.AttachmentID, err)
-			}
-			body, err := repo.Open(ctx, attachment.ContentID)
-			if err != nil {
-				return err
-			}
-			length, readErr := io.Copy(io.Discard, body)
-			closeErr := body.Close()
-			if readErr != nil {
-				return readErr
-			}
-			if closeErr != nil || length != attachment.LogicalLength {
-				return fmt.Errorf("portable fact attachment %s length mismatch", attachment.AttachmentID)
 			}
 		}
 	}
@@ -476,6 +494,9 @@ func validateRecoveryExtensions(critical []string, optional json.RawMessage) err
 func validateReferencePublicationBinding(reference RecoveryReference) error {
 	commit := reference.PublicationCommit
 	prepared := reference.PreparedClosure.Prepared
+	if commit.PreparedObjectDigest != reference.PreparedClosureDigest {
+		return errors.New("publication commit prepared object differs from recovery reference")
+	}
 	if prepared.PublicationID != commit.PublicationID || prepared.PublicationDomain != commit.PublicationDomain || prepared.Generation != commit.Generation || prepared.SnapshotRef != commit.SnapshotRef || prepared.RRFRootDigest != commit.RRFRootDigest || prepared.ManifestDigest != commit.ManifestDigest || prepared.PayloadReceiptDigest != commit.PayloadReceiptDigest || prepared.PayloadReceiptLength != commit.PayloadReceiptLength || prepared.PayloadReceiptObjectCount != commit.PayloadReceiptObjectCount || prepared.PlanDigest != commit.PlanDigest || prepared.CaptureDigest != commit.CaptureDigest || prepared.PolicyDigest != commit.PolicyDigest || prepared.VerificationDigest != commit.VerificationDigest || prepared.TargetIdentity != commit.TargetIdentity || prepared.FenceToken != commit.FenceToken || prepared.ParentCommitDigest != commit.ParentCommitDigest {
 		return errors.New("prepared closure and publication commit bindings differ")
 	}
@@ -529,7 +550,20 @@ func validateReferenceFactChain(reference RecoveryReference, anchor TrustAnchor)
 			return err
 		}
 		closure := fact.Envelope.Closure
-		if closure.ParentCommitDigest != reference.PublicationCommitDigest || closure.PublicationDomain != reference.PublicationDomain || closure.SnapshotRef != reference.SnapshotRef || !sameStrings(closure.RequiredReaderDependencies, reference.RequiredReaderDependencies) {
+		if fact.Envelope.Schema != PortableFactClosureEnvelopeSchemaV1 ||
+			closure.ParentCommitDigest != reference.PublicationCommitDigest ||
+			closure.PublicationID != reference.PublicationCommit.PublicationID ||
+			closure.PublicationDomain != reference.PublicationDomain ||
+			closure.SnapshotRef != reference.SnapshotRef ||
+			closure.ManifestDigest != reference.PreparedClosure.Manifest.ManifestDigest ||
+			closure.ParentGeneration != reference.PublicationCommit.Generation ||
+			closure.TargetIdentity != reference.Repository.RepositoryID ||
+			closure.TargetIdentity != reference.PublicationCommit.TargetIdentity ||
+			closure.FenceToken != reference.PublicationCommit.FenceToken ||
+			closure.BundleSchema != PortableFactBundleSchemaV1 ||
+			closure.CanonicalizationProfile != "encoding/json-compact-v1" ||
+			closure.SignedAt.Before(reference.PublicationCommit.SignedAt) ||
+			!sameStrings(closure.RequiredReaderDependencies, reference.RequiredReaderDependencies) {
 			return errors.New("portable fact reference parent or dependency binding mismatch")
 		}
 		if index == 0 {
@@ -538,6 +572,8 @@ func validateReferenceFactChain(reference RecoveryReference, anchor TrustAnchor)
 			}
 		} else if closure.ClosureSequence != uint64(index+1) || closure.PredecessorClosureDigest != previous {
 			return errors.New("portable fact reference successor lineage is invalid")
+		} else if closure.SignedAt.Before(reference.PortableFactClosures[index-1].Envelope.Closure.SignedAt) {
+			return errors.New("portable fact reference signed time is not monotonic")
 		}
 		bundle, err := validatePortableFactBundle(fact.Envelope.Bundle, closure.WorkspaceID, closure.SnapshotRef)
 		if err != nil {
@@ -546,8 +582,13 @@ func validateReferenceFactChain(reference RecoveryReference, anchor TrustAnchor)
 		if DigestBytes(fact.Envelope.Bundle) != closure.BundleDigest || int64(len(fact.Envelope.Bundle)) != closure.BundleLength || int64(len(bundle.Records)) != closure.RecordCount || int64(len(bundle.Attachments)) != closure.AttachmentCount {
 			return errors.New("portable fact reference bundle binding mismatch")
 		}
-		if err := validatePortableFactRecords(bundle); err != nil {
+		if err := validatePortableFactRecordsAgainstManifest(bundle, reference.PreparedClosure.Manifest); err != nil {
 			return err
+		}
+		for _, attachment := range bundle.Attachments {
+			if attachment.RepositoryID != reference.Repository.RepositoryID {
+				return fmt.Errorf("portable fact attachment %s repository binding mismatch", attachment.AttachmentID)
+			}
 		}
 		previous = closureDigest
 	}
@@ -661,6 +702,9 @@ func readRecoveryRecord(ctx context.Context, driver repository.RecordDriver, rol
 	}
 	if int64(len(payload)) > portableRecordReadLimit {
 		return nil, errors.New("portable recovery record exceeds read limit")
+	}
+	if DigestBytes(payload) != digest {
+		return nil, fmt.Errorf("portable recovery record %s digest mismatch", digest)
 	}
 	receipt := repository.RecordReceipt{RepositoryID: driver.RepositoryIdentity(), Role: role, Digest: digest, Bytes: int64(len(payload))}
 	if err := driver.VerifyRecord(ctx, receipt); err != nil {

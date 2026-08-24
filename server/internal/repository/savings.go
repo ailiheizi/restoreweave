@@ -12,6 +12,8 @@ package repository
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -38,6 +40,51 @@ const (
 	// logical bytes it restores.
 	SavingsMechanismCompression SavingsMechanism = "compression"
 )
+
+// SavingsCategoryStatus states whether a physical-overhead category has a
+// measured value. UNMEASURED is intentionally distinct from zero: the
+// in-tree repository profiles do not own external indexes/models, and their
+// transient temp area is not a stable accounting surface.
+type SavingsCategoryStatus string
+
+const (
+	SavingsCategoryMeasured   SavingsCategoryStatus = "MEASURED"
+	SavingsCategoryUnmeasured SavingsCategoryStatus = "UNMEASURED"
+)
+
+// SavingsOverheadCategory is one independently reported physical-overhead
+// category. Bytes is meaningful only when Status is MEASURED.
+type SavingsOverheadCategory struct {
+	Bytes  int64                 `json:"bytes"`
+	Status SavingsCategoryStatus `json:"status"`
+}
+
+// SavingsOverhead separates repository-owned metadata from categories that
+// are outside the in-tree repository measurement boundary. It prevents an
+// unavailable index/model/temp measurement from being presented as zero.
+type SavingsOverhead struct {
+	RepositoryMetadata SavingsOverheadCategory `json:"repository_metadata"`
+	RecoveryRecords    SavingsOverheadCategory `json:"recovery_records"`
+	Index              SavingsOverheadCategory `json:"index"`
+	Model              SavingsOverheadCategory `json:"model"`
+	Temporary          SavingsOverheadCategory `json:"temporary"`
+}
+
+func (overhead SavingsOverhead) measuredBytes() int64 {
+	var total int64
+	for _, category := range []SavingsOverheadCategory{
+		overhead.RepositoryMetadata,
+		overhead.RecoveryRecords,
+		overhead.Index,
+		overhead.Model,
+		overhead.Temporary,
+	} {
+		if category.Status == SavingsCategoryMeasured {
+			total += category.Bytes
+		}
+	}
+	return total
+}
 
 // SavingsReport is an honest, mechanism-separated accounting of what a
 // repository actually holds. The fields are deliberately named to mirror the
@@ -68,12 +115,20 @@ type SavingsReport struct {
 	// PhysicalStoredBytes is the sum of the physical object lengths on disk,
 	// measured from the repository layout after every object was re-verified.
 	PhysicalStoredBytes int64
+	// RepositoryGrowthBytes is the measured repository footprint attributable
+	// to this repository root: payload objects plus measured repository-owned
+	// overhead. It is not a filesystem block-allocation or time-series delta.
+	RepositoryGrowthBytes int64
 	// OverheadBytes is the repository metadata and catalog bytes measurable on
 	// a local filesystem: the profile marker, the repository identity, and the
 	// portable recovery-record tree. The in-tree profiles keep no separately
 	// stored index or model on the repository path, so index/model overhead is
 	// not fabricated; it is simply not measurable for these profiles.
 	OverheadBytes int64
+	// Overhead provides the typed category/status view behind OverheadBytes.
+	// Categories marked UNMEASURED are excluded from both OverheadBytes and
+	// RepositoryGrowthBytes; they must not be interpreted as zero bytes.
+	Overhead SavingsOverhead
 	// NetPhysicalSavingsBytes is the difference between LogicalBytes and the
 	// full physical footprint (PhysicalStoredBytes plus OverheadBytes). It is a
 	// derived number, never an input, and it is only valid when the repository
@@ -132,10 +187,18 @@ func MeasureSavings(ctx context.Context, driver Driver, placements []Receipt) (S
 	// accounting. A stored object could have been placed once or a hundred
 	// times; the repository layout alone cannot tell.
 	report := SavingsReport{Mechanisms: []SavingsMechanism{}}
+	expectedLengths := make(map[string]int64, len(placements))
 	for _, receipt := range placements {
-		if receipt.Bytes <= 0 {
-			return SavingsReport{}, fmt.Errorf("invalid placement receipt %q with non-positive logical bytes %d", receipt.ContentID, receipt.Bytes)
+		if _, err := parseContentID(receipt.ContentID); err != nil {
+			return SavingsReport{}, fmt.Errorf("invalid placement receipt: %w", err)
 		}
+		if receipt.Bytes < 0 {
+			return SavingsReport{}, fmt.Errorf("invalid placement receipt %q with negative logical bytes %d", receipt.ContentID, receipt.Bytes)
+		}
+		if previous, ok := expectedLengths[receipt.ContentID]; ok && previous != receipt.Bytes {
+			return SavingsReport{}, fmt.Errorf("placement receipt %q has conflicting logical lengths %d and %d", receipt.ContentID, previous, receipt.Bytes)
+		}
+		expectedLengths[receipt.ContentID] = receipt.Bytes
 		report.LogicalBytes += receipt.Bytes
 		if receipt.Existed {
 			report.DuplicateBytes += receipt.Bytes
@@ -148,6 +211,7 @@ func MeasureSavings(ctx context.Context, driver Driver, placements []Receipt) (S
 	// its lengths enter the report, so corruption or relocation fails the
 	// measurement instead of contributing a guessed number.
 	storedObjects := 0
+	observed := make(map[string]struct{}, len(expectedLengths))
 	if err := filepath.WalkDir(filepath.Join(dir.root, blobDirName, AlgorithmSHA256), func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -159,13 +223,23 @@ func MeasureSavings(ctx context.Context, driver Driver, placements []Receipt) (S
 			return nil
 		}
 		name := entry.Name()
-		if !entry.Type().IsRegular() || len(name) != 64 {
-			return nil
+		if !entry.Type().IsRegular() {
+			return fmt.Errorf("savings measurement found non-regular repository object %q", path)
+		}
+		if len(name) != 64 {
+			return fmt.Errorf("savings measurement found repository object with invalid name %q", name)
 		}
 		if _, err := parseContentID(AlgorithmSHA256 + ":" + name); err != nil {
 			return err
 		}
+		if prefix := filepath.Base(filepath.Dir(path)); prefix != name[:hexPrefixLen] {
+			return fmt.Errorf("savings measurement found repository object %q in prefix directory %q", name, prefix)
+		}
 		contentID := AlgorithmSHA256 + ":" + name
+		if _, ok := expectedLengths[contentID]; !ok {
+			return fmt.Errorf("savings measurement found untracked repository object %s", contentID)
+		}
+		observed[contentID] = struct{}{}
 		physical, err := fileSize(path)
 		if err != nil {
 			return err
@@ -173,9 +247,12 @@ func MeasureSavings(ctx context.Context, driver Driver, placements []Receipt) (S
 		if err := driver.Verify(ctx, contentID); err != nil {
 			return fmt.Errorf("savings measurement verify %s: %w", name, err)
 		}
-		logical, err := logicalLength(ctx, driver, contentID)
+		logical, err := readbackLogicalObject(ctx, driver, contentID)
 		if err != nil {
 			return err
+		}
+		if expected, ok := expectedLengths[contentID]; ok && expected != logical {
+			return fmt.Errorf("savings measurement logical length mismatch for %s: read back %d want %d", contentID, logical, expected)
 		}
 		storedObjects++
 		report.PhysicalStoredBytes += physical
@@ -186,6 +263,11 @@ func MeasureSavings(ctx context.Context, driver Driver, placements []Receipt) (S
 	}); err != nil {
 		return SavingsReport{}, fmt.Errorf("measure repository objects: %w", err)
 	}
+	for contentID := range expectedLengths {
+		if _, ok := observed[contentID]; !ok {
+			return SavingsReport{}, fmt.Errorf("savings measurement receipt %s has no repository object", contentID)
+		}
+	}
 
 	if storedObjects > 0 && len(placements) == 0 {
 		return SavingsReport{}, errors.New("cannot measure savings honestly without the placement receipts observed during ingest")
@@ -194,7 +276,12 @@ func MeasureSavings(ctx context.Context, driver Driver, placements []Receipt) (S
 	// Overhead is measured from the repository layout. Index/model overhead is
 	// not measurable for the in-tree profiles and is deliberately not fabricated
 	// as zero.
-	report.OverheadBytes = measureOverhead(dir)
+	report.Overhead, err = measureOverhead(dir)
+	if err != nil {
+		return SavingsReport{}, fmt.Errorf("measure repository overhead: %w", err)
+	}
+	report.OverheadBytes = report.Overhead.measuredBytes()
+	report.RepositoryGrowthBytes = report.PhysicalStoredBytes + report.OverheadBytes
 	report.NetPhysicalSavingsBytes = report.LogicalBytes - report.PhysicalStoredBytes - report.OverheadBytes
 
 	if report.DuplicateFiles > 0 {
@@ -214,21 +301,42 @@ func storageRoot(driver Driver) (*Dir, bool) {
 		return d, true
 	case *ZstdDir:
 		return d.Dir, true
+	case savingsRootProvider:
+		return d.savingsRoot(), true
 	default:
 		return nil, false
 	}
 }
 
-// logicalLength opens the object through the driver and returns the logical
-// decoded length. For the raw identity profile this equals the physical length;
-// for the zstd profile it is the decompressed length.
-func logicalLength(ctx context.Context, driver Driver, contentID string) (int64, error) {
+// savingsRootProvider is an internal seam for directory-backed qualification
+// wrappers. It keeps savings measurement limited to a host-readable layout
+// while allowing tests to model a dishonest backend implementation.
+type savingsRootProvider interface {
+	savingsRoot() *Dir
+}
+
+// readbackLogicalObject opens the object through the driver and independently
+// hashes the logical stream. Backend Verify is an additional signal, never the
+// authority for a savings claim.
+func readbackLogicalObject(ctx context.Context, driver Driver, contentID string) (int64, error) {
 	body, err := driver.Open(ctx, contentID)
 	if err != nil {
 		return 0, err
 	}
-	defer body.Close()
-	return io.Copy(io.Discard, body)
+	hash := sha256.New()
+	logical, copyErr := io.Copy(hash, body)
+	closeErr := body.Close()
+	if copyErr != nil {
+		return 0, copyErr
+	}
+	if closeErr != nil {
+		return 0, closeErr
+	}
+	got := AlgorithmSHA256 + ":" + hex.EncodeToString(hash.Sum(nil))
+	if got != contentID {
+		return 0, fmt.Errorf("%w: readback got %s want %s", ErrDigestMismatch, got, contentID)
+	}
+	return logical, nil
 }
 
 // measureOverhead returns the bytes the repository layout itself consumes on
@@ -237,42 +345,76 @@ func logicalLength(ctx context.Context, driver Driver, contentID string) (int64,
 // overhead figure; the in-tree profiles keep no separate index on the
 // repository path. Blob and temporary placement state are payload or transient
 // and are not counted here.
-func measureOverhead(dir *Dir) int64 {
-	var total int64
-	_ = filepath.WalkDir(dir.root, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil || entry.IsDir() {
+func measureOverhead(dir *Dir) (SavingsOverhead, error) {
+	overhead := SavingsOverhead{
+		RepositoryMetadata: SavingsOverheadCategory{Status: SavingsCategoryMeasured},
+		RecoveryRecords:    SavingsOverheadCategory{Status: SavingsCategoryMeasured},
+		Index:              SavingsOverheadCategory{Status: SavingsCategoryUnmeasured},
+		Model:              SavingsOverheadCategory{Status: SavingsCategoryUnmeasured},
+		Temporary:          SavingsOverheadCategory{Status: SavingsCategoryUnmeasured},
+	}
+	err := filepath.WalkDir(dir.root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
 			return nil
 		}
 		relative, err := filepath.Rel(dir.root, path)
 		if err != nil {
-			return nil
+			return err
 		}
 		parts := strings.Split(relative, string(filepath.Separator))
 		switch {
 		case len(parts) == 1 && entry.Name() == repositoryProfileFile:
-			total += entrySize(entry, path)
+			size, err := entrySize(entry, path)
+			if err != nil {
+				return err
+			}
+			overhead.RepositoryMetadata.Bytes += size
 		case len(parts) == 1 && entry.Name() == repositoryIdentityFile:
-			total += entrySize(entry, path)
+			size, err := entrySize(entry, path)
+			if err != nil {
+				return err
+			}
+			overhead.RepositoryMetadata.Bytes += size
 		case len(parts) >= 2 && parts[0] == recoveryDirName:
-			total += entrySize(entry, path)
+			size, err := entrySize(entry, path)
+			if err != nil {
+				return err
+			}
+			overhead.RecoveryRecords.Bytes += size
+		case len(parts) >= 3 && parts[0] == blobDirName && parts[1] == AlgorithmSHA256:
+			// Payload bytes are measured and verified by the object walk.
+			// Any other blob namespace entry is rejected there.
+			return nil
 		default:
-			// Blob and tmp files are counted by the object walk or are
-			// transient placement state.
+			return fmt.Errorf("unaccounted repository file %q", path)
 		}
 		return nil
 	})
-	return total
+	if err != nil {
+		return SavingsOverhead{}, err
+	}
+	return overhead, nil
 }
 
 // entrySize returns the size of a directory entry via its DirEntry info,
 // falling back to a stat when the entry info is incomplete.
-func entrySize(entry fs.DirEntry, path string) int64 {
-	if info, err := entry.Info(); err == nil {
-		return info.Size()
+func entrySize(entry fs.DirEntry, path string) (int64, error) {
+	info, err := entry.Info()
+	if err == nil {
+		if !info.Mode().IsRegular() {
+			return 0, fmt.Errorf("repository overhead entry is not a regular file: %s", path)
+		}
+		return info.Size(), nil
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return 0
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		return 0, fmt.Errorf("stat repository overhead entry %q: %w (directory entry info: %v)", path, statErr, err)
 	}
-	return info.Size()
+	if !info.Mode().IsRegular() {
+		return 0, fmt.Errorf("repository overhead entry is not a regular file: %s", path)
+	}
+	return info.Size(), nil
 }

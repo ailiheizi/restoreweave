@@ -68,21 +68,69 @@ func (d *Dispatcher) handleRecoveryTokenExport(ctx context.Context, env command.
 	if anchor == nil {
 		return failed(env, started, newReason(ReasonCodeUnavailable, "recovery trust anchor is unavailable"))
 	}
-	token, err := d.exact.BuildRecoveryToken(ctx, input.SnapshotRef, input.SubjectPath, *anchor)
+	set, err := d.exact.BuildRecoveryTokenSet(ctx, input.SnapshotRef, input.SubjectPath, *anchor)
 	if err != nil {
 		return exactOperationErrorResult(env, started, err)
 	}
-	return succeeded(env, started, command.RecoveryTokenData{
-		TokenSchema:          token.TokenSchema,
-		SnapshotRef:          token.SnapshotRef,
-		SubjectRef:           token.SubjectRef,
-		RecoveryReferenceID:  token.RecoveryReferenceID,
-		ExpectedContentID:    token.ExpectedContentID,
-		ExpectedLength:       token.ExpectedLength,
-		RecipeDigest:         token.RecipeDigest,
-		PublicationCommitRef: token.PublicationCommitRef,
-		TrustAnchorRef:       token.TrustAnchorRef,
-		Expiry:               token.Expiry,
-		TokenDigest:          token.TokenDigest,
-	})
+	data := command.RecoveryTokenData{
+		TokenSetSchema:    set.Schema,
+		SnapshotRef:       set.SnapshotRef,
+		PublicationDomain: set.PublicationDomain,
+		SubjectPath:       set.SubjectPath,
+		SubjectRef:        set.SubjectRef,
+		ProtectionOutcome: set.ProtectionOutcome,
+		TokenSetDigest:    set.SetDigest,
+		Tokens:            make([]command.RecoveryTokenItemData, 0, len(set.Tokens)),
+	}
+	for _, token := range set.Tokens {
+		item := command.RecoveryTokenItemData{
+			TokenSchema:          token.TokenSchema,
+			SnapshotRef:          token.SnapshotRef,
+			PublicationDomain:    token.PublicationDomain,
+			SubjectRef:           token.SubjectRef,
+			RecoveryReferenceID:  token.RecoveryReferenceID,
+			ReferenceKind:        token.ReferenceKind,
+			ProtectionClaim:      token.ProtectionClaim,
+			ExpectedContentID:    token.ExpectedContentID,
+			ExpectedLength:       token.ExpectedLength,
+			RecipeDigest:         token.RecipeDigest,
+			LocatorSetDigest:     token.LocatorSetDigest,
+			PublicationCommitRef: token.PublicationCommitRef,
+			TrustAnchorRef:       token.TrustAnchorRef,
+			Expiry:               token.Expiry,
+			TokenDigest:          token.TokenDigest,
+		}
+		data.Tokens = append(data.Tokens, item)
+	}
+	if set.Unprotected != nil {
+		data.Unprotected = &command.RecoveryUnprotectedData{
+			Schema:               set.Unprotected.Schema,
+			SnapshotRef:          set.Unprotected.SnapshotRef,
+			SubjectRef:           set.Unprotected.SubjectRef,
+			SubjectPath:          set.Unprotected.SubjectPath,
+			ProtectionMode:       set.Unprotected.ProtectionMode,
+			ProtectionOutcome:    set.Unprotected.ProtectionOutcome,
+			ReasonCode:           set.Unprotected.ReasonCode,
+			ExpectedLogicalBytes: set.Unprotected.ExpectedLogicalBytes,
+			RecordDigest:         set.Unprotected.RecordDigest,
+		}
+	}
+	// Keep the first-token projection for existing clients that predate
+	// subject-scope token sets.
+	if len(set.Tokens) > 0 {
+		token := set.Tokens[0]
+		data.TokenSchema = token.TokenSchema
+		data.RecoveryReferenceID = token.RecoveryReferenceID
+		data.ReferenceKind = token.ReferenceKind
+		data.ProtectionClaim = token.ProtectionClaim
+		data.ExpectedContentID = token.ExpectedContentID
+		data.ExpectedLength = token.ExpectedLength
+		data.RecipeDigest = token.RecipeDigest
+		data.LocatorSetDigest = token.LocatorSetDigest
+		data.PublicationCommitRef = token.PublicationCommitRef
+		data.TrustAnchorRef = token.TrustAnchorRef
+		data.Expiry = token.Expiry
+		data.TokenDigest = token.TokenDigest
+	}
+	return succeeded(env, started, data)
 }

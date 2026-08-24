@@ -178,6 +178,7 @@ func (d *Dispatcher) handleDescriptionCreate(ctx context.Context, env command.En
 		Body:            input.Body,
 		SourceRef:       strings.TrimSpace(input.SourceRef),
 		ProducerProfile: strings.TrimSpace(input.ProducerProfile),
+		ConfigDigest:    d.effectiveConfigDigest(),
 		Confidence:      input.Confidence,
 		Coverage:        input.Coverage,
 		Visibility:      input.Visibility,
@@ -192,6 +193,7 @@ func (d *Dispatcher) handleDescriptionCreate(ctx context.Context, env command.En
 	if document.ProducerProfile == "" {
 		document.ProducerProfile = "command"
 	}
+	document.ProducerProfileDigest = sqlite.DescriptionProducerProfileDigest(document.ProducerProfile)
 	chunks := splitDescriptionBody(document.Body)
 	segments := make([]sqlite.SemanticSegment, 0, len(chunks))
 	for ordinal, chunk := range chunks {
@@ -204,15 +206,17 @@ func (d *Dispatcher) handleDescriptionCreate(ctx context.Context, env command.En
 			return catalogErrorResult(env, started, marshalErr)
 		}
 		segments = append(segments, sqlite.SemanticSegment{
-			ID:          segmentID,
-			WorkspaceID: document.WorkspaceID,
-			DocumentID:  document.ID,
-			SubjectRef:  document.SubjectRef,
-			Ordinal:     int64(ordinal),
-			Text:        chunk.text,
-			Language:    document.Language,
-			Section:     "body",
-			SourceSpan:  span,
+			ID:                        segmentID,
+			WorkspaceID:               document.WorkspaceID,
+			DocumentID:                document.ID,
+			SubjectRef:                document.SubjectRef,
+			DocumentRevision:          document.Revision,
+			Ordinal:                   int64(ordinal),
+			Text:                      chunk.text,
+			Language:                  document.Language,
+			Section:                   "body",
+			SourceSpan:                span,
+			SegmentationProfileDigest: sqlite.DescriptionSegmentationProfileDigestV1,
 		})
 	}
 	if err := d.store.Update(ctx, func(tx *sqlite.Tx) error {
@@ -234,23 +238,25 @@ func (d *Dispatcher) handleDescriptionCreate(ctx context.Context, env command.En
 
 func projectDescriptionSummary(document sqlite.DescriptionDocument) command.DescriptionSummaryData {
 	return command.DescriptionSummaryData{
-		ID:              document.ID,
-		WorkspaceID:     document.WorkspaceID,
-		SubjectRef:      document.SubjectRef,
-		Kind:            string(document.Kind),
-		Title:           document.Title,
-		Language:        document.Language,
-		BodyDigest:      document.BodyDigest,
-		SourceRef:       document.SourceRef,
-		ProducerProfile: document.ProducerProfile,
-		Confidence:      document.Confidence,
-		Coverage:        document.Coverage,
-		Visibility:      document.Visibility,
-		Accepted:        document.Accepted,
-		Revision:        document.Revision,
-		PredecessorID:   document.PredecessorID,
-		CreatedAt:       document.CreatedAt.UTC().Format(time.RFC3339),
-		UpdatedAt:       document.UpdatedAt.UTC().Format(time.RFC3339),
+		ID:                    document.ID,
+		WorkspaceID:           document.WorkspaceID,
+		SubjectRef:            document.SubjectRef,
+		Kind:                  string(document.Kind),
+		Title:                 document.Title,
+		Language:              document.Language,
+		BodyDigest:            document.BodyDigest,
+		SourceRef:             document.SourceRef,
+		ProducerProfile:       document.ProducerProfile,
+		ConfigDigest:          document.ConfigDigest,
+		ProducerProfileDigest: document.ProducerProfileDigest,
+		Confidence:            document.Confidence,
+		Coverage:              document.Coverage,
+		Visibility:            document.Visibility,
+		Accepted:              document.Accepted,
+		Revision:              document.Revision,
+		PredecessorID:         document.PredecessorID,
+		CreatedAt:             document.CreatedAt.UTC().Format(time.RFC3339),
+		UpdatedAt:             document.UpdatedAt.UTC().Format(time.RFC3339),
 	}
 }
 
@@ -258,41 +264,45 @@ func projectDescription(document sqlite.DescriptionDocument, segments []sqlite.S
 	projectedSegments := make([]command.SemanticSegmentData, 0, len(segments))
 	for _, segment := range segments {
 		projectedSegments = append(projectedSegments, command.SemanticSegmentData{
-			ID:          segment.ID,
-			WorkspaceID: segment.WorkspaceID,
-			DocumentID:  segment.DocumentID,
-			SubjectRef:  segment.SubjectRef,
-			Ordinal:     segment.Ordinal,
-			Text:        segment.Text,
-			TextDigest:  segment.TextDigest,
-			Language:    segment.Language,
-			Section:     segment.Section,
-			SourceSpan:  segment.SourceSpan,
-			Metadata:    segment.Metadata,
-			CreatedAt:   segment.CreatedAt.UTC().Format(time.RFC3339),
+			ID:                        segment.ID,
+			WorkspaceID:               segment.WorkspaceID,
+			DocumentID:                segment.DocumentID,
+			SubjectRef:                segment.SubjectRef,
+			DocumentRevision:          segment.DocumentRevision,
+			Ordinal:                   segment.Ordinal,
+			Text:                      segment.Text,
+			TextDigest:                segment.TextDigest,
+			Language:                  segment.Language,
+			Section:                   segment.Section,
+			SourceSpan:                segment.SourceSpan,
+			Metadata:                  segment.Metadata,
+			SegmentationProfileDigest: segment.SegmentationProfileDigest,
+			CreatedAt:                 segment.CreatedAt.UTC().Format(time.RFC3339),
 		})
 	}
 	return command.DescriptionDocumentData{
-		ID:              document.ID,
-		WorkspaceID:     document.WorkspaceID,
-		SubjectRef:      document.SubjectRef,
-		Kind:            string(document.Kind),
-		Title:           document.Title,
-		Language:        document.Language,
-		Body:            document.Body,
-		BodyDigest:      document.BodyDigest,
-		SourceRef:       document.SourceRef,
-		ProducerProfile: document.ProducerProfile,
-		Confidence:      document.Confidence,
-		Coverage:        document.Coverage,
-		Visibility:      document.Visibility,
-		Accepted:        document.Accepted,
-		Revision:        document.Revision,
-		PredecessorID:   document.PredecessorID,
-		Metadata:        document.Metadata,
-		CreatedAt:       document.CreatedAt.UTC().Format(time.RFC3339),
-		UpdatedAt:       document.UpdatedAt.UTC().Format(time.RFC3339),
-		Segments:        projectedSegments,
+		ID:                    document.ID,
+		WorkspaceID:           document.WorkspaceID,
+		SubjectRef:            document.SubjectRef,
+		Kind:                  string(document.Kind),
+		Title:                 document.Title,
+		Language:              document.Language,
+		Body:                  document.Body,
+		BodyDigest:            document.BodyDigest,
+		SourceRef:             document.SourceRef,
+		ProducerProfile:       document.ProducerProfile,
+		ConfigDigest:          document.ConfigDigest,
+		ProducerProfileDigest: document.ProducerProfileDigest,
+		Confidence:            document.Confidence,
+		Coverage:              document.Coverage,
+		Visibility:            document.Visibility,
+		Accepted:              document.Accepted,
+		Revision:              document.Revision,
+		PredecessorID:         document.PredecessorID,
+		Metadata:              document.Metadata,
+		CreatedAt:             document.CreatedAt.UTC().Format(time.RFC3339),
+		UpdatedAt:             document.UpdatedAt.UTC().Format(time.RFC3339),
+		Segments:              projectedSegments,
 	}
 }
 

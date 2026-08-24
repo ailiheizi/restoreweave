@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 
 	"github.com/ailiheizi/restoreweave/server/internal/store/sqlite"
@@ -69,6 +68,94 @@ func (s *Service) ImportRecoveryArtifact(ctx context.Context, artifactPath, trus
 	default:
 		return result, fmt.Errorf("unsupported recovery artifact schema %q", header.Schema)
 	}
+}
+
+// MigrateRecoveryArtifact converts the legacy v1 recovery export into the
+// independently retainable v2 reference. Migration is a read/validate/write
+// operation: it never deletes or overwrites the source artifact and never
+// publishes a second snapshot. The repository's authenticated commit and
+// portable fact closure remain authoritative for the successor reference.
+func (s *Service) MigrateRecoveryArtifact(ctx context.Context, artifactPath, trustAnchorPath, destination, publicationDomain string) (ExportResult, error) {
+	var result ExportResult
+	if strings.TrimSpace(destination) == "" {
+		return result, errors.New("migration destination is required")
+	}
+	anchor, err := s.loadRecoveryImportAnchor(trustAnchorPath, publicationDomain)
+	if err != nil {
+		return result, err
+	}
+	payload, err := readRecoveryArtifact(artifactPath)
+	if err != nil {
+		return result, err
+	}
+	var header struct {
+		Schema string `json:"schema"`
+	}
+	if err := json.Unmarshal(payload, &header); err != nil {
+		return result, fmt.Errorf("decode recovery artifact header: %w", err)
+	}
+	var reference RecoveryReference
+	switch header.Schema {
+	case RecoveryExportBundleSchemaV1:
+		var bundle recoveryExportBundle
+		if err := decodeStrictRecord(payload, &bundle); err != nil {
+			return result, fmt.Errorf("decode recovery bundle: %w", err)
+		}
+		if _, _, _, err := s.verifyImportBundle(ctx, anchor, bundle); err != nil {
+			return result, fmt.Errorf("validate legacy recovery bundle for migration: %w", err)
+		}
+		// BuildRecoveryReference reads the authenticated repository lineage and
+		// current complete-state child; it does not trust mutable v1 fields. Use
+		// a catalog-free reader with the independently loaded anchor rather than
+		// copying the caller's synchronization state.
+		reader := &Service{
+			Repo:                     s.Repo,
+			TrustAnchor:              &anchor,
+			PublicationDomain:        s.PublicationDomain,
+			RequireSignedPublication: true,
+		}
+		if reader.PublicationDomain == "" {
+			reader.PublicationDomain = anchor.PublicationDomain
+		}
+		reference, err = reader.BuildRecoveryReference(ctx, bundle.SnapshotRef)
+		if err != nil {
+			return result, fmt.Errorf("build v2 recovery successor: %w", err)
+		}
+		if reference.PublicationCommitDigest != bundle.PublicationCommitDigest ||
+			reference.PreparedClosure.Manifest.ManifestDigest != bundle.PreparedClosure.Manifest.ManifestDigest {
+			return result, errors.New("migration changed the authenticated publication identity")
+		}
+	case RecoveryReferenceSchemaV2:
+		reference, err = DecodeRecoveryReference(payload)
+		if err != nil {
+			return result, err
+		}
+		if err := reference.ValidateAgainstRepository(ctx, s.Repo, anchor); err != nil {
+			return result, fmt.Errorf("validate v2 recovery reference for migration: %w", err)
+		}
+	default:
+		return result, fmt.Errorf("unsupported recovery artifact schema %q", header.Schema)
+	}
+	// Revalidate the exact successor against the supplied repository and
+	// independent anchor before writing any bytes to the destination.
+	if err := reference.ValidateAgainstRepository(ctx, s.Repo, anchor); err != nil {
+		return result, fmt.Errorf("validate migrated recovery reference: %w", err)
+	}
+	encoded, err := MarshalRecoveryReference(reference)
+	if err != nil {
+		return result, err
+	}
+	path, err := writeNewRecoveryFile(destination, encoded)
+	if err != nil {
+		return result, err
+	}
+	files, bytes := manifestFileTotals(reference.PreparedClosure.Manifest)
+	return ExportResult{
+		SnapshotRef: reference.SnapshotRef, Schema: RecoveryReferenceSchemaV2,
+		ManifestDigest: reference.PreparedClosure.Manifest.ManifestDigest,
+		ArtifactPath:   path, Length: int64(len(encoded)), Files: files, Bytes: bytes,
+		IndependentlyStored: true,
+	}, nil
 }
 
 // ImportRecoveryBundle admits a portable recovery export produced by
@@ -217,7 +304,7 @@ func readRecoveryArtifact(artifactPath string) ([]byte, error) {
 	if strings.TrimSpace(artifactPath) == "" {
 		return nil, errors.New("recovery artifact path is required")
 	}
-	file, err := os.Open(artifactPath)
+	file, err := openRecoveryInput(artifactPath)
 	if err != nil {
 		return nil, fmt.Errorf("open recovery artifact: %w", err)
 	}
@@ -298,6 +385,15 @@ func (s *Service) verifyImportBundle(ctx context.Context, anchor TrustAnchor, bu
 	}
 	if err := validatePreparedEnvelope(driver, anchor, bundle.PublicationCommit, bundle.PreparedClosure, int64(len(preparedBytes))); err != nil {
 		return "", "", "", fmt.Errorf("validate recovery bundle prepared closure: %w", err)
+	}
+	// The legacy v1 bundle carries the authenticated payload receipt but not a
+	// separate v2 reference reader envelope. Validate every exact object here so
+	// import and migration reject a missing or tampered payload before reporting
+	// a clean-install recovery artifact as admitted.
+	for _, object := range bundle.PreparedClosure.PayloadReceipt.Objects {
+		if err := verifyExactObjectReadback(ctx, s.Repo, object.ContentID, object.LogicalBytes); err != nil {
+			return "", "", "", fmt.Errorf("verify recovery bundle payload %s: %w", object.ContentID, err)
+		}
 	}
 	domain := s.PublicationDomain
 	if domain == "" {

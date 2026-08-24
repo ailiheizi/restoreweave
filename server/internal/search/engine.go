@@ -47,12 +47,11 @@ type Document struct {
 	Segments        string
 }
 
-// SegmentRef is provenance for one description match inside a hit. It names
-// the durable description revision and the semantic segment whose text carried
-// the match, so a user can tell whether a result came from a filename, a user
-// note, or model-generated plot/analysis.
+// SegmentRef is provenance for one durable text span inside a hit.
 type SegmentRef struct {
 	DescriptionDocumentID string
+	SourceType            string
+	SourceID              string
 	SegmentID             string
 	Ordinal               int64
 	MatchedText           string
@@ -161,6 +160,11 @@ func (engine *Engine) Query(ctx context.Context, dbPath, text string, axes []str
 // QueryFiltered is the structured form of Query. Typed filters become precise
 // post-filter predicates; free-text behavior is unchanged from Query.
 func (engine *Engine) QueryFiltered(ctx context.Context, dbPath, text string, axes []string, filters Filters) ([]Hit, error) {
+	normalizedFilters, err := NormalizeFilters(filters)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidQuery, err)
+	}
+	filters = normalizedFilters
 	if strings.TrimSpace(text) == "" && !filters.Has() {
 		return nil, errors.New("search query text is required")
 	}
@@ -192,46 +196,127 @@ SELECT subject_id, path, name, suffix, entry_type, content_id, metadata,
        size_facet, mtime_facet, duplicate_group, segments
 FROM documents ` + where
 	if len(tokens) > 0 {
-		query += ` ORDER BY rank`
+		query += ` ORDER BY rank, rowid`
+	} else {
+		// A deterministic order makes candidate paging stable while filters
+		// are applied after the row is decoded.
+		query += ` ORDER BY rowid`
 	}
-	query += ` LIMIT 1000`
-	rows, err := db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("query fts5: %w", err)
-	}
-	defer rows.Close()
+	const (
+		candidatePageSize = 1000
+		resultLimit       = 1000
+	)
 	var hits []Hit
-	for rows.Next() {
-		var hit Hit
-		var suffix, metadata, duplicates, protection, locators, tags, notes, descriptions, extracted string
-		var detection, processing, representations, language string
-		var sizeFacet, mtimeFacet sql.NullInt64
-		var duplicateGroup, segments string
-		if err := rows.Scan(
-			&hit.SubjectID, &hit.Path, &hit.Name, &suffix, &hit.EntryType,
-			&hit.ContentID, &metadata, &duplicates, &protection, &locators,
-			&tags, &notes, &descriptions, &extracted, &detection, &processing,
-			&representations, &language, &sizeFacet, &mtimeFacet, &duplicateGroup,
-			&segments,
-		); err != nil {
-			return nil, err
+	for offset := 0; len(hits) < resultLimit; offset += candidatePageSize {
+		pageArgs := append(append([]any(nil), args...), candidatePageSize, offset)
+		rows, queryErr := db.QueryContext(ctx, query+` LIMIT ? OFFSET ?`, pageArgs...)
+		if queryErr != nil {
+			return nil, fmt.Errorf("query fts5: %w", queryErr)
 		}
-		if !matchesFilters(hit, filters, sizeFacet, mtimeFacet, duplicateGroup, suffix, protection) {
+		pageRows := 0
+		for rows.Next() {
+			pageRows++
+			var hit Hit
+			var suffix, metadata, duplicates, protection, locators, tags, notes, descriptions, extracted string
+			var detection, processing, representations, language string
+			var sizeFacet, mtimeFacet sql.NullInt64
+			var duplicateGroup, segments string
+			if err := rows.Scan(
+				&hit.SubjectID, &hit.Path, &hit.Name, &suffix, &hit.EntryType,
+				&hit.ContentID, &metadata, &duplicates, &protection, &locators,
+				&tags, &notes, &descriptions, &extracted, &detection, &processing,
+				&representations, &language, &sizeFacet, &mtimeFacet, &duplicateGroup,
+				&segments,
+			); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			if !matchesFilters(hit, filters, sizeFacet, mtimeFacet, duplicateGroup, suffix, protection, language) {
+				continue
+			}
+			hit.ConstructAxes = matchedConstructAxes(hit, suffix, metadata, duplicates,
+				protection, locators, tags, notes, descriptions, extracted,
+				detection, processing, representations, language, duplicateGroup, tokens)
+			hit.Segments = matchedDescriptionSegments(segments, tokens)
+			hits = append(hits, hit)
+			if len(hits) >= resultLimit {
+				break
+			}
+		}
+		rowsErr := rows.Err()
+		closeErr := rows.Close()
+		if rowsErr != nil {
+			return nil, rowsErr
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		if pageRows < candidatePageSize || len(hits) >= resultLimit {
+			break
+		}
+	}
+	return hits, nil
+}
+
+// filterCandidates applies lexical typed facets to an already bounded set of
+// provider hits. The provider's path/type fields are display data only; filter
+// authority comes from the generation-aligned lexical row.
+func (engine *Engine) filterCandidates(ctx context.Context, dbPath string, candidates []Hit, filters Filters) ([]Hit, error) {
+	if _, err := os.Stat(dbPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, ErrUnavailable
+		}
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	if len(candidates) == 0 {
+		// Opening the generation is part of the filter dependency check. An
+		// empty provider result must not hide a missing lexical authority.
+		if err := db.PingContext(ctx); err != nil {
+			return nil, fmt.Errorf("open candidate filter authority: %w", err)
+		}
+		return nil, nil
+	}
+	stmt, err := db.PrepareContext(ctx, `
+SELECT entry_type, content_id, duplicate_group, suffix, protection, language,
+       size_facet, mtime_facet
+FROM documents
+WHERE subject_id = ?
+LIMIT 1`)
+	if err != nil {
+		return nil, fmt.Errorf("prepare candidate filter: %w", err)
+	}
+	defer stmt.Close()
+	filtered := make([]Hit, 0, len(candidates))
+	for _, candidate := range candidates {
+		var indexed Hit
+		var duplicateGroup, suffix, protection, language string
+		var sizeFacet, mtimeFacet sql.NullInt64
+		err := stmt.QueryRowContext(ctx, candidate.SubjectID).Scan(
+			&indexed.EntryType, &indexed.ContentID, &duplicateGroup, &suffix,
+			&protection, &language, &sizeFacet, &mtimeFacet,
+		)
+		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
-		hit.ConstructAxes = matchedConstructAxes(hit, suffix, metadata, duplicates,
-			protection, locators, tags, notes, descriptions, extracted,
-			detection, processing, representations, language, duplicateGroup, tokens)
-		hit.Segments = matchedDescriptionSegments(segments, tokens)
-		hits = append(hits, hit)
+		if err != nil {
+			return nil, fmt.Errorf("filter provider candidate %q: %w", candidate.SubjectID, err)
+		}
+		if matchesFilters(indexed, filters, sizeFacet, mtimeFacet, duplicateGroup, suffix, protection, language) {
+			filtered = append(filtered, candidate)
+		}
 	}
-	return hits, rows.Err()
+	return filtered, nil
 }
 
 // matchesFilters applies typed structured constraints as post-filter
 // predicates over the FTS row. Numeric facets are stored in UNINDEXED columns
 // so MATCH can never touch them; constraints never invent a hit.
-func matchesFilters(hit Hit, filters Filters, sizeFacet, mtimeFacet sql.NullInt64, duplicateGroup, suffix, protection string) bool {
+func matchesFilters(hit Hit, filters Filters, sizeFacet, mtimeFacet sql.NullInt64, duplicateGroup, suffix, protection, language string) bool {
 	if filters.EntryType != "" && strings.ToUpper(filters.EntryType) != strings.ToUpper(hit.EntryType) {
 		return false
 	}
@@ -242,6 +327,12 @@ func matchesFilters(hit Hit, filters Filters, sizeFacet, mtimeFacet sql.NullInt6
 		return false
 	}
 	if filters.ProtectionMode != "" && !containsWord(filters.ProtectionMode, protection) {
+		return false
+	}
+	// Language is a structured exact facet. Compare canonicalized display
+	// values without treating missing or whitespace-only values as a match.
+	if want := strings.TrimSpace(filters.Language); want != "" &&
+		!strings.EqualFold(want, strings.TrimSpace(language)) {
 		return false
 	}
 	if filters.Suffix != "" && strings.TrimPrefix(strings.ToLower(suffix), ".") != strings.TrimPrefix(strings.ToLower(filters.Suffix), ".") {

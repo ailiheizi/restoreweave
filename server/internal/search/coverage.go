@@ -5,11 +5,134 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/ailiheizi/restoreweave/server/internal/store/sqlite"
 	_ "modernc.org/sqlite"
 )
+
+type semanticCoverageProbe interface {
+	Coverage(context.Context, ZvecGenerationSpec) ([]string, error)
+}
+
+type SemanticCoverageStatement struct {
+	Dimension     string
+	GenerationID  string
+	ConfigDigest  string
+	ProfileDigest string
+	Available     bool
+	Complete      bool
+	Expected      int
+	Indexed       int
+	Missing       []string
+	Notes         string
+}
+
+// SemanticCoverage reports only evidence available from the durable segment
+// set and the backend's generation coverage probe. A backend that cannot
+// enumerate indexed segment IDs is deliberately partial, never complete.
+func (idx *Indexer) SemanticCoverage(ctx context.Context, workspaceID string) (SemanticCoverageStatement, error) {
+	statement := SemanticCoverageStatement{Dimension: DimensionSemantic, Notes: "semantic coverage requires backend segment identity evidence"}
+	if idx == nil || idx.Store == nil || idx.SemanticProvider == nil || idx.SemanticZvec == nil || idx.SemanticManifest == (EmbeddingGenerationManifest{}) {
+		statement.Notes = "semantic provider or backend is unavailable"
+		return statement, nil
+	}
+	if idx.semanticUnavailable.Load() {
+		statement.Notes = "semantic provider is degraded"
+		return statement, nil
+	}
+	if health, ok := idx.SemanticProvider.(interface{ SemanticReady() bool }); ok && !health.SemanticReady() {
+		statement.Notes = "semantic provider is not ready"
+		return statement, nil
+	}
+	if health, ok := idx.SemanticZvec.(ZvecGenerationReadiness); ok && !health.ZvecReady(idx.SemanticLibraryPath, idx.SemanticLibraryDigest, idx.SemanticManifest) {
+		statement.Notes = "semantic backend is not ready"
+		return statement, nil
+	}
+	generation, err := idx.Store.LatestIndexGeneration(ctx, workspaceID, DimensionSemantic)
+	if err != nil {
+		if errors.Is(err, sqlite.ErrNotFound) {
+			return statement, nil
+		}
+		return statement, err
+	}
+	statement.GenerationID, statement.ConfigDigest, statement.ProfileDigest = generation.ID, generation.ConfigDigest, generation.ProviderProfileDigest
+	if !generationBindingMatches(idx, generation, DimensionSemantic) {
+		statement.Notes = "semantic generation binding mismatch"
+		return statement, nil
+	}
+	docs, err := idx.Store.ListDescriptionDocuments(ctx, workspaceID, "")
+	if err != nil {
+		return statement, err
+	}
+	expected := map[string]struct{}{}
+	for _, doc := range docs {
+		segments, listErr := idx.Store.ListSemanticSegments(ctx, workspaceID, doc.ID)
+		if listErr != nil {
+			return statement, listErr
+		}
+		for _, segment := range segments {
+			expected[segment.ID] = struct{}{}
+		}
+	}
+	annotations, err := idx.Store.ListAnnotations(ctx, workspaceID, "", false)
+	if err != nil {
+		return statement, err
+	}
+	for _, annotation := range annotations {
+		if annotation.Kind == sqlite.AnnotationNote {
+			expected[annotation.ID] = struct{}{}
+		}
+	}
+	statement.Expected = len(expected)
+	probe, ok := idx.SemanticZvec.(semanticCoverageProbe)
+	if !ok {
+		statement.Notes = "semantic backend does not provide segment coverage evidence"
+		return statement, nil
+	}
+	spec := ZvecGenerationSpec{Path: generation.DBPath, LibraryPath: idx.SemanticLibraryPath, LibraryDigest: idx.SemanticLibraryDigest, ProfileDigest: idx.SemanticManifest.CanonicalDigest(), Manifest: idx.SemanticManifest}
+	indexed, err := probe.Coverage(ctx, spec)
+	if err != nil {
+		statement.Notes = "semantic coverage probe unavailable"
+		return statement, nil
+	}
+	seen := map[string]struct{}{}
+	unknown := false
+	duplicate := false
+	for _, id := range indexed {
+		if _, ok := expected[id]; ok {
+			if _, exists := seen[id]; exists {
+				duplicate = true
+			}
+			seen[id] = struct{}{}
+		} else {
+			unknown = true
+		}
+	}
+	statement.Indexed = len(seen)
+	statement.Available = true
+	for id := range expected {
+		if _, ok := seen[id]; !ok {
+			statement.Missing = append(statement.Missing, id)
+		}
+	}
+	sort.Strings(statement.Missing)
+	statement.Complete = len(statement.Missing) == 0 && statement.Indexed == statement.Expected && !unknown && !duplicate
+	switch {
+	case unknown:
+		statement.Notes = "semantic generation contains unknown segment identities"
+	case duplicate:
+		statement.Notes = "semantic generation contains duplicate segment identities"
+	case statement.Expected > 0 && statement.Indexed == 0:
+		statement.Notes = "semantic generation is empty"
+	case !statement.Complete:
+		statement.Notes = "semantic generation has incomplete segment coverage"
+	default:
+		statement.Notes = "semantic generation covers every durable segment"
+	}
+	return statement, nil
+}
 
 // Coverage reports what the lexical generation actually feeds, honestly.
 // Missing fields are reported as missing; a generation that does not exist

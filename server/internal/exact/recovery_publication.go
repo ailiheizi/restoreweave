@@ -41,6 +41,10 @@ var (
 	// ErrNeedsReconciliation is the operator/action classification for an
 	// unknown repository placement outcome.
 	ErrNeedsReconciliation = errors.New("NEEDS_RECONCILIATION")
+	// ErrPublicationLeaseRelease records a failed release after a publication
+	// side effect. The immutable record may already be committed, so callers
+	// must reconcile the publication before treating the operation as terminal.
+	ErrPublicationLeaseRelease = errors.New("PUBLICATION_LEASE_RELEASE_FAILED")
 )
 
 // PublicationOutcomeError preserves the operation identity needed to perform
@@ -76,6 +80,61 @@ func (e *PublicationOutcomeError) Unwrap() error { return e.Cause }
 
 func (e *PublicationOutcomeError) Is(target error) bool {
 	return target == ErrUnknownExternalOutcome || target == ErrNeedsReconciliation
+}
+
+// PayloadPlacementOutcomeError identifies an exact blob whose placement
+// response could not be proven. The content identity is retained so a caller
+// can reconcile the object without replaying source reads or creating a
+// second logical payload.
+type PayloadPlacementOutcomeError struct {
+	ContentID string
+	Cause     error
+}
+
+func (e *PayloadPlacementOutcomeError) Error() string {
+	message := ErrUnknownExternalOutcome.Error() + "; " + ErrNeedsReconciliation.Error()
+	if e != nil && e.ContentID != "" {
+		message += fmt.Sprintf(" after payload %s placement", e.ContentID)
+	}
+	if e != nil && e.Cause != nil {
+		message += ": " + e.Cause.Error()
+	}
+	return message
+}
+
+func (e *PayloadPlacementOutcomeError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+func (e *PayloadPlacementOutcomeError) Is(target error) bool {
+	return target == ErrUnknownExternalOutcome || target == ErrNeedsReconciliation
+}
+
+// placeExactWithReadback treats every post-boundary placement error as an
+// unknown outcome until the expected content identity is independently
+// verified. A successful readback returns a deterministic synthetic receipt;
+// receipt transport itself is not recovery authority.
+func placeExactWithReadback(ctx context.Context, driver repository.Driver, contentID string, logicalBytes int64, body io.Reader) (repository.Receipt, error) {
+	receipt, placeErr := driver.PlaceExact(ctx, contentID, body)
+	if placeErr == nil {
+		// Hash the logical stream exposed by the reader rather than trusting a
+		// backend Verify result. A replaceable driver may report backend health
+		// while returning bytes that do not satisfy the signed exact identity.
+		if verifyErr := verifyExactObjectReadback(ctx, driver, contentID, logicalBytes); verifyErr == nil {
+			return receipt, nil
+		} else {
+			placeErr = fmt.Errorf("exact payload readback after successful placement: %w", verifyErr)
+		}
+	}
+	if verifyErr := verifyExactObjectReadback(context.WithoutCancel(ctx), driver, contentID, logicalBytes); verifyErr == nil {
+		return repository.Receipt{ContentID: contentID, Bytes: logicalBytes, StoredBytes: logicalBytes, Existed: true}, nil
+	} else {
+		placeErr = fmt.Errorf("observe exact payload %s: %w; original placement: %v", contentID, verifyErr, placeErr)
+	}
+	return repository.Receipt{}, &PayloadPlacementOutcomeError{ContentID: contentID, Cause: placeErr}
 }
 
 type PayloadObjectReceipt struct {
@@ -236,8 +295,7 @@ func buildMetadataEvidence(manifest Manifest) (AuthenticatedMetadataEvidence, er
 	return evidence, nil
 }
 
-func (s *Service) publishRecoveryClosure(ctx context.Context, adopted adopted, manifest Manifest, placed placedSet, planDigest, captureDigest, policyDigest string) (PublicationClosureResult, error) {
-	var result PublicationClosureResult
+func (s *Service) publishRecoveryClosure(ctx context.Context, adopted adopted, manifest Manifest, placed placedSet, planDigest, captureDigest, policyDigest string) (result PublicationClosureResult, retErr error) {
 	if !s.signedPublicationEnabled() {
 		return result, nil
 	}
@@ -262,7 +320,12 @@ func (s *Service) publishRecoveryClosure(ctx context.Context, adopted adopted, m
 	if err != nil {
 		return result, err
 	}
-	defer lease.release()
+	ctx = lease.context()
+	defer func() {
+		if releaseErr := lease.release(); releaseErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("%w: %w: %v", ErrNeedsReconciliation, ErrPublicationLeaseRelease, releaseErr))
+		}
+	}()
 	existing, err := listCommitMarkers(ctx, driver, *s.TrustAnchor, s.PublicationDomain)
 	if err != nil {
 		return result, err
@@ -304,9 +367,16 @@ func (s *Service) publishRecoveryClosure(ctx context.Context, adopted adopted, m
 		}
 		recordFenceToken = latest.Commit.FenceToken + 1
 	}
-	// The portable token is derived from the authenticated commit lineage while
-	// holding the repository lock. Catalog lease counters are coordination-only
-	// and cannot become recovery authority.
+	// The signed token must advance both the authenticated commit lineage and
+	// the coordination lease counter. An abandoned lease can advance the
+	// latter without producing a commit; reusing a smaller lineage token would
+	// let a stale writer appear newer to readers.
+	if lease.coordinationToken > 0 && uint64(lease.coordinationToken) > recordFenceToken {
+		recordFenceToken = uint64(lease.coordinationToken)
+	}
+	if recordFenceToken == 0 {
+		return result, errors.New("publication fence token exhausted")
+	}
 	lease.token = recordFenceToken
 	prepared, err := SignPreparedClosure(*s.SigningIdentity, SignedPreparedClosure{
 		Schema: PreparedClosureSchemaV1, SignatureDomain: RecoverySignatureDomainV1,
@@ -346,6 +416,9 @@ func (s *Service) publishRecoveryClosure(ctx context.Context, adopted adopted, m
 	if err := driver.VerifyRecord(ctx, preparedReceipt); err != nil {
 		return s.reconcileUnknownPublicationOutcome(ctx, driver, adopted.publicationID, manifest.SnapshotRef, planDigest, repository.RecordPreparedClosure, fmt.Errorf("reconcile prepared closure: %w", err))
 	}
+	if err := s.validatePublicationFence(ctx, lease); err != nil {
+		return s.reconcileUnknownPublicationOutcome(ctx, driver, adopted.publicationID, manifest.SnapshotRef, planDigest, repository.RecordPreparedClosure, err)
+	}
 	preparedReceiptDigest, err := DigestCanonicalJSON(stableReceipt(preparedReceipt))
 	if err != nil {
 		return result, err
@@ -380,6 +453,9 @@ func (s *Service) publishRecoveryClosure(ctx context.Context, adopted adopted, m
 	}
 	if err := driver.VerifyRecord(ctx, commitReceipt); err != nil {
 		return s.reconcileUnknownPublicationOutcome(ctx, driver, adopted.publicationID, manifest.SnapshotRef, planDigest, repository.RecordPublicationCommit, fmt.Errorf("reconcile publication commit: %w", err))
+	}
+	if err := s.validatePublicationFence(ctx, lease); err != nil {
+		return s.reconcileUnknownPublicationOutcome(ctx, driver, adopted.publicationID, manifest.SnapshotRef, planDigest, repository.RecordPublicationCommit, err)
 	}
 	return PublicationClosureResult{PreparedDigest: preparedReceipt.Digest, CommitDigest: commitReceipt.Digest, Generation: generation}, nil
 }
@@ -419,6 +495,29 @@ func (s *Service) reconcileUnknownPublicationOutcome(ctx context.Context, driver
 		}
 	}
 	return PublicationClosureResult{}, &PublicationOutcomeError{
+		PlanDigest: planDigest, SnapshotRef: snapshotRef, PublicationID: publicationID,
+		Role: role, Cause: cause,
+	}
+}
+
+// reconcileUnknownChildOutcome observes one immutable post-publication child
+// after PlaceRecord or VerifyRecord returned an error. The expected payload
+// digest is known before placement, so an exact readback proves that the
+// child committed; a missing, unreadable, or changed object remains an
+// explicit unknown outcome and must not be retried blindly.
+func (s *Service) reconcileUnknownChildOutcome(ctx context.Context, driver repository.RecordDriver, role repository.RecordRole, payload []byte, publicationID, snapshotRef, parentDigest, planDigest string, cause error) error {
+	reconcileCtx := context.WithoutCancel(ctx)
+	recordDigest := DigestBytes(payload)
+	observed, err := readRecord(reconcileCtx, driver, role, recordDigest)
+	if err == nil && bytes.Equal(observed, payload) {
+		return nil
+	}
+	if err != nil {
+		cause = fmt.Errorf("observe %s %s: %w; original placement: %v", role, recordDigest, err, cause)
+	} else {
+		cause = fmt.Errorf("observed %s %s differs from the signed payload; original placement: %v", role, recordDigest, cause)
+	}
+	return &PublicationOutcomeError{
 		PlanDigest: planDigest, SnapshotRef: snapshotRef, PublicationID: publicationID,
 		Role: role, Cause: cause,
 	}

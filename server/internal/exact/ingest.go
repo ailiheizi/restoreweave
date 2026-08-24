@@ -123,6 +123,7 @@ func (s *Service) executeCapturedIngestWithExecutionKey(ctx context.Context, cap
 	if err != nil {
 		return result, err
 	}
+	result = IngestResult{WorkspaceID: ids.workspaceID, SourceID: ids.sourceID, ScanID: ids.scanID, BindingID: ids.bindingID, RootID: adopted.rootID, SnapshotRef: written.SnapshotRef, ManifestDigest: written.ManifestDigest, ConfigDigest: s.ConfigDigest, ProtectionDigest: protectionDigest, ProtectionMode: policy.mode, ProtectionDecisions: protectionDecisions, Files: placed.files, Bytes: placed.bytes, LocalFiles: placed.localFiles, LocalBytes: placed.localBytes, NewBytes: placed.newBytes, LinkOnlyFiles: placed.linkOnlyFiles, LocatorCount: len(policy.locators), PreparedClosureDigest: closure.PreparedDigest, PublicationCommitDigest: closure.CommitDigest, PublicationGeneration: closure.Generation}
 	if err := s.Store.Update(ctx, func(tx *sqlite.Tx) error {
 		metadata, _ := json.Marshal(map[string]any{
 			"config_digest":             s.ConfigDigest,
@@ -132,34 +133,56 @@ func (s *Service) executeCapturedIngestWithExecutionKey(ctx context.Context, cap
 		})
 		return tx.InsertPublication(ctx, &sqlite.Publication{ID: adopted.publicationID, WorkspaceID: ids.workspaceID, PlanDigest: executionKey, SnapshotRef: written.SnapshotRef, ScanGenerationID: ids.scanID, BindingID: ids.bindingID, NamespaceRootID: adopted.rootID, ManifestDigest: written.ManifestDigest, Metadata: metadata})
 	}); err != nil {
+		if closure.CommitDigest != "" {
+			return result, &PublicationOutcomeError{
+				PlanDigest: executionKey, SnapshotRef: written.SnapshotRef,
+				PublicationID: adopted.publicationID, Role: repository.RecordPublicationCommit,
+				Cause: fmt.Errorf("project committed publication %s (snapshot %s) in catalog: %w", adopted.publicationID, written.SnapshotRef, err),
+			}
+		}
 		return result, err
 	}
-	result = IngestResult{WorkspaceID: ids.workspaceID, SourceID: ids.sourceID, ScanID: ids.scanID, BindingID: ids.bindingID, RootID: adopted.rootID, SnapshotRef: written.SnapshotRef, ManifestDigest: written.ManifestDigest, ConfigDigest: s.ConfigDigest, ProtectionDigest: protectionDigest, ProtectionMode: policy.mode, ProtectionDecisions: protectionDecisions, Files: placed.files, Bytes: placed.bytes, LocalFiles: placed.localFiles, LocalBytes: placed.localBytes, NewBytes: placed.newBytes, LinkOnlyFiles: placed.linkOnlyFiles, LocatorCount: len(policy.locators), PreparedClosureDigest: closure.PreparedDigest, PublicationCommitDigest: closure.CommitDigest, PublicationGeneration: closure.Generation}
+	var reconciliationErrs []error
 	// The exact publication is already durable at this point. Optional
 	// processing and indexing are post-commit branches, so their failures are
 	// warnings rather than ingest failures.
 	if s.Processor != nil {
-		if err := s.Processor.ProcessPublication(ctx, result.WorkspaceID, result.SnapshotRef, result.RootID); err != nil {
+		processErr := s.Processor.ProcessPublication(ctx, result.WorkspaceID, result.SnapshotRef, result.RootID)
+		if processErr != nil {
 			var source interface{ PublicationWarnings() []string }
-			if errors.As(err, &source) {
+			if errors.As(processErr, &source) {
 				for _, warning := range source.PublicationWarnings() {
 					result.Warnings = append(result.Warnings, "processor: "+warning)
 				}
 			} else {
-				result.Warnings = append(result.Warnings, "processor: "+err.Error())
+				result.Warnings = append(result.Warnings, "processor: "+processErr.Error())
 			}
 		}
 		if err := s.publishProcessorAttemptClosure(context.WithoutCancel(ctx), result.WorkspaceID, result.SnapshotRef, result.PublicationCommitDigest); err != nil {
 			result.Warnings = append(result.Warnings, "processor closure: "+err.Error())
+			if errors.Is(err, ErrUnknownExternalOutcome) || errors.Is(err, ErrNeedsReconciliation) {
+				reconciliationErrs = append(reconciliationErrs, err)
+			}
+		}
+		if processErr != nil {
+			if err := s.scheduleProcessorRetry(context.WithoutCancel(ctx), result, executionKey, processErr); err != nil {
+				result.Warnings = append(result.Warnings, "processor retry: "+err.Error())
+			}
 		}
 	}
 	if err := s.publishPortableFactClosure(context.WithoutCancel(ctx), result.WorkspaceID, result.SnapshotRef, result.PublicationCommitDigest); err != nil {
 		result.Warnings = append(result.Warnings, "portable fact closure: "+err.Error())
+		if errors.Is(err, ErrUnknownExternalOutcome) || errors.Is(err, ErrNeedsReconciliation) {
+			reconciliationErrs = append(reconciliationErrs, err)
+		}
 	}
 	if s.Indexer != nil {
 		if _, err := s.Indexer.Rebuild(ctx, result.WorkspaceID, result.SnapshotRef, result.RootID); err != nil {
 			result.Warnings = append(result.Warnings, "indexer: "+err.Error())
 		}
+	}
+	if len(reconciliationErrs) > 0 {
+		return result, errors.Join(reconciliationErrs...)
 	}
 	return result, nil
 }
@@ -345,13 +368,10 @@ func (s *Service) placeFiles(
 		if err != nil {
 			return placed, fmt.Errorf("reopen %s: %w", entry.RelativePath, err)
 		}
-		receipt, err := s.Repo.PlaceExact(ctx, entry.Content.ContentID, body)
+		receipt, err := placeExactWithReadback(ctx, s.Repo, entry.Content.ContentID, entry.Content.BytesRead, body)
 		_ = body.Close()
 		if err != nil {
 			return placed, fmt.Errorf("place %s: %w", entry.RelativePath, err)
-		}
-		if err := s.Repo.Verify(ctx, receipt.ContentID); err != nil {
-			return placed, fmt.Errorf("readback %s: %w", entry.RelativePath, err)
 		}
 		seen[entry.Content.ContentID] = struct{}{}
 		placed.payloadReceipts = append(placed.payloadReceipts, receipt)
@@ -880,8 +900,11 @@ func toManifestEntry(entry scanner.EntryRecord, entryType sqlite.NamespaceEntryT
 }
 
 func buildManifestEntryFacts(entry scanner.EntryRecord, binding capture.BindingRecord) (*ManifestEntryFacts, error) {
-	sourceProfile := binding.Schema + "/" + binding.Profile + "/" + string(binding.CaptureMode) + "/" + scanner.MetadataVersion
+	sourceProfile := binding.Schema + "/" + binding.Profile + "/" + string(binding.CaptureMode) + "/" + scanner.MetadataVersion + "/" + scanner.FilesystemFactsVersion
 	capturedAt := binding.BoundAt.UTC()
+	if !entry.Filesystem.CapturedAt.IsZero() {
+		capturedAt = entry.Filesystem.CapturedAt.UTC()
+	}
 	hardLinkState := PortableFactObserved
 	hardLinkValueState := string(entry.HardLink.State)
 	switch entry.HardLink.State {
@@ -947,6 +970,10 @@ func buildManifestEntryFacts(entry scanner.EntryRecord, binding capture.BindingR
 	unsupported := func(reason string) PortableUnsupportedValue {
 		return PortableUnsupportedValue{ReasonCode: reason}
 	}
+	xattrState, xattrValue := portableXAttrFact(entry.Filesystem.XAttrs)
+	aclState, aclValue := portableACLFact(entry.Filesystem.ACLs)
+	xattrAuthority := portableFactAuthority(xattrState)
+	aclAuthority := portableFactAuthority(aclState)
 	extentState := PortableFactUnsupported
 	extentValue := PortableUnsupportedValue{ReasonCode: "CAPTURE_PROFILE_DOES_NOT_EMIT_EXTENT_MAP"}
 	if entry.Kind != scanner.KindRegularFile {
@@ -968,11 +995,11 @@ func buildManifestEntryFacts(entry scanner.EntryRecord, binding capture.BindingR
 			MediaType: entry.Detection.Result.MediaType, Confidence: entry.Detection.Result.Confidence,
 			Evidence: detectionEvidence,
 		}},
-		{name: PortableFactACLs, state: PortableFactUnsupported, authority: "CAPTURE_PROFILE_DECLARATION", value: unsupported("CAPTURE_PROFILE_DOES_NOT_OBSERVE_ACLS")},
+		{name: PortableFactACLs, state: aclState, authority: aclAuthority, value: aclValue},
 		{name: PortableFactAlternateStreams, state: PortableFactUnsupported, authority: "CAPTURE_PROFILE_DECLARATION", value: unsupported("CAPTURE_PROFILE_DOES_NOT_OBSERVE_ALTERNATE_STREAMS")},
 		{name: PortableFactFlags, state: PortableFactUnsupported, authority: "CAPTURE_PROFILE_DECLARATION", value: unsupported("CAPTURE_PROFILE_DOES_NOT_OBSERVE_FILE_FLAGS")},
 		{name: PortableFactResourceForks, state: PortableFactUnsupported, authority: "CAPTURE_PROFILE_DECLARATION", value: unsupported("CAPTURE_PROFILE_DOES_NOT_OBSERVE_RESOURCE_FORKS")},
-		{name: PortableFactXAttrs, state: PortableFactUnsupported, authority: "CAPTURE_PROFILE_DECLARATION", value: unsupported("CAPTURE_PROFILE_DOES_NOT_OBSERVE_XATTRS")},
+		{name: PortableFactXAttrs, state: xattrState, authority: xattrAuthority, value: xattrValue},
 		{name: PortableFactBoundary, state: boundaryState, authority: "CAPTURE_OBSERVATION", value: PortableBoundaryValue{
 			Checked: entry.Boundary.Checked, Action: boundaryAction, Reason: entry.Boundary.Reason,
 		}},
@@ -993,6 +1020,74 @@ func buildManifestEntryFacts(entry scanner.EntryRecord, binding capture.BindingR
 		return nil, err
 	}
 	return facts, nil
+}
+
+func portableCaptureFactState(state scanner.CaptureFactState, valueState string) PortableFactState {
+	switch state {
+	case scanner.CaptureFactObserved:
+		return PortableFactObserved
+	case scanner.CaptureFactUnobserved:
+		return PortableFactUnobserved
+	case scanner.CaptureFactUnsupported:
+		return PortableFactUnsupported
+	case scanner.CaptureFactInconsistent:
+		return PortableFactInconsistent
+	default:
+		if valueState == "UNSUPPORTED" {
+			return PortableFactUnsupported
+		}
+		return PortableFactUnobserved
+	}
+}
+
+func portableFactAuthority(state PortableFactState) string {
+	if state == PortableFactUnsupported {
+		return "CAPTURE_PROFILE_DECLARATION"
+	}
+	return "CAPTURE_OBSERVATION"
+}
+
+func portableXAttrFact(facts scanner.XAttrFacts) (PortableFactState, PortableXAttrValue) {
+	state := facts.State
+	value := PortableXAttrValue{
+		State:      string(state),
+		Attributes: make([]PortableXAttr, 0, len(facts.Attributes)),
+		ReasonCode: facts.ReasonCode,
+	}
+	for _, attribute := range facts.Attributes {
+		value.Attributes = append(value.Attributes, PortableXAttr{Name: attribute.Name, Value: append([]byte(nil), attribute.Value...)})
+	}
+	sort.SliceStable(value.Attributes, func(i, j int) bool {
+		return value.Attributes[i].Name < value.Attributes[j].Name
+	})
+	if value.State == "" {
+		state = scanner.CaptureFactUnsupported
+		value.State = "UNSUPPORTED"
+		value.ReasonCode = "CAPTURE_PROFILE_DID_NOT_EMIT_XATTRS"
+	}
+	return portableCaptureFactState(state, value.State), value
+}
+
+func portableACLFact(facts scanner.ACLFacts) (PortableFactState, PortableACLValue) {
+	state := facts.State
+	value := PortableACLValue{
+		State:      string(state),
+		Format:     facts.Format,
+		Records:    make([]PortableACLRecord, 0, len(facts.Records)),
+		ReasonCode: facts.ReasonCode,
+	}
+	for _, record := range facts.Records {
+		value.Records = append(value.Records, PortableACLRecord{Name: record.Name, Raw: append([]byte(nil), record.Raw...)})
+	}
+	sort.SliceStable(value.Records, func(i, j int) bool {
+		return value.Records[i].Name < value.Records[j].Name
+	})
+	if value.State == "" {
+		state = scanner.CaptureFactUnsupported
+		value.State = "UNSUPPORTED"
+		value.ReasonCode = "CAPTURE_PROFILE_DID_NOT_EMIT_ACLS"
+	}
+	return portableCaptureFactState(state, value.State), value
 }
 
 func newManifestPortableFact(name string, state PortableFactState, sourceProfile, authority string, capturedAt time.Time, value any) (ManifestPortableFact, error) {

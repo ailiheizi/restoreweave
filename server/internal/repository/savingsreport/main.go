@@ -84,10 +84,24 @@ func main() {
 	fmt.Printf("duplicate bytes:           %d\n", report.DuplicateBytes)
 	fmt.Printf("compression saved bytes:   %d\n", report.CompressionSavedBytes)
 	fmt.Printf("physical stored bytes:     %d\n", report.PhysicalStoredBytes)
+	fmt.Printf("repository growth bytes:   %d\n", report.RepositoryGrowthBytes)
 	fmt.Printf("overhead bytes:            %d\n", report.OverheadBytes)
+	printOverheadCategory("overhead.repository_metadata", report.Overhead.RepositoryMetadata)
+	printOverheadCategory("overhead.recovery_records", report.Overhead.RecoveryRecords)
+	printOverheadCategory("overhead.index", report.Overhead.Index)
+	printOverheadCategory("overhead.model", report.Overhead.Model)
+	printOverheadCategory("overhead.temporary", report.Overhead.Temporary)
 	fmt.Printf("net physical savings:      %d\n", report.NetPhysicalSavingsBytes)
 	fmt.Printf("physical/logical ratio:    %.3f\n", ratio(report.PhysicalStoredBytes, report.LogicalBytes))
 	fmt.Printf("mechanisms:                %v\n", report.Mechanisms)
+}
+
+func printOverheadCategory(name string, category repository.SavingsOverheadCategory) {
+	if category.Status != repository.SavingsCategoryMeasured {
+		fmt.Printf("%-27s %s\n", name+":", category.Status)
+		return
+	}
+	fmt.Printf("%-27s %d\n", name+":", category.Bytes)
 }
 
 // corpusFiles returns the sorted regular files under the corpus directory.

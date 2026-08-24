@@ -1,6 +1,5 @@
 // Command restoreweaved runs the RestoreWeave control-plane daemon. It
-// exposes the client/command envelope protocol over a Unix socket, and
-// optionally a loopback OpenSubsonic/OPDS/Inbox facade over the same ABI.
+// exposes the client/command envelope protocol over a Unix socket.
 package main
 
 import (
@@ -12,14 +11,20 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
+	"time"
 
 	rwconfig "github.com/ailiheizi/restoreweave/config"
 	"github.com/ailiheizi/restoreweave/server/controlplane"
+	"github.com/ailiheizi/restoreweave/server/internal/api"
 	"github.com/ailiheizi/restoreweave/server/internal/exact"
-	"github.com/ailiheizi/restoreweave/server/internal/gateway/protocol"
+	"github.com/ailiheizi/restoreweave/server/internal/processor"
+	"github.com/ailiheizi/restoreweave/server/internal/processor/sandbox"
 	"github.com/ailiheizi/restoreweave/server/internal/repository"
+	"github.com/ailiheizi/restoreweave/server/internal/search"
 	"github.com/ailiheizi/restoreweave/server/internal/store/sqlite"
 )
 
@@ -45,19 +50,20 @@ func run() error {
 			"SQLite catalog path (overrides persisted config and RESTOREWEAVE_CATALOG)")
 		repositoryPath = flag.String("repository", "",
 			"Exact-lane repository path (overrides persisted config and RESTOREWEAVE_REPOSITORY)")
-		facadeListen = flag.String("facade-listen", "",
-			"Loopback OpenSubsonic/OPDS listen address (empty disables the facade)")
-		facadeToken = flag.String("facade-token", os.Getenv("RESTOREWEAVE_FACADE_TOKEN"),
-			"Shared token for the protocol facade (or RESTOREWEAVE_FACADE_TOKEN)")
-		facadeWorkspace = flag.String("facade-workspace", "",
-			"Workspace pinned to the protocol facade")
-		facadeSnapshot = flag.String("facade-snapshot", "",
-			"Optional snapshot pin for the protocol facade")
+		semanticBundle = flag.String("semantic-bundle", os.Getenv("RESTOREWEAVE_SEMANTIC_BUNDLE"),
+			"local semantic bundle root (overrides configured paths.models profile)")
+		apiListen               = flag.String("api-listen", "", "HTTP /api/v1 listen address (overrides api.listen; empty uses config)")
+		apiToken                = flag.String("api-token", os.Getenv("RESTOREWEAVE_API_TOKEN"), "Bearer token for HTTP /api/v1")
+		onnxWorkerProcessBundle = flag.String("onnx-worker-process", "",
+			"private host-supervisor ONNX worker bundle root")
 	)
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if strings.TrimSpace(*onnxWorkerProcessBundle) != "" {
+		return processor.RunONNXWorkerProcess(ctx, *onnxWorkerProcessBundle)
+	}
 	return runWithOptions(ctx, daemonOptions{
 		socketPath:        *socketPath,
 		recoveryReader:    *recoveryReader,
@@ -66,10 +72,9 @@ func run() error {
 		configPath:        *configPath,
 		catalogPath:       *catalogPath,
 		repositoryPath:    *repositoryPath,
-		facadeListen:      *facadeListen,
-		facadeToken:       *facadeToken,
-		facadeWorkspace:   *facadeWorkspace,
-		facadeSnapshot:    *facadeSnapshot,
+		semanticBundle:    *semanticBundle,
+		apiListen:         *apiListen,
+		apiToken:          *apiToken,
 	})
 }
 
@@ -81,10 +86,126 @@ type daemonOptions struct {
 	configPath        string
 	catalogPath       string
 	repositoryPath    string
-	facadeListen      string
-	facadeToken       string
-	facadeWorkspace   string
-	facadeSnapshot    string
+	semanticBundle    string
+	apiListen         string
+	apiToken          string
+}
+
+func configureSemanticBinding(ctx context.Context, resolved rwconfig.ResolvedConfig, store *sqlite.Store, bundleRoot string) (controlplane.DispatcherOption, func() error, error) {
+	if strings.TrimSpace(bundleRoot) == "" {
+		return nil, nil, nil
+	}
+	if strings.TrimSpace(resolved.Config.Semantic.EmbeddingMode) != "local" {
+		return nil, nil, fmt.Errorf("semantic.embedding_mode %q is not compatible with the admitted local bundle", resolved.Config.Semantic.EmbeddingMode)
+	}
+	if strings.TrimSpace(resolved.Config.Semantic.LocalProfile) != search.SemanticBundleBGEProfileID {
+		return nil, nil, fmt.Errorf("semantic.local_profile %q is not compatible with the admitted bundle profile %q", resolved.Config.Semantic.LocalProfile, search.SemanticBundleBGEProfileID)
+	}
+	if strings.TrimSpace(resolved.Config.Semantic.VectorBackend) != "zvec" {
+		return nil, nil, fmt.Errorf("semantic.vector_backend %q is not compatible with the admitted zvec bundle", resolved.Config.Semantic.VectorBackend)
+	}
+	bundle, err := search.LoadSemanticBundle(bundleRoot)
+	if err != nil {
+		return nil, nil, err
+	}
+	manifest, err := bundle.EmbeddingGenerationManifest(resolved.Digest)
+	if err != nil {
+		return nil, nil, err
+	}
+	owner := fmt.Sprintf("restoreweave-semantic-%d", os.Getpid())
+	leaseToken := fmt.Sprintf("semantic:%d", time.Now().UnixNano())
+	domain := resolved.Config.Recovery.PublicationDomain + ":semantic-worker"
+	now := time.Now()
+	fencer := exact.NewPublicationFencer(store, time.Now)
+	fenceToken, err := fencer.Acquire(ctx, domain, owner, leaseToken, now, now.Add(exact.DefaultPublicationFenceTTL))
+	if err != nil {
+		return nil, nil, fmt.Errorf("acquire semantic worker lease: %w", err)
+	}
+	validateLease := func(checkCtx context.Context) error {
+		return renewAndValidateSemanticLease(checkCtx, fencer, domain, owner, leaseToken, fenceToken, time.Now())
+	}
+	factory, err := processor.NewONNXSemanticEmbeddingProviderFactory(processor.ONNXWorkerSupervisorOptions{
+		BundleRoot: bundleRoot, ConfigDigest: resolved.Digest, FenceToken: fenceToken,
+		SandboxPolicyDigest: sandbox.PolicyDigest(), FenceValidator: validateLease,
+	})
+	if err != nil {
+		_ = fencer.Release(context.Background(), domain, owner, leaseToken, fenceToken, time.Now())
+		return nil, nil, err
+	}
+	probeCtx, cancelProbe := context.WithTimeout(ctx, 45*time.Second)
+	_, err = factory.Embed(probeCtx, search.SemanticEmbeddingRequest{
+		Purpose:      search.SemanticEmbeddingQuery,
+		GenerationID: "semantic-readiness-probe",
+		Manifest:     manifest,
+		Inputs: []search.SemanticTextInput{{
+			SegmentID: "query",
+			Language:  "zh",
+			Text:      "语义搜索就绪检查",
+		}},
+	})
+	cancelProbe()
+	if err != nil {
+		_ = fencer.Release(context.Background(), domain, owner, leaseToken, fenceToken, time.Now())
+		return nil, nil, fmt.Errorf("probe semantic worker: %w", err)
+	}
+	leaseCtx, stopLease := context.WithCancel(ctx)
+	leaseDone := make(chan struct{})
+	go keepSemanticLeaseAlive(leaseCtx, exact.DefaultPublicationFenceTTL/3, func(renewCtx context.Context) error {
+		return renewAndValidateSemanticLease(renewCtx, fencer, domain, owner, leaseToken, fenceToken, time.Now())
+	}, func(renewErr error) {
+		factory.Invalidate(renewErr)
+		log.Printf("semantic worker lease renewal: %v", renewErr)
+	}, leaseDone)
+	release := func() error {
+		stopLease()
+		<-leaseDone
+		factory.Invalidate(errors.New("semantic worker lease released"))
+		return fencer.Release(context.Background(), domain, owner, leaseToken, fenceToken, time.Now())
+	}
+	libraryPath := filepath.Join(bundleRoot, filepath.FromSlash(bundle.Descriptor.Zvec.Path))
+	libraryDigest := "sha256:" + bundle.AssetDigests["zvec"]
+	return controlplane.WithSemanticIndexerBinding(factory, search.NewZvecGenerationDriver(libraryPath), libraryPath, libraryDigest, manifest), release, nil
+}
+
+func keepSemanticLeaseAlive(ctx context.Context, interval time.Duration, renew func(context.Context) error, invalidate func(error), done chan<- struct{}) {
+	defer close(done)
+	if invalidate == nil {
+		return
+	}
+	if interval <= 0 || renew == nil {
+		invalidate(errors.New("semantic worker lease keepalive is not configured"))
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := renew(ctx); err != nil {
+				invalidate(err)
+				return
+			}
+		}
+	}
+}
+
+// renewAndValidateSemanticLease keeps a long-lived worker's coordination
+// lease alive while preserving the original fencing token. A takeover is
+// never adopted silently: the changed token fails the worker closed.
+func renewAndValidateSemanticLease(ctx context.Context, fencer exact.PublicationFencer, domain, owner, leaseToken string, fenceToken int64, now time.Time) error {
+	if fencer == nil {
+		return errors.New("semantic worker lease provider is unavailable")
+	}
+	renewed, err := fencer.Acquire(ctx, domain, owner, leaseToken, now, now.Add(exact.DefaultPublicationFenceTTL))
+	if err != nil {
+		return fmt.Errorf("renew semantic worker lease: %w", err)
+	}
+	if renewed != fenceToken {
+		return fmt.Errorf("semantic worker lease fencing token changed from %d to %d", fenceToken, renewed)
+	}
+	return fencer.Validate(ctx, domain, owner, leaseToken, fenceToken, now)
 }
 
 func runWithOptions(ctx context.Context, options daemonOptions) error {
@@ -144,8 +265,49 @@ func runWithOptions(ctx context.Context, options daemonOptions) error {
 		PublicationDomain:            resolved.Config.Recovery.PublicationDomain,
 		RequireSignedPublication:     true,
 	}
-	dispatcher := controlplane.NewDispatcher(store, catalogPath, options.socketPath,
-		controlplane.WithConfigDigest(resolved.Digest), controlplane.WithExact(exactLane))
+	bundleRoot := strings.TrimSpace(options.semanticBundle)
+	if bundleRoot == "" {
+		bundleRoot = filepath.Join(resolved.Config.Paths.Models, search.SemanticBundleBGEProfileID, runtime.GOOS+"-"+runtime.GOARCH)
+	}
+	semanticOption, semanticCleanup, semanticErr := configureSemanticBinding(ctx, resolved, store, bundleRoot)
+	if semanticErr != nil {
+		log.Printf("semantic capability unavailable: %v", semanticErr)
+	}
+	if semanticCleanup != nil {
+		defer func() {
+			if err := semanticCleanup(); err != nil {
+				log.Printf("semantic lease release: %v", err)
+			}
+		}()
+	}
+	indexBinding := search.IndexBinding{
+		ConfigDigest:         resolved.Digest,
+		LexicalProfileDigest: search.ProfileDigest(search.DimensionLexical, search.LexicalProfileV1),
+		GraphProfileDigest:   search.ProfileDigest(search.DimensionGraph, search.GraphProfileV1),
+	}
+	dispatcherOptions := []controlplane.DispatcherOption{
+		controlplane.WithConfigDigest(resolved.Digest), controlplane.WithIndexBinding(indexBinding),
+		controlplane.WithVectorPath(resolved.Config.Paths.Vectors), controlplane.WithExact(exactLane),
+	}
+	if semanticOption != nil {
+		dispatcherOptions = append(dispatcherOptions, semanticOption)
+	}
+	dispatcher := controlplane.NewDispatcher(store, catalogPath, options.socketPath, dispatcherOptions...)
+	if semanticOption != nil {
+		if workspace, workspaceErr := store.GetWorkspaceByName(ctx, "default"); workspaceErr == nil {
+			if warmErr := dispatcher.WarmSemanticGeneration(ctx, workspace.ID); warmErr != nil {
+				log.Printf("semantic generation warm-up unavailable: %v", warmErr)
+			}
+		} else if !errors.Is(workspaceErr, sqlite.ErrNotFound) {
+			log.Printf("semantic workspace lookup: %v", workspaceErr)
+		}
+	}
+	go func() {
+		_ = exactLane.RunProcessorRetryWorker(ctx, exact.ProcessorRetryWorkerOptions{
+			Owner:   fmt.Sprintf("restoreweaved-%d", os.Getpid()),
+			OnError: func(err error) { log.Printf("processor retry worker: %v", err) },
+		})
+	}()
 	server, err := controlplane.NewServer(dispatcher, options.socketPath,
 		controlplane.WithErrorHandler(func(err error) { log.Printf("%v", err) }))
 	if err != nil {
@@ -159,33 +321,26 @@ func runWithOptions(ctx context.Context, options daemonOptions) error {
 			log.Printf("serve: %v", err)
 		}
 	}()
-	log.Printf("restoreweaved listening on %s (catalog %s, repository %s)", server.SocketPath(), catalogPath, repositoryPath)
-
-	var facadeServer *http.Server
-	if strings.TrimSpace(options.facadeListen) != "" {
-		facade, err := protocol.New(dispatcher.Handle, protocol.Options{
-			WorkspaceID: options.facadeWorkspace,
-			SnapshotRef: options.facadeSnapshot,
-			Token:       options.facadeToken,
-			Listen:      options.facadeListen,
-		})
-		if err != nil {
-			_ = server.Close()
-			return fmt.Errorf("protocol facade: %w", err)
-		}
-		facadeServer = &http.Server{Addr: options.facadeListen, Handler: facade.Handler()}
+	apiAddress := strings.TrimSpace(options.apiListen)
+	if apiAddress == "" && resolved.Config.API.Enabled {
+		apiAddress = strings.TrimSpace(resolved.Config.API.Listen)
+	}
+	var apiServer *http.Server
+	if apiAddress != "" {
+		apiServer = &http.Server{Addr: apiAddress, Handler: api.Handler(dispatcher.Handle, api.Options{Token: options.apiToken})}
 		go func() {
-			log.Printf("protocol facade listening on %s (OpenSubsonic /opds /inbox, loopback only)", options.facadeListen)
-			if err := facadeServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Printf("protocol facade: %v", err)
+			log.Printf("restoreweaved API listening on %s", apiAddress)
+			if err := apiServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("api: %v", err)
 			}
 		}()
 	}
+	log.Printf("restoreweaved listening on %s (catalog %s, repository %s)", server.SocketPath(), catalogPath, repositoryPath)
 
 	<-ctx.Done()
 	log.Printf("shutting down")
-	if facadeServer != nil {
-		_ = facadeServer.Shutdown(context.Background())
+	if apiServer != nil {
+		_ = apiServer.Shutdown(context.Background())
 	}
 	if err := server.Close(); err != nil {
 		return fmt.Errorf("close control plane: %w", err)

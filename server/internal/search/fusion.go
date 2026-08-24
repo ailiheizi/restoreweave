@@ -3,6 +3,7 @@ package search
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 )
 
@@ -35,6 +36,11 @@ func (idx *Indexer) Fuse(ctx context.Context, req QueryRequest) (FuseResult, err
 	if idx == nil || idx.Store == nil || idx.Engine == nil {
 		return result, errors.New("search indexer requires a catalog and engine")
 	}
+	filters, err := NormalizeFilters(req.Filters)
+	if err != nil {
+		return result, fmt.Errorf("%w: %v", ErrInvalidQuery, err)
+	}
+	req.Filters = filters
 	dims, err := NormalizeFuse(req.Fuse)
 	if err != nil {
 		return result, err
