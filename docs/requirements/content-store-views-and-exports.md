@@ -667,7 +667,7 @@ This is the canonical checkout-status matrix. Other plans may add evidence, but 
 | In-process zvec generation/query | implemented and tested for the opt-in component profile | Real zvec build/open/query evidence and daemon generation-loss/rebuild evidence passed in the opt-in Linux arm64 environment; fixture dimensions do not count as zvec |
 | Fused default search | partial | Lexical + structured + real semantic fusion is wired and covered by the executed opt-in Linux arm64 daemon test; profile switching preserves old generations and durable descriptions, while the absence of a supported packaged bundle keeps the default experience honestly degraded |
 | Saved views and frozen export manifests | implemented and tested for the stated local scope | `rw view save/get/list/evaluate` and `rw export plan/apply/verify` work end-to-end with exact receipts; release qualification remains |
-| Inbox/OpenSubsonic/OPDS | optional compatibility experiments, maintenance-only | They cannot define or advance core completion |
+| Inbox/OpenSubsonic/OPDS | retired historical adapters | Their implementation has been removed; they do not define or advance core completion |
 | FUSE/mount/network filesystem | closed non-goal | External tools consume exports or authorized reads |
 | OpenList fork/core dependency | closed non-goal | Interoperation may be considered only outside core authority |
 | RWKV/Transformer codec | deferred optional profile | Cannot start before simple storage and recovery qualification |

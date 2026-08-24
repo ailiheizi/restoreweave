@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Added complete Chinese and English public README guides.
+- Reconciled public capability and roadmap wording with the tested core preview.
+- Marked the removed Inbox, OpenSubsonic, and OPDS adapters as historical.
+
 ## v0.1.0-prealpha.1 - 2026-08-25
 
 First core-preview checkpoint. This is a source build for development and
