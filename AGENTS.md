@@ -103,9 +103,11 @@ the stated development scope. It is not release-qualified. Work in this order:
 1. Complete the admitted xattr/ACL/sparse/detection fact profile and bind
    description, annotation, processor-artifact, and portable subject-mapping
    records into the authenticated closure. Terminal processor attempts use a
-   signed complete-state successor chain. Do not enable automatic retry or
-   reprocessing until the async worker also binds retry intent, idempotency,
-   reconciliation, and retry ceilings to that tested lineage.
+   signed complete-state successor chain. The admitted worker may perform only
+   bounded automatic retry of the same signed plan with retry intent,
+   idempotency, reconciliation, fencing, and retry ceilings bound to that
+   tested lineage. Do not enable arbitrary manual, rerouted, or general
+   reprocessing without a separately reviewed successor contract.
 2. Complete independently retained trust-anchor handling and the clean-install
    import/reader workflow.
 3. Add cross-process publication fencing or leases and unknown-outcome
