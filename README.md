@@ -263,7 +263,7 @@ Darwin ARM64 的默认位置示例：
 
 近期工作只聚焦把现有核心变成可发行产品：
 
-1. **正式后台任务：** 完成通用 async processor worker、retry intent、幂等、重启对账、fencing 和 retry ceiling。
+1. **正式后台任务：** 对现有同计划有界 retry worker 完成发行资格；为用户主动、换路线或通用 reprocessing 另行定义签名 successor contract。
 2. **离线安装包：** 打包 daemon、WebUI、ONNX Runtime、BGE model/tokenizer 和 zvec，安装后不依赖首次查询下载。
 3. **生产仓库资格：** 用代表性 corpus 比较并选定一个 lossless repository profile，完整验证 encryption、损坏、repair、搬迁、迁移、回滚、clean reader 和实际净节省。
 4. **完整日常体验：** 在 WebUI 中补齐可写配置、诊断、SavedView、ExportManifest、备份/升级/恢复引导，并让普通流程不要求用户处理内部 ID。

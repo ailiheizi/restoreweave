@@ -263,7 +263,7 @@ The model, ONNX Runtime, zvec, and Go binding each retain their own license, NOT
 
 Near-term work is limited to turning the existing core into a releasable product:
 
-1. **Formal background work:** complete the general async processor worker, retry intent, idempotency, restart reconciliation, fencing, and retry ceilings.
+1. **Formal background work:** release-qualify the existing bounded same-plan retry worker, and define a separate signed successor contract for user-triggered, rerouted, or general reprocessing.
 2. **Offline packaging:** package the daemon, WebUI, ONNX Runtime, BGE model/tokenizer, and zvec without first-query downloads.
 3. **Production repository qualification:** use representative corpora to select one lossless repository profile and fully test encryption, corruption, repair, relocation, migration, rollback, clean reading, and real net savings.
 4. **Complete daily experience:** expose writable configuration, diagnostics, SavedViews, ExportManifests, backup/upgrade/recovery guidance in the WebUI, and remove internal IDs from ordinary workflows.

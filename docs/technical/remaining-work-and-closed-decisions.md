@@ -91,9 +91,9 @@ generated default and does not close encryption release qualification.
 
 ## 5. Near-term release work
 
-1. **Formal asynchronous processing:** bind retry intent, idempotency,
-   reconciliation, fencing, restart behavior, and retry ceilings to the signed
-   processor lineage.
+1. **Formal asynchronous processing:** release-qualify the existing bounded
+   same-plan worker, and define a separate signed successor contract for
+   user-triggered, rerouted, or general reprocessing.
 2. **Supported offline semantic packaging:** distribute the daemon, ONNX
    Runtime, pinned BGE model/tokenizer, and zvec library without a first-query
    download.
