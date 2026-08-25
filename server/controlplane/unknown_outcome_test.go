@@ -188,6 +188,9 @@ func TestPlanApplyReplayReconcilesNeedsReconciliationJobFromCommittedPublication
 	if !data.AlreadyApplied || data.JobID != jobID || data.SnapshotRef != committed.SnapshotRef || data.ManifestDigest != committed.ManifestDigest {
 		t.Fatalf("reconciled result = %+v, committed = %+v", data, committed)
 	}
+	if data.SavingsMeasured || data.NewPhysicalBytes != 0 || data.CompressionSavedBytes != 0 {
+		t.Fatalf("reconciliation inferred savings without persisted placement receipts: %+v", data)
+	}
 	if got := phase2PublicationCount(t, h.store); got != publicationCount {
 		t.Fatalf("reconciliation created a publication: before=%d after=%d", publicationCount, got)
 	}
@@ -289,6 +292,9 @@ BEFORE INSERT ON publications BEGIN SELECT RAISE(ABORT, 'injected projection fai
 	}
 	if !replayData.AlreadyApplied || replayData.SnapshotRef != partial.Data.SnapshotRef {
 		t.Fatalf("reconciled result = %+v, partial = %+v", replayData, partial.Data)
+	}
+	if replayData.SavingsMeasured != partial.Data.SavingsMeasured || replayData.NewPhysicalBytes != partial.Data.NewPhysicalBytes || replayData.CompressionSavedBytes != partial.Data.CompressionSavedBytes {
+		t.Fatalf("reconciliation changed persisted savings without new receipts: replay=%+v partial=%+v", replayData, partial.Data)
 	}
 	commitsAfter, err := repo.ListRecordDigests(ctx, repository.RecordPublicationCommit)
 	if err != nil || len(commitsAfter) != 1 || commitsAfter[0] != commits[0] {

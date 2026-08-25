@@ -23,7 +23,7 @@ func TestEngineBuildQueryAndUnavailableAfterDelete(t *testing.T) {
 			Duplicates:   "duplicate same-content count 2",
 			Protection:   "STORE_EXACT EXACT_PROTECTED",
 			Locators:     "HTTPS example.test/archive",
-			Tags:         "reviewed inbox",
+			Tags:         "reviewed inbox topic:restoreweave",
 			Notes:        "quarterly experiment report",
 			Descriptions: "主角在废墟中寻找失落城市",
 			Extracted:    "unique extract token",
@@ -50,6 +50,14 @@ func TestEngineBuildQueryAndUnavailableAfterDelete(t *testing.T) {
 	}
 	if len(hits) != 1 {
 		t.Fatalf("tag hits = %+v", hits)
+	}
+
+	hits, err = engine.Query(ctx, path, "topic:restoreweave", nil)
+	if err != nil {
+		t.Fatalf("Query namespaced tag: %v", err)
+	}
+	if len(hits) != 1 || !containsAxis(hits[0].ConstructAxes, AxisTags) {
+		t.Fatalf("namespaced tag hits = %+v", hits)
 	}
 
 	hits, err = engine.Query(ctx, path, "quarterly", nil)

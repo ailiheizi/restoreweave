@@ -165,15 +165,52 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
-	nodes, err := idx.Store.ListNamespaceSubtree(ctx, workspaceID, namespaceRootID, "")
-	if err != nil {
-		return generation, err
+	// A committed rebuild represents the current library, which may contain
+	// several sources. Keep the newest published root for every source instead
+	// of silently narrowing the index to the publication that triggered this
+	// rebuild. Low-level callers without any publication retain the historical
+	// root-scoped behavior used by import and fixture harnesses.
+	_, publicationErr := idx.Store.LatestPublication(ctx, workspaceID)
+	useLatestSources := publicationErr == nil
+	if publicationErr != nil && !errors.Is(publicationErr, sqlite.ErrNotFound) {
+		return generation, publicationErr
+	}
+	var (
+		err   error
+		nodes []sqlite.NamespaceNode
+	)
+	var entries []sqlite.NamespaceEntry
+	if useLatestSources {
+		entries, err = idx.Store.ListLatestNamespaceEntries(ctx, workspaceID)
+		if err != nil {
+			return generation, err
+		}
+		nodes = make([]sqlite.NamespaceNode, 0, len(entries))
+		for _, entry := range entries {
+			nodes = append(nodes, sqlite.NamespaceNode{Entry: entry})
+		}
+	} else {
+		nodes, err = idx.Store.ListNamespaceSubtree(ctx, workspaceID, namespaceRootID, "")
+		if err != nil {
+			return generation, err
+		}
+	}
+	currentSubjects := make(map[string]struct{}, len(nodes))
+	for _, node := range nodes {
+		currentSubjects[node.Entry.ID] = struct{}{}
 	}
 	annotations, err := idx.Store.ListAnnotations(ctx, workspaceID, "", false)
 	if err != nil {
 		return generation, err
 	}
-	artifacts, err := idx.Store.ListAdmittedArtifacts(ctx, workspaceID, snapshotRef)
+	artifactSnapshotRef := snapshotRef
+	if useLatestSources {
+		// Derived facts are durable per subject. Loading all records here lets
+		// the current-subject filter below retain facts from older sources while
+		// excluding superseded roots.
+		artifactSnapshotRef = ""
+	}
+	artifacts, err := idx.Store.ListAdmittedArtifacts(ctx, workspaceID, artifactSnapshotRef)
 	if err != nil {
 		return generation, err
 	}
@@ -193,7 +230,11 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 	if err != nil {
 		return generation, err
 	}
-	attempts, err := idx.Store.ListProcessorAttempts(ctx, workspaceID, snapshotRef)
+	attemptSnapshotRef := snapshotRef
+	if useLatestSources {
+		attemptSnapshotRef = ""
+	}
+	attempts, err := idx.Store.ListProcessorAttempts(ctx, workspaceID, attemptSnapshotRef)
 	if err != nil {
 		return generation, err
 	}
@@ -214,6 +255,9 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 	recoveryBySubject := map[string][]string{}
 	duplicateGroupBySubject := map[string]string{}
 	for _, record := range annotations {
+		if _, ok := currentSubjects[record.SubjectRef]; !ok {
+			continue
+		}
 		switch record.Kind {
 		case sqlite.AnnotationTag:
 			tagsBySubject[record.SubjectRef] = append(tagsBySubject[record.SubjectRef], record.Body)
@@ -244,6 +288,9 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 			attempt.Stage, attempt.CapabilityID, attempt.Status, attempt.ReasonCode)
 	}
 	for _, description := range descriptions {
+		if _, ok := currentSubjects[description.SubjectRef]; !ok {
+			continue
+		}
 		descriptionsBySubject[description.SubjectRef] = append(descriptionsBySubject[description.SubjectRef],
 			description.Title, description.Language, description.Body, string(description.Kind), description.SourceRef)
 		if description.ID == "" {

@@ -209,6 +209,11 @@ func (s *Store) GetAnnotation(ctx context.Context, workspaceID, annotationID str
 WHERE workspace_id = ? AND annotation_id = ?`, workspaceID, annotationID))
 }
 
+func (tx *Tx) GetAnnotation(ctx context.Context, workspaceID, annotationID string) (Annotation, error) {
+	return scanAnnotation(tx.tx.QueryRowContext(ctx, annotationSelect+`
+WHERE workspace_id = ? AND annotation_id = ?`, workspaceID, annotationID))
+}
+
 func (s *Store) ListAnnotations(ctx context.Context, workspaceID, subjectRef string, includeTombstones bool) ([]Annotation, error) {
 	query := annotationSelect + `WHERE workspace_id = ?`
 	args := []any{workspaceID}

@@ -4,6 +4,8 @@ const (
 	OpStatusGet            = "status.get"
 	OpDoctorCheck          = "doctor.check"
 	OpCapabilityList       = "capability.list"
+	OpConfigGet            = "config.get"
+	OpConfigUpdate         = "config.update"
 	OpSnapshotList         = "snapshot.list"
 	OpSnapshotDiff         = "snapshot.diff"
 	OpSnapshotVerify       = "snapshot.verify"
@@ -18,6 +20,7 @@ const (
 	OpRecoveryExport       = "recovery.export"
 	OpRecoveryAnchorExport = "recovery.anchor.export"
 	OpNamespaceList        = "namespace.list"
+	OpContentList          = "content.list"
 	OpNamespaceResolve     = "namespace.resolve"
 	OpNamespaceStat        = "namespace.stat"
 	OpNamespaceReadlink    = "namespace.readlink"
@@ -52,6 +55,8 @@ func KnownOperations() []string {
 		OpStatusGet,
 		OpDoctorCheck,
 		OpCapabilityList,
+		OpConfigGet,
+		OpConfigUpdate,
 		OpSnapshotList,
 		OpSnapshotDiff,
 		OpSnapshotVerify,
@@ -66,6 +71,7 @@ func KnownOperations() []string {
 		OpRecoveryExport,
 		OpRecoveryAnchorExport,
 		OpNamespaceList,
+		OpContentList,
 		OpNamespaceResolve,
 		OpNamespaceStat,
 		OpNamespaceReadlink,

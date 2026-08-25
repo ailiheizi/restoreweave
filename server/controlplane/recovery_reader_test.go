@@ -117,6 +117,9 @@ func TestRecoveryReaderPlanApplyIsCatalogFreeDigestBoundAndIdempotent(t *testing
 	if len(listData.Snapshots) != 1 || listData.Snapshots[0].SnapshotRef != snapshotRef {
 		t.Fatalf("snapshot.list data = %+v", listData)
 	}
+	if listData.Snapshots[0].WorkspaceID != "" || listData.Snapshots[0].NamespaceRootID != "" {
+		t.Fatalf("clean reader exposed catalog browse projection: %+v", listData.Snapshots[0])
+	}
 
 	verified := reader.Handle(ctx, mustEnvelope(t, command.OpSnapshotVerify, map[string]any{
 		"snapshot_ref": snapshotRef, "mode": command.VerifyFullBytes,

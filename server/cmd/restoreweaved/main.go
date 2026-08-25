@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ailiheizi/restoreweave/client/command"
 	rwconfig "github.com/ailiheizi/restoreweave/config"
 	"github.com/ailiheizi/restoreweave/server/controlplane"
 	"github.com/ailiheizi/restoreweave/server/internal/api"
@@ -167,6 +168,25 @@ func configureSemanticBinding(ctx context.Context, resolved rwconfig.ResolvedCon
 	return controlplane.WithSemanticIndexerBinding(factory, search.NewZvecGenerationDriver(libraryPath), libraryPath, libraryDigest, manifest), release, nil
 }
 
+func semanticBundleCapability(bundleRoot string) command.Capability {
+	capability := command.Capability{
+		Kind:    "model-bundle",
+		ID:      search.SemanticBundleBGEProfileID,
+		State:   command.CapabilityUnavailable,
+		Version: "1",
+		Source:  "BAAI/bge-small-zh-v1.5",
+		Notes:   "local semantic bundle is not installed or has not passed integrity admission",
+	}
+	bundle, err := search.LoadSemanticBundle(strings.TrimSpace(bundleRoot))
+	if err != nil {
+		return capability
+	}
+	capability.State = command.CapabilityAvailable
+	capability.Version = bundle.ProfileDigest
+	capability.Notes = "bundle is installed and locally verified; semantic index readiness is reported separately"
+	return capability
+}
+
 func keepSemanticLeaseAlive(ctx context.Context, interval time.Duration, renew func(context.Context) error, invalidate func(error), done chan<- struct{}) {
 	defer close(done)
 	if invalidate == nil {
@@ -269,6 +289,7 @@ func runWithOptions(ctx context.Context, options daemonOptions) error {
 	if bundleRoot == "" {
 		bundleRoot = filepath.Join(resolved.Config.Paths.Models, search.SemanticBundleBGEProfileID, runtime.GOOS+"-"+runtime.GOARCH)
 	}
+	bundleCapability := semanticBundleCapability(bundleRoot)
 	semanticOption, semanticCleanup, semanticErr := configureSemanticBinding(ctx, resolved, store, bundleRoot)
 	if semanticErr != nil {
 		log.Printf("semantic capability unavailable: %v", semanticErr)
@@ -287,6 +308,8 @@ func runWithOptions(ctx context.Context, options daemonOptions) error {
 	}
 	dispatcherOptions := []controlplane.DispatcherOption{
 		controlplane.WithConfigDigest(resolved.Digest), controlplane.WithIndexBinding(indexBinding),
+		controlplane.WithOperatorConfig(resolved),
+		controlplane.WithSemanticBundleCapability(bundleCapability),
 		controlplane.WithVectorPath(resolved.Config.Paths.Vectors), controlplane.WithExact(exactLane),
 	}
 	if semanticOption != nil {
@@ -321,9 +344,9 @@ func runWithOptions(ctx context.Context, options daemonOptions) error {
 			log.Printf("serve: %v", err)
 		}
 	}()
-	apiAddress := strings.TrimSpace(options.apiListen)
-	if apiAddress == "" && resolved.Config.API.Enabled {
-		apiAddress = strings.TrimSpace(resolved.Config.API.Listen)
+	apiAddress, err := resolveAPIAddress(options.apiListen, resolved.Config.API)
+	if err != nil {
+		return err
 	}
 	var apiServer *http.Server
 	if apiAddress != "" {
@@ -347,6 +370,20 @@ func runWithOptions(ctx context.Context, options daemonOptions) error {
 	}
 	<-serveDone
 	return nil
+}
+
+func resolveAPIAddress(override string, configured rwconfig.APIConfig) (string, error) {
+	address := strings.TrimSpace(override)
+	if address == "" && configured.Enabled {
+		address = configured.Listen
+	}
+	if address == "" {
+		return "", nil
+	}
+	if err := rwconfig.ValidateLoopbackAPIListen(address); err != nil {
+		return "", fmt.Errorf("start local HTTP adapter: %w", err)
+	}
+	return address, nil
 }
 
 func runRecoveryReader(ctx context.Context, options daemonOptions) error {

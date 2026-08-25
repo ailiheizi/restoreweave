@@ -379,7 +379,10 @@ func planApplyDataFromIngestResult(plan sqlite.Plan, result exact.IngestResult) 
 		RootID: result.RootID, SnapshotRef: result.SnapshotRef, ManifestDigest: result.ManifestDigest,
 		ProtectionDigest:    result.ProtectionDigest,
 		ProtectionDecisions: protectionDecisionsForCommand(result.ProtectionDecisions),
-		Files:               result.Files, Bytes: result.Bytes, Warnings: append([]string(nil), result.Warnings...),
+		Files:               result.Files, Bytes: result.Bytes, LocalBytes: result.LocalBytes,
+		NewBytes: result.NewBytes, Warnings: append([]string(nil), result.Warnings...),
+		SavingsMeasured: result.SavingsMeasured, NewPhysicalBytes: result.NewPhysicalBytes,
+		CompressionSavedBytes: result.CompressionSavedBytes,
 	}
 }
 
@@ -457,6 +460,13 @@ func (d *Dispatcher) replayPlanApplyJob(
 			case "INGEST":
 				if reconciled, err := d.exact.ReconcileIngestPublicationCompletion(ctx, plan.WorkspaceID, plan.PlanDigest); err == nil {
 					data := planApplyDataFromIngestResult(plan, reconciled)
+					// Reconciliation has no placement receipt transport. Preserve
+					// the diagnostic measured by the original apply job when it
+					// crossed the publication boundary; otherwise it remains
+					// unavailable rather than being inferred from the repository.
+					data.SavingsMeasured = stored.Data.SavingsMeasured
+					data.NewPhysicalBytes = stored.Data.NewPhysicalBytes
+					data.CompressionSavedBytes = stored.Data.CompressionSavedBytes
 					data.JobID = job.ID
 					data.AlreadyApplied = true
 					if finishErr := d.finishPlanApplyJob(ctx, env, job, sqlite.JobSucceeded, data, "", ""); finishErr != nil {

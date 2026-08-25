@@ -72,6 +72,9 @@ func TestDispatcherExactIngestAndRestore(t *testing.T) {
 	if applyData.AlreadyApplied || applyData.SnapshotRef == "" {
 		t.Fatalf("apply data = %+v", applyData)
 	}
+	if !applyData.SavingsMeasured || applyData.LocalBytes != int64(len("exact-lane")) || applyData.NewBytes != int64(len("exact-lane")) || applyData.NewPhysicalBytes != int64(len("exact-lane")) || applyData.CompressionSavedBytes != 0 {
+		t.Fatalf("apply savings data = %+v", applyData)
+	}
 	ingestData.SnapshotRef = applyData.SnapshotRef
 	ingestData.ManifestDigest = applyData.ManifestDigest
 	ingestData.RootID = applyData.RootID
@@ -88,6 +91,9 @@ func TestDispatcherExactIngestAndRestore(t *testing.T) {
 	if replayed.Status != command.StatusSucceeded || !replayData.AlreadyApplied || replayData.SnapshotRef != ingestData.SnapshotRef {
 		t.Fatalf("replayed apply = %q %+v", replayed.Status, replayData)
 	}
+	if replayData.SavingsMeasured != applyData.SavingsMeasured || replayData.LocalBytes != applyData.LocalBytes || replayData.NewBytes != applyData.NewBytes || replayData.NewPhysicalBytes != applyData.NewPhysicalBytes || replayData.CompressionSavedBytes != applyData.CompressionSavedBytes {
+		t.Fatalf("replayed savings changed: first=%+v replay=%+v", applyData, replayData)
+	}
 	wrong := dispatcher.Handle(context.Background(), mustEnvelope(t, command.OpPlanApply, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
 		"plan_id":      ingestData.PlanID,
@@ -100,6 +106,13 @@ func TestDispatcherExactIngestAndRestore(t *testing.T) {
 	listed := dispatcher.Handle(context.Background(), mustEnvelope(t, command.OpSnapshotList, map[string]any{}))
 	if listed.Status != command.StatusSucceeded {
 		t.Fatalf("snapshot.list = %q: %+v", listed.Status, listed.Reasons)
+	}
+	var snapshotData command.SnapshotListData
+	if err := json.Unmarshal(listed.Data, &snapshotData); err != nil {
+		t.Fatalf("decode snapshot list: %v", err)
+	}
+	if len(snapshotData.Snapshots) != 1 || snapshotData.Snapshots[0].WorkspaceID != ingestData.WorkspaceID || snapshotData.Snapshots[0].NamespaceRootID != ingestData.RootID {
+		t.Fatalf("snapshot browse projection = %+v", snapshotData.Snapshots)
 	}
 
 	verified := dispatcher.Handle(context.Background(), mustEnvelope(t, command.OpSnapshotVerify, map[string]any{
@@ -272,6 +285,57 @@ func TestDispatcherExactIngestAndRestore(t *testing.T) {
 	if item.Class != command.RepresentationClassExact || !item.Authoritative ||
 		item.Placement != command.RepresentationPlacementPresent || item.Verified == nil || !*item.Verified {
 		t.Fatalf("exact representation = %+v", item)
+	}
+}
+
+func TestDispatcherPlanApplyPersistsExactDuplicateSavingsAndReplaysIt(t *testing.T) {
+	store := testutil.OpenStore(t, filepath.Join(t.TempDir(), "catalog.sqlite"))
+	repo, err := repository.OpenDir(filepath.Join(t.TempDir(), "repository"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatcher := NewDispatcher(store, "catalog.sqlite", "/tmp/rw.sock", WithExact(&exact.Service{Store: store, Repo: repo}))
+	root := t.TempDir()
+	payload := []byte("duplicate plan apply payload")
+	if err := os.WriteFile(filepath.Join(root, "first.txt"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "second.txt"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	planned := dispatcher.Handle(context.Background(), mustEnvelope(t, command.OpPlanIngest, map[string]any{"root": root}))
+	if planned.Status != command.StatusSucceeded {
+		t.Fatalf("plan.ingest = %q: %+v", planned.Status, planned.Reasons)
+	}
+	var plan command.PlanIngestData
+	if err := json.Unmarshal(planned.Data, &plan); err != nil {
+		t.Fatal(err)
+	}
+	applied := dispatcher.Handle(context.Background(), mustEnvelope(t, command.OpPlanApply, map[string]any{
+		"workspace_id": plan.WorkspaceID, "plan_id": plan.PlanID, "plan_digest": plan.PlanDigest,
+	}))
+	if applied.Status != command.StatusSucceeded {
+		t.Fatalf("plan.apply = %q: %+v", applied.Status, applied.Reasons)
+	}
+	var first command.PlanApplyData
+	if err := json.Unmarshal(applied.Data, &first); err != nil {
+		t.Fatal(err)
+	}
+	if !first.SavingsMeasured || first.Bytes != int64(len(payload))*2 || first.LocalBytes != int64(len(payload))*2 || first.NewBytes != int64(len(payload)) || first.NewPhysicalBytes != int64(len(payload)) || first.CompressionSavedBytes != 0 {
+		t.Fatalf("duplicate savings = %+v", first)
+	}
+	replayed := dispatcher.Handle(context.Background(), mustEnvelope(t, command.OpPlanApply, map[string]any{
+		"workspace_id": plan.WorkspaceID, "plan_id": plan.PlanID, "plan_digest": plan.PlanDigest,
+	}))
+	if replayed.Status != command.StatusSucceeded {
+		t.Fatalf("replayed plan.apply = %q: %+v", replayed.Status, replayed.Reasons)
+	}
+	var second command.PlanApplyData
+	if err := json.Unmarshal(replayed.Data, &second); err != nil {
+		t.Fatal(err)
+	}
+	if !second.AlreadyApplied || second.SavingsMeasured != first.SavingsMeasured || second.LocalBytes != first.LocalBytes || second.NewBytes != first.NewBytes || second.NewPhysicalBytes != first.NewPhysicalBytes || second.CompressionSavedBytes != first.CompressionSavedBytes {
+		t.Fatalf("replayed duplicate savings = %+v, first = %+v", second, first)
 	}
 }
 

@@ -18,6 +18,7 @@ The following decisions are frozen for `RW-MVP-1`. Changing one requires an expl
 | --- | --- |
 | Product shape | A content, description, discovery, export, and recovery plane; not a normal writable filesystem or a media application |
 | Organization | Stable subjects, durable facts, tags, descriptions, relations, saved views, and frozen exports; original paths are provenance and a recovery projection |
+| Tag organization | Durable multi-value `Annotation.TAG` facts are the `RW-MVP-1` user taxonomy; deterministic type and format facets remain system facts, and machine suggestions never silently replace user tags |
 | Exact identity | SHA-256 over the complete logical byte stream plus logical length |
 | Default deduplication claim | Exact whole-content deduplication only; repository-private verified chunk deduplication may add savings |
 | Protection default | `STORE_EXACT`; `LINK_ONLY` is explicit, confirmed, visibly unprotected until qualified reacquisition succeeds |
@@ -61,6 +62,23 @@ source trees / application exports / object sources
 ~~~
 
 The authoritative collection is not a writable directory tree. A folder-shaped result is one possible materialization of an immutable subject set. The system MAY retain and restore original paths, but daily organization SHOULD be driven by tags, annotations, relations, structured fields, search, and saved views.
+
+The default library view MUST be content-first rather than a traversal of the
+latest source tree. Original paths remain visible as provenance and MAY be
+offered as a secondary browse projection for recovery-oriented work. A normal
+library workflow MUST NOT require the user to navigate source directories or
+know internal workspace, root, entry, or subject identifiers.
+
+For `RW-MVP-1`, user taxonomy reuses durable multi-value `Annotation.TAG`
+facts. The set of live tag values used in a workspace MAY be projected as the
+available tag vocabulary; an additional tag-definition store, hierarchy, or
+second catalog is not required. Entry type, suffix, and admitted detection
+facts MAY be presented through stable system facets such as `type:video` or
+`format:mp4`, but they MUST NOT be copied into operator-authored tags or
+inferred by a language model. Machine-assisted reclassification is an
+explicit preview-and-confirm operation: it records its producer/profile, does
+not silently remove user tags, and has no authority over content identity,
+deduplication, recovery, or garbage collection.
 
 RestoreWeave therefore resembles a Nix-style store in four limited ways:
 

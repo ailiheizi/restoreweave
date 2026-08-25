@@ -418,18 +418,10 @@ func queryTokens(text string) []string {
 		if token == "" {
 			return
 		}
-		token = strings.Map(func(r rune) rune {
-			if unicode.IsLetter(r) || unicode.IsNumber(r) {
-				return r
-			}
-			return -1
-		}, token)
-		if token != "" {
-			tokens = append(tokens, token)
-		}
+		tokens = append(tokens, token)
 	}
 	for _, r := range text {
-		if unicode.IsSpace(r) {
+		if !unicode.IsLetter(r) && !unicode.IsNumber(r) {
 			flush()
 			continue
 		}

@@ -14,8 +14,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -820,17 +822,42 @@ func validate(cfg Config, resolvedPaths bool) error {
 		return err
 	}
 	if cfg.API.Enabled {
-		if strings.TrimSpace(cfg.API.Listen) == "" {
-			return errors.New("api.listen is required when api.enabled is true")
-		}
-		if strings.TrimSpace(cfg.API.Listen) != cfg.API.Listen || strings.ContainsFunc(cfg.API.Listen, unicode.IsControl) {
-			return errors.New("api.listen must be a non-whitespace listener address")
+		if err := ValidateLoopbackAPIListen(cfg.API.Listen); err != nil {
+			return err
 		}
 	}
 	if resolvedPaths {
 		if err := validatePathSeparation(cfg.Paths); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// ValidateLoopbackAPIListen keeps the current convenience adapter on the
+// local machine. Remote HTTP exposure requires a separately qualified profile
+// with authentication, authorization, TLS, origin controls, and audit.
+func ValidateLoopbackAPIListen(value string) error {
+	if strings.TrimSpace(value) == "" {
+		return errors.New("api.listen is required when api.enabled is true")
+	}
+	if strings.TrimSpace(value) != value || strings.ContainsFunc(value, unicode.IsControl) {
+		return errors.New("api.listen must be a non-whitespace listener address")
+	}
+	host, portText, err := net.SplitHostPort(value)
+	if err != nil {
+		return fmt.Errorf("api.listen must be a host:port loopback address: %w", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return errors.New("api.listen must use a numeric port from 1 through 65535")
+	}
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return errors.New("api.listen must use localhost or a loopback IP address in the current local profile")
 	}
 	return nil
 }

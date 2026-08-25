@@ -87,6 +87,23 @@ func TestDescriptionProviderIsRequiredOnlyForOnIngest(t *testing.T) {
 	}
 }
 
+func TestAPIListenRequiresCurrentLocalLoopbackProfile(t *testing.T) {
+	for _, address := range []string{"127.0.0.1:4534", "localhost:4534", "[::1]:4534"} {
+		cfg := Default()
+		cfg.API = APIConfig{Enabled: true, Listen: address}
+		if err := Validate(cfg); err != nil {
+			t.Fatalf("loopback address %q rejected: %v", address, err)
+		}
+	}
+	for _, address := range []string{"", ":4534", "0.0.0.0:4534", "192.0.2.10:4534", "example.com:4534", "127.0.0.1:0", "127.0.0.1:http"} {
+		cfg := Default()
+		cfg.API = APIConfig{Enabled: true, Listen: address}
+		if err := Validate(cfg); err == nil {
+			t.Fatalf("non-local or invalid address %q unexpectedly validated", address)
+		}
+	}
+}
+
 func TestStorageProfileTuples(t *testing.T) {
 	tests := []struct {
 		name        string

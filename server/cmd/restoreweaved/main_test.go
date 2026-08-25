@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -131,6 +132,77 @@ func TestValidateRuntimeStorageProfileRejectsSilentlyIgnoredProfiles(t *testing.
 	}
 }
 
+func TestSemanticBundleCapabilityRejectsMissingOrCorruptBundle(t *testing.T) {
+	missing := semanticBundleCapability(filepath.Join(t.TempDir(), "missing"))
+	if missing.Kind != "model-bundle" || missing.ID != search.SemanticBundleBGEProfileID || missing.State != command.CapabilityUnavailable {
+		t.Fatalf("missing bundle capability = %+v, want model-bundle unavailable", missing)
+	}
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, search.SemanticBundleManifestName), []byte(`{"schema":"not-a-bundle"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	corrupt := semanticBundleCapability(root)
+	if corrupt.State != command.CapabilityUnavailable {
+		t.Fatalf("corrupt bundle capability = %+v, want UNAVAILABLE", corrupt)
+	}
+}
+
+func TestSemanticBundleCapabilityAcceptsAdmittedBundleWithoutIndexReadiness(t *testing.T) {
+	sourceRoot := t.TempDir()
+	destination := filepath.Join(t.TempDir(), "bundle")
+	descriptor := search.SemanticBundleDescriptor{
+		Schema: search.SemanticBundleSchemaV1, ProfileID: search.SemanticBundleBGEProfileID,
+		PlatformOS: runtime.GOOS, PlatformArch: runtime.GOARCH,
+		ONNXRuntimeVersion: "1.29.0", ONNXRuntimeBuild: "test-runtime",
+		ONNXRuntimeCAPI:     search.SemanticBundleONNXRuntimeCAPI,
+		ONNXGoBindingCommit: "test-binding", ONNXGoBindingCAPI: search.SemanticBundleONNXRuntimeCAPI,
+		ModelID: "BAAI/bge-small-zh-v1.5", ModelRevision: "test-model-revision",
+		ModelExport: "onnx-last-hidden-state", ONNXOpset: 11,
+		ModelLicenseID: "BAAI/bge-small-zh-v1.5:MIT", TokenizerVersion: "test-tokenizer",
+		TokenizerRevision: "test-tokenizer-revision", ZvecVersion: "0.6.0",
+		ZvecBuild: "test-zvec", ZvecGoVersion: "0.6.0", ZvecGoCommit: "test-zvec-go",
+		LicenseExpression:   search.SemanticBundleLicenseExpression,
+		PreprocessingDigest: "sha256:" + strings.Repeat("a", 64),
+		QueryPrefix:         search.SemanticBundleBGEQueryPrefix, DocumentPrefix: search.SemanticBundleBGEDocumentPrefix,
+		MaxTokens: search.SemanticBundleBGEMaxTokens, Pooling: search.SemanticBundleBGEPooling,
+		Normalization: search.SemanticBundleBGENormalization, ElementType: search.SemanticBundleBGEElementType,
+		Dimension: search.SemanticBundleBGEDimension, VectorSchema: search.SemanticBundleBGEVectorSchema,
+		SemanticSpace: search.SemanticBundleBGESemanticSpace, Distance: search.SemanticBundleBGEDistance,
+		IndexConfig: search.ZvecIndexConfigV1, QueryConfig: search.ZvecQueryConfigV1,
+	}
+	sources := map[string]string{}
+	asset := func(name string) search.SemanticBundleAsset {
+		payload := []byte("restoreweave " + name + " test asset")
+		source := filepath.Join(sourceRoot, name+".source")
+		if err := os.WriteFile(source, payload, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		digest := sha256.Sum256(payload)
+		sources[name] = source
+		return search.SemanticBundleAsset{Path: name + ".bin", SHA256: hex.EncodeToString(digest[:]), Size: uint64(len(payload))}
+	}
+	descriptor.Runtime = asset("runtime")
+	descriptor.ONNXBinding = asset("onnx_binding")
+	descriptor.ONNXCAPI = asset("onnx_c_api")
+	descriptor.Model = asset("model")
+	descriptor.Tokenizer = asset("tokenizer")
+	descriptor.Profile = asset("profile")
+	descriptor.Zvec = asset("zvec")
+	descriptor.ZvecGo = asset("zvec_go")
+	descriptor.License = asset("license")
+	descriptor.Notice = asset("notice")
+	descriptor.SBOM = asset("sbom")
+	descriptor.ONNXGoBindingDigest = descriptor.ONNXBinding.SHA256
+	if _, err := search.PackageSemanticBundle(destination, descriptor, sources); err != nil {
+		t.Fatalf("package test bundle: %v", err)
+	}
+	capability := semanticBundleCapability(destination)
+	if capability.State != command.CapabilityAvailable || capability.Version == "" {
+		t.Fatalf("admitted bundle capability = %+v, want AVAILABLE with profile digest", capability)
+	}
+}
+
 func TestValidateRuntimeStorageProfileAcceptsCurrentDevelopmentProfile(t *testing.T) {
 	if err := validateRuntimeStorageProfile(rwconfig.Default()); err != nil {
 		t.Fatal(err)
@@ -143,6 +215,22 @@ func TestValidateRuntimeStorageProfileAcceptsLocalZstdCandidate(t *testing.T) {
 	cfg.Storage.CompressionProfile = rwconfig.CompressionProfileZstdV1
 	if err := validateRuntimeStorageProfile(cfg); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestResolveAPIAddressKeepsCurrentAdapterOnLoopback(t *testing.T) {
+	configured := rwconfig.APIConfig{Enabled: true, Listen: "127.0.0.1:4534"}
+	if got, err := resolveAPIAddress("", configured); err != nil || got != configured.Listen {
+		t.Fatalf("configured address = %q, %v", got, err)
+	}
+	if got, err := resolveAPIAddress("localhost:4535", configured); err != nil || got != "localhost:4535" {
+		t.Fatalf("loopback override = %q, %v", got, err)
+	}
+	if _, err := resolveAPIAddress("0.0.0.0:4534", configured); err == nil {
+		t.Fatal("non-loopback override unexpectedly accepted")
+	}
+	if got, err := resolveAPIAddress("", rwconfig.APIConfig{}); err != nil || got != "" {
+		t.Fatalf("disabled address = %q, %v", got, err)
 	}
 }
 

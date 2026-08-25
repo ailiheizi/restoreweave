@@ -51,6 +51,15 @@ The current bounded implementation exposes:
 - optional `Authorization: Bearer <token>` validation when the host supplies
   `RESTOREWEAVE_API_TOKEN` or `--api-token`.
 
+The daemon may additionally expose `config.get` and `config.update` through
+the same strict command endpoint when it was started from a persisted operator
+profile. `config.update` replaces that one TOML document only after schema,
+path-separation, profile-tuple, credential-reference, and optimistic-digest
+validation. It never writes SQLite, hot-swaps a repository or provider, stores
+plaintext credentials, or grants the clean-install recovery reader
+configuration mutation. A successful change reports `restart_required` when
+the persisted digest differs from the running daemon digest.
+
 The listener is disabled by default. `api.enabled` and `api.listen` in the
 persisted TOML profile enable it; `--api-listen` is a one-shot override. The
 adapter has no database, repository, filesystem, job, or recovery state of its
@@ -151,6 +160,9 @@ The UI SHOULD organize the product around these tasks:
 
 - Show logical protected bytes separately from physical stored bytes and estimated savings.
 - Explain whether savings come from deduplication, compression, transformation, prior placement reuse, or exclusion under an explicit later policy.
+- After an ingest apply, show receipt-bound physical and compression results as
+  applying to that save only. Keep them unavailable after an unknown outcome;
+  do not relabel them as whole-repository or net savings.
 - Show repository health, placement count, verification evidence, decoder dependencies, and last successful readback.
 - Browse the original directory tree independent of physical packs or chunks.
 - Restore a file, subtree, or snapshot through a reviewable destination plan.

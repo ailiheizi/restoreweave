@@ -310,9 +310,46 @@ func TestDispatcherCapabilityList(t *testing.T) {
 	if states["index-dimension:"+search.DimensionAcoustic] != command.CapabilityUnavailable {
 		t.Fatalf("acoustic dimension = %q, want UNAVAILABLE", states["index-dimension:"+search.DimensionAcoustic])
 	}
+	if states["model-bundle:"+search.SemanticBundleBGEProfileID] != command.CapabilityUnavailable {
+		t.Fatalf("model bundle = %q, want UNAVAILABLE without an admitted bundle", states["model-bundle:"+search.SemanticBundleBGEProfileID])
+	}
 	want := len(command.KnownOperations()) + 2 + len(search.DeclaredDimensions(search.ProviderReadiness{})) + 1
+	want++
 	if len(data.Capabilities) != want {
 		t.Fatalf("capability count = %d, want %d", len(data.Capabilities), want)
+	}
+}
+
+func TestDispatcherCapabilityListKeepsBundleAndSemanticReadinessIndependent(t *testing.T) {
+	store := testutil.OpenStore(t, ":memory:")
+	repo, err := repository.OpenDir(filepath.Join(t.TempDir(), "repository"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatcher := NewDispatcher(store, "catalog.sqlite", "/tmp/rw.sock",
+		WithSemanticBundleCapability(command.Capability{
+			Kind: "model-bundle", ID: search.SemanticBundleBGEProfileID,
+			State: command.CapabilityAvailable, Version: "sha256:test",
+			Source: "BAAI/bge-small-zh-v1.5", Notes: "bundle is installed and locally verified",
+		}),
+		WithExact(&exact.Service{Store: store, Repo: repo}))
+	result := dispatcher.Handle(context.Background(), mustEnvelope(t, command.OpCapabilityList, map[string]any{}))
+	if result.Status != command.StatusSucceeded {
+		t.Fatalf("capability.list status = %q: %+v", result.Status, result.Reasons)
+	}
+	var data command.CapabilityListData
+	if err := json.Unmarshal(result.Data, &data); err != nil {
+		t.Fatal(err)
+	}
+	states := map[string]string{}
+	for _, capability := range data.Capabilities {
+		states[capability.Kind+":"+capability.ID] = capability.State
+	}
+	if states["model-bundle:"+search.SemanticBundleBGEProfileID] != command.CapabilityAvailable {
+		t.Fatalf("model bundle = %q, want AVAILABLE", states["model-bundle:"+search.SemanticBundleBGEProfileID])
+	}
+	if states["index-dimension:"+search.DimensionSemantic] != command.CapabilityUnavailable {
+		t.Fatalf("semantic dimension = %q, want UNAVAILABLE without a generation", states["index-dimension:"+search.DimensionSemantic])
 	}
 }
 

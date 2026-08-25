@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ailiheizi/restoreweave/client/command"
+	rwconfig "github.com/ailiheizi/restoreweave/config"
 	"github.com/ailiheizi/restoreweave/server/internal/access"
 	"github.com/ailiheizi/restoreweave/server/internal/exact"
 	"github.com/ailiheizi/restoreweave/server/internal/identify"
@@ -32,6 +33,7 @@ type Dispatcher struct {
 	indexBinding      search.IndexBinding
 	vectorPath        string
 	semanticBinding   semanticIndexerBinding
+	semanticBundle    command.Capability
 	now               func() time.Time
 	exact             *exact.Service
 	search            *search.Indexer
@@ -39,9 +41,12 @@ type Dispatcher struct {
 	sessions          *contentSessions
 	access            *access.Service
 	recoveryReader    *recoveryReaderState
+	operatorConfig    *operatorConfigState
 	implemented       map[string]bool
 	unimplemented     []string
 }
+
+const modelBundleCapabilityKind = "model-bundle"
 
 // semanticIndexerBinding is a host-owned runtime handoff. It is deliberately
 // not persisted or exposed through the command ABI; a missing binding keeps
@@ -66,6 +71,18 @@ func WithConfigDigest(digest string) DispatcherOption {
 		// This keeps option order deterministic and prevents a stale binding
 		// digest from being attached to a current daemon profile.
 		d.indexBinding.ConfigDigest = d.configDigest
+	}
+}
+
+// WithOperatorConfig enables validated reads and atomic updates of the same
+// persisted profile selected at daemon startup. Updates never hot-swap live
+// services; callers receive an explicit restart-required state instead.
+func WithOperatorConfig(resolved rwconfig.ResolvedConfig) DispatcherOption {
+	return func(d *Dispatcher) {
+		if strings.TrimSpace(resolved.ConfigPath) == "" {
+			return
+		}
+		d.operatorConfig = &operatorConfigState{path: resolved.ConfigPath, runningDigest: resolved.Digest}
 	}
 }
 
@@ -102,6 +119,18 @@ func WithSemanticIndexerBinding(provider search.SemanticEmbeddingProvider, zvec 
 			provider: provider, zvec: zvec, libraryPath: strings.TrimSpace(libraryPath),
 			libraryDigest: strings.TrimSpace(libraryDigest), manifest: manifest,
 		}
+	}
+}
+
+// WithSemanticBundleCapability reports the independent local bundle admission
+// result. It deliberately remains separate from semantic index readiness:
+// valid model files do not imply that a generation has been built.
+func WithSemanticBundleCapability(capability command.Capability) DispatcherOption {
+	return func(d *Dispatcher) {
+		if strings.TrimSpace(capability.Kind) == "" {
+			capability.Kind = modelBundleCapabilityKind
+		}
+		d.semanticBundle = capability
 	}
 }
 
@@ -155,6 +184,7 @@ func NewDispatcher(store *sqlite.Store, catalogPath, socketPath string, opts ...
 		command.OpDoctorCheck:        true,
 		command.OpCapabilityList:     true,
 		command.OpNamespaceList:      true,
+		command.OpContentList:        true,
 		command.OpNamespaceResolve:   true,
 		command.OpNamespaceStat:      true,
 		command.OpNamespaceReadlink:  true,
@@ -174,6 +204,12 @@ func NewDispatcher(store *sqlite.Store, catalogPath, socketPath string, opts ...
 		catalogPath: catalogPath,
 		socketPath:  socketPath,
 		now:         time.Now,
+		semanticBundle: command.Capability{
+			Kind: modelBundleCapabilityKind, ID: search.SemanticBundleBGEProfileID,
+			State: command.CapabilityUnavailable, Version: "1",
+			Source: "BAAI/bge-small-zh-v1.5",
+			Notes:  "local semantic bundle is not installed or has not passed integrity admission",
+		},
 		implemented: implemented,
 	}
 	for _, opt := range opts {
@@ -262,6 +298,10 @@ func NewDispatcher(store *sqlite.Store, catalogPath, socketPath string, opts ...
 		implemented[command.OpAudioList] = true
 		implemented[command.OpBooksList] = true
 	}
+	if dispatcher.operatorConfig != nil {
+		implemented[command.OpConfigGet] = true
+		implemented[command.OpConfigUpdate] = true
+	}
 	var unimplemented []string
 	for _, operation := range command.KnownOperations() {
 		if !implemented[operation] {
@@ -295,8 +335,14 @@ func (d *Dispatcher) Handle(ctx context.Context, raw command.Envelope) command.R
 		return d.handleDoctorCheck(ctx, env, started)
 	case command.OpCapabilityList:
 		return d.handleCapabilityList(env, started)
+	case command.OpConfigGet:
+		return d.handleConfigGet(env, started)
+	case command.OpConfigUpdate:
+		return d.handleConfigUpdate(env, started)
 	case command.OpNamespaceList:
 		return d.handleNamespaceList(ctx, env, started)
+	case command.OpContentList:
+		return d.handleContentList(ctx, env, started)
 	case command.OpNamespaceResolve:
 		return d.handleNamespaceResolve(ctx, env, started)
 	case command.OpNamespaceStat:
@@ -499,6 +545,7 @@ func (d *Dispatcher) handleCapabilityList(env command.Envelope, started time.Tim
 			Notes:   "host-owned suffix and magic-byte detector",
 		},
 	)
+	capabilities = append(capabilities, d.semanticBundle)
 	for _, dimension := range search.DeclaredDimensions(search.IndexerReadiness(d.search)) {
 		if dimension.ID == search.DimensionSemantic && dimension.State == command.CapabilityUnavailable && d.search != nil {
 			if failure := strings.TrimSpace(d.search.SemanticFailure()); failure != "" {
@@ -536,6 +583,80 @@ type namespaceListInput struct {
 	WorkspaceID string `json:"workspace_id"`
 	RootID      string `json:"root_id"`
 	ParentID    string `json:"parent_id,omitempty"`
+}
+
+type contentListInput struct {
+	WorkspaceID string `json:"workspace_id"`
+}
+
+// handleContentList is the flat content-library projection. Directory
+// navigation remains the separate namespace.list operation.
+func (d *Dispatcher) handleContentList(ctx context.Context, env command.Envelope, started time.Time) command.Result {
+	var input contentListInput
+	if err := decodeInput(env.Input, &input); err != nil {
+		return invalidInputResult(env, started, err)
+	}
+	if err := requireStableID("workspace_id", input.WorkspaceID); err != nil {
+		return invalidInputResult(env, started, err)
+	}
+	if _, err := d.store.GetWorkspace(ctx, input.WorkspaceID); err != nil {
+		return namespaceLookupResult(env, started, err)
+	}
+	// Keep the operation scoped to a workspace with committed content. An
+	// empty result for an existing but unpublished workspace must not look like
+	// a successful library projection.
+	if _, err := d.store.LatestPublication(ctx, input.WorkspaceID); err != nil {
+		return namespaceLookupResult(env, started, err)
+	}
+	entries, err := d.store.ListLatestNamespaceContent(ctx, input.WorkspaceID)
+	if err != nil {
+		return catalogErrorResult(env, started, err)
+	}
+	roots, err := d.store.ListLatestNamespaceRoots(ctx, input.WorkspaceID)
+	if err != nil {
+		return catalogErrorResult(env, started, err)
+	}
+	// RootID remains useful for the single-source case and deliberately becomes
+	// empty when a workspace spans multiple source roots. The flat library is
+	// content-first; directory traversal uses an explicit namespace root.
+	rootID := ""
+	for _, entry := range entries {
+		if rootID == "" {
+			rootID = entry.RootID
+		} else if rootID != entry.RootID {
+			rootID = ""
+			break
+		}
+	}
+	items := make([]command.ContentItemData, 0, len(entries))
+	for _, entry := range entries {
+		items = append(items, command.ContentItemData{
+			SubjectRef:  entry.ID,
+			Name:        entry.DisplayName,
+			Path:        d.namespaceDisplayPath(ctx, input.WorkspaceID, entry),
+			EntryType:   string(entry.EntryType),
+			ContentID:   entry.ContentID,
+			LogicalSize: entry.LogicalSize,
+		})
+	}
+	rootChoices := make([]command.ContentRootData, 0, len(roots))
+	for _, root := range roots {
+		source, err := d.store.GetSource(ctx, input.WorkspaceID, root.SourceID)
+		if err != nil {
+			return namespaceLookupResult(env, started, err)
+		}
+		rootChoices = append(rootChoices, command.ContentRootData{
+			RootID:     root.ID,
+			Name:       root.Name,
+			SourcePath: source.Locator,
+		})
+	}
+	return succeeded(env, started, command.ContentListData{
+		WorkspaceID: input.WorkspaceID,
+		RootID:      rootID,
+		Roots:       rootChoices,
+		Items:       items,
+	})
 }
 
 func (d *Dispatcher) handleNamespaceList(ctx context.Context, env command.Envelope, started time.Time) command.Result {

@@ -14,8 +14,8 @@ RestoreWeave 不是网盘文件系统，也不是 OpenList、媒体服务器或�
 
 ```text
 配置存储位置
--> 检查将要保护的目录
--> 确认保护计划
+-> 检查要加入内容库的来源
+-> 确认存储计划
 -> 保存精确文件内容和可恢复元数据
 -> 添加 Note 或 Description
 -> 用普通条件和语义搜索找到内容
@@ -48,6 +48,7 @@ RestoreWeave 不是网盘文件系统，也不是 OpenList、媒体服务器或�
 - 记录文件名、原始路径、类型、大小、时间、符号链接、硬链接、检测结果，以及当前平台可观察的 xattr/ACL 状态和 sparse indication。
 - 识别扫描期间发生变化、无法读取、越界或不稳定的条目，并把它们显示为阻塞项，而不是假装成功。
 - 先生成不会写入仓库的保护计划，显示文件数、逻辑大小、预计新增存储量和每个条目的结果；已存在或重复的内容会体现为更少的 `new_bytes`。
+- 保存成功后，WebUI 会根据本次经过校验的写入凭据分别显示实际新增内容占用和压缩节省；这不是整个仓库的净节省，无法确认写入结果时会明确显示未测量。
 - 只有确认 plan ID 和 plan digest 后才真正写入；重复执行同一计划会重放同一个逻辑结果。
 - 默认使用 `STORE_EXACT` 保存精确字节。
 - 高级 CLI 支持显式 `LINK_ONLY`、`METADATA_ONLY` 和外部 locator 记录；它们始终显示真实的未保护或不可恢复状态，不会冒充完整保护。
@@ -65,7 +66,9 @@ RestoreWeave 不是网盘文件系统，也不是 OpenList、媒体服务器或�
 
 - 为同一个文件保存多个可编辑、带修订号的 Note。
 - Note 直接进入普通搜索和语义搜索，不需要复制成另一个隐藏字段。
-- 仍提供 durable tag 和 annotation import/export，方便脚本和兼容工作流；当前 WebUI 的日常语义入口以 Note 为主。
+- 一个内容项可以拥有多个持久标签；WebUI 可创建、复用和移除标签，并从当前工作区已经使用的标签中给出候选。
+- 格式和类型作为确定性的系统标签/筛选项展示，不冒充用户标签；未来 AI 归类必须先预览并由用户确认，不能静默覆盖手工标签。
+- 默认首页按内容展示；原始目录只是来源证明和恢复投影，可在“按来源路径浏览”中查看，不承担日常组织。
 - 保存版本化 Description，保留来源、语言、producer、前一修订和语义分段。
 - 保存用户、导入、提取或标记为模型来源的 Description；当前不内置 Description 生成器，也不会在 ingest 时自动生成。
 - 内置基础提取器可处理 UTF-8 文本、ID3/FLAC/OGG 音频标签和 EPUB OPF 元数据。
@@ -111,7 +114,7 @@ RestoreWeave 不是网盘文件系统，也不是 OpenList、媒体服务器或�
 
 ### 接口
 
-- **WebUI：** 查看服务和存储状态、选择目录、预览/确认保护、搜索、查看路径/SHA/保护状态、添加或修改多个 Note、预览/确认整快照恢复。
+- **WebUI：** 查看服务和存储状态、按内容或来源路径浏览、预览/确认存储、搜索、查看路径/SHA/存储状态、维护多个标签和 Note、预览/确认整快照恢复。
 - **CLI：** 初始化、诊断、脚本、完整计划/快照/view/export 和紧急恢复入口；不是未来日常使用必须依赖的主界面。
 - **MCP：** 本地 stdio 的只读检查、搜索、namespace、representation、annotation 和元数据入口。
 - **API：** 当前只有 loopback `GET /api/v1/healthz` 与 typed `POST /api/v1/command`，复用同一 dispatcher，可选 bearer token；它不是可直接暴露公网的完整 REST 平台。
@@ -129,6 +132,8 @@ RestoreWeave 不是网盘文件系统，也不是 OpenList、媒体服务器或�
 -> 搜索文件并添加多个 Note
 -> 用描述性语句进行 BGE 语义搜索
 -> 查看 SHA-256 与保护状态
+-> 在 Settings 中配置存储路径、本地 BGE/在线替换 profile、Description、恢复与服务选项
+-> 保存时校验并原子更新同一份 TOML；需要时明确提示重启
 -> Preview restore
 -> 恢复到新的空目录并校验
 ```
@@ -137,7 +142,7 @@ RestoreWeave 不是网盘文件系统，也不是 OpenList、媒体服务器或�
 
 ```bash
 # 初始化配置并启动
-go build -o bin/restoreweaved ./server/cmd/restoreweaved
+go build -tags=purego -o bin/restoreweaved ./server/cmd/restoreweaved
 go build -o bin/rw ./client/cmd/rw
 bin/rw config init --path ./restoreweave.toml
 bin/restoreweaved --config ./restoreweave.toml --socket /tmp/restoreweaved.sock
@@ -212,7 +217,7 @@ RestoreWeave 保持较少的物理实体，但它们职责不同：
 git clone https://github.com/ailiheizi/restoreweave.git
 cd restoreweave
 
-go build -o bin/restoreweaved ./server/cmd/restoreweaved
+go build -tags=purego -o bin/restoreweaved ./server/cmd/restoreweaved
 go build -o bin/rw ./client/cmd/rw
 bin/rw config init --path ./restoreweave.toml
 ```
@@ -256,6 +261,8 @@ Darwin ARM64 的默认位置示例：
 ```
 
 也可以用 `--semantic-bundle` 显式指定。缺少 bundle 时 daemon 会诚实报告 semantic unavailable，不会使用 fixture vector 冒充真实模型。
+
+当前从源码构建 daemon 时必须保留上面的 `-tags=purego`，这样真实 zvec backend 才会编入程序；不带该标签的开发构建只保留明确不可用的占位实现。未来正式安装包应直接包含正确变体，不要求用户理解构建标签。
 
 模型、ONNX Runtime、zvec 和 Go binding 各自的许可证、NOTICE/SBOM 与再分发条件必须随未来安装 bundle 单独保留和资格化；它们不由本仓库的 MIT License 自动覆盖。
 

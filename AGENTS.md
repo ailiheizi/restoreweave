@@ -49,6 +49,11 @@ or safety gates, keep it outside the core queue.
 - User, imported, extracted, and model-produced descriptions are durable,
   versioned content. AI description generation is an explicit, on-demand
   `DESCRIBE_SUBJECT` operation and is not an implicit ingest dependency.
+- Daily organization is content-first and multi-tag-first. Source directories
+  remain provenance and recovery projections. Reuse durable `Annotation.TAG`
+  facts for user tags; deterministic type and format facets remain system
+  fields. Machine classification must be explicit, attributable, previewed,
+  and confirmed before it changes user-visible tags.
 - The operational catalog and every search index are rebuildable projections.
   Repository objects plus authenticated portable recovery records are the
   recovery authority.

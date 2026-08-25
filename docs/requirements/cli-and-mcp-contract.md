@@ -266,6 +266,8 @@ Display paths are for people. Machine clients SHOULD pass `path_ref`. A CLI conv
 
 | Operation | Side effect | Purpose |
 | --- | --- | --- |
+| `config.get` | None | Read the validated persisted operator profile, its path, persisted digest, running digest, and restart state without exposing secret values. |
+| `config.update` | Atomic configuration-file write | Replace the persisted profile after full schema validation and an `expected_config_digest` check; live services are not hot-swapped and the result reports whether restart is required. |
 | `plan.ingest` | Local capture and immutable plan state | Inspect a qualified source, identify content, select processors and representations, estimate incremental storage, and produce a reviewable ingest plan without repository publication. |
 | `plan.revise` | Local plan and decision records | Create an immutable successor plan from explicit candidate decisions. |
 | `plan.abandon` | Local capture-hold release | Abandon one unapplied plan and release its retained capture when safe. |
@@ -280,6 +282,7 @@ Display paths are for people. Machine clients SHOULD pass `path_ref`. A CLI conv
 | `snapshot.verify` | Verification reads and evidence writes | Verify a declared snapshot scope and append evidence. |
 | `recovery.export` | Bounded artifact creation | Export a portable recovery closure or independently retainable recovery reference. |
 | `recovery.anchor.export` | Bounded artifact creation | Export the public Ed25519 trust anchor required to authenticate signed publication commits; never export private signing material. |
+| `content.list` | None | List the latest workspace content as a flat library projection with path provenance, entry type, exact content identity, and logical size; directory traversal remains a separate `namespace.list` view. |
 | `namespace.list` | None | List one directory in a committed snapshot. |
 | `namespace.resolve` | None | Resolve path components and return an opaque path reference. |
 | `namespace.stat` | None | Read recorded entry and file-version metadata. |
@@ -543,6 +546,15 @@ revalidate
 ~~~
 
 The reconciled `PUBLICATION_COMMIT` placement is the portable logical commit point. A local pointer, index update, or successful upload cannot substitute for it.
+
+For an ingest plan, the apply result MAY include the receipt-bound diagnostic
+fields `savings_measured`, `new_physical_bytes`, and
+`compression_saved_bytes`. These values cover newly placed exact payload
+objects from that apply only. They do not include portable records, catalog,
+indexes, models, temporary space, or whole-repository growth. If placement
+crossed an unknown-outcome boundary or its receipt cannot support the
+measurement, `savings_measured` is false and clients MUST display the values
+as unavailable rather than infer zero savings from repository state.
 
 Restore apply stages, materializes, verifies, and finalizes only the destination declared by the immutable restore plan.
 

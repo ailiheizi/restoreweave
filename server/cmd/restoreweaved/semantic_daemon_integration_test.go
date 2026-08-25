@@ -78,6 +78,7 @@ func TestRealDaemonSemanticEndToEnd(t *testing.T) {
 
 	initialCaps := runRWProcess(t, rwBin, socketPath, "capability", "list")
 	assertSemanticCapability(t, initialCaps, command.CapabilityUnavailable)
+	assertModelBundleCapability(t, initialCaps, command.CapabilityAvailable)
 
 	planned := runRWProcess(t, rwBin, socketPath, "ingest", source)
 	var ingest command.PlanIngestData
@@ -186,6 +187,26 @@ func assertSemanticCapability(t *testing.T, result command.Result, want string) 
 		}
 	}
 	t.Fatalf("semantic capability was not declared")
+}
+
+func assertModelBundleCapability(t *testing.T, result command.Result, want string) {
+	t.Helper()
+	if result.Status != command.StatusSucceeded {
+		t.Fatalf("capability.list status = %s, reasons=%+v", result.Status, result.Reasons)
+	}
+	var data command.CapabilityListData
+	if err := json.Unmarshal(result.Data, &data); err != nil {
+		t.Fatal(err)
+	}
+	for _, capability := range data.Capabilities {
+		if capability.Kind == "model-bundle" && capability.ID == search.SemanticBundleBGEProfileID {
+			if capability.State != want {
+				t.Fatalf("model bundle capability = %+v, want %s", capability, want)
+			}
+			return
+		}
+	}
+	t.Fatalf("model bundle capability was not declared")
 }
 
 func runRWProcessAllowStatus(t *testing.T, rwBin, socketPath string, args ...string) command.Result {

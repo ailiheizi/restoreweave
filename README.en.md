@@ -14,8 +14,8 @@ RestoreWeave is not a cloud-drive filesystem, OpenList fork, media server, or a 
 
 ```text
 configure storage locations
--> inspect a directory before protection
--> approve a protection plan
+-> inspect a source to add to the content library
+-> approve a storage plan
 -> retain exact content and recoverable metadata
 -> add Notes or Descriptions
 -> find content with ordinary filters and semantic search
@@ -48,6 +48,7 @@ The list below is organized around user-visible work. Except where marked as a c
 - Capture of names, original paths, types, sizes, timestamps, symlinks, hard links, detection evidence, platform-observable xattr/ACL state, and sparse indication.
 - Changed, unreadable, out-of-boundary, or unstable entries become visible blockers instead of fabricated successes.
 - A non-mutating protection plan reports file count, logical size, expected new storage, and per-entry outcomes; already-stored or duplicate content appears as reduced `new_bytes`.
+- After a successful save, the WebUI reports actual new payload bytes and compression savings from that save's verified placement receipts. This is not whole-repository net savings, and an unprovable placement outcome remains explicitly unmeasured.
 - Placement begins only after the plan ID and digest are approved. Reapplying the same plan replays the same logical result.
 - `STORE_EXACT` is the default.
 - Advanced CLI flows can explicitly retain `LINK_ONLY`, `METADATA_ONLY`, and external locator records. Their unprotected or unavailable state remains visible and is never reported as exact protection.
@@ -65,7 +66,9 @@ The list below is organized around user-visible work. Except where marked as a c
 
 - Multiple editable, revisioned Notes for one file.
 - Notes feed both ordinary and semantic search directly, without copying them into a hidden second record.
-- Durable tags and annotation import/export remain available for scripts and compatibility flows; the daily WebUI centers semantic information on Notes.
+- A content item may have multiple durable tags. The WebUI can create, reuse, and remove tags, with suggestions drawn from tag values already used in the workspace.
+- Format and type appear as deterministic system tags/facets rather than pretending to be user tags. Future AI classification must be previewed and confirmed and cannot silently replace manual tags.
+- The default library is content-first. Original directories remain provenance and a recovery projection under the secondary source-path browser, not the primary organization.
 - Versioned Descriptions retain source, language, producer, predecessor revision, and semantic segments.
 - User, imported, extracted, and model-attributed Descriptions can be retained. No Description generator is built in, and ingest never generates one automatically.
 - Basic built-in extraction covers UTF-8 text, ID3/FLAC/OGG audio tags, and EPUB OPF metadata.
@@ -111,7 +114,7 @@ The list below is organized around user-visible work. Except where marked as a c
 
 ### Interfaces
 
-- **WebUI:** service and storage status, directory selection, protection preview/confirmation, search, path/SHA/protection details, multiple Note creation and editing, and whole-snapshot restore preview/confirmation.
+- **WebUI:** service and storage status, content-first and source-path browsing, storage preview/confirmation, search, path/SHA/storage details, multiple tags and Notes, and whole-snapshot restore preview/confirmation.
 - **CLI:** initialization, diagnostics, scripts, the complete plan/snapshot/view/export surface, and emergency recovery. It is not intended to remain the required daily interface.
 - **MCP:** local read-only stdio access for inspection, search, namespace, representation, annotation, and metadata operations.
 - **API:** currently only loopback `GET /api/v1/healthz` and typed `POST /api/v1/command`, sharing the same dispatcher with optional bearer-token validation. It is not a complete public-network REST platform.
@@ -129,6 +132,8 @@ open Add content
 -> search and add multiple Notes
 -> run a descriptive BGE semantic query
 -> inspect SHA-256 and protection state
+-> configure storage paths, local BGE/online replacement profiles, Descriptions, recovery, and service options in Settings
+-> validate and atomically update the same TOML profile, with an explicit restart notice when required
 -> Preview restore
 -> restore to a new empty directory and verify
 ```
@@ -137,7 +142,7 @@ open Add content
 
 ```bash
 # Initialize and start
-go build -o bin/restoreweaved ./server/cmd/restoreweaved
+go build -tags=purego -o bin/restoreweaved ./server/cmd/restoreweaved
 go build -o bin/rw ./client/cmd/rw
 bin/rw config init --path ./restoreweave.toml
 bin/restoreweaved --config ./restoreweave.toml --socket /tmp/restoreweaved.sock
@@ -212,7 +217,7 @@ Use Go 1.26 (or the version declared by `go.mod`) and a Node.js version supporte
 git clone https://github.com/ailiheizi/restoreweave.git
 cd restoreweave
 
-go build -o bin/restoreweaved ./server/cmd/restoreweaved
+go build -tags=purego -o bin/restoreweaved ./server/cmd/restoreweaved
 go build -o bin/rw ./client/cmd/rw
 bin/rw config init --path ./restoreweave.toml
 ```
@@ -256,6 +261,8 @@ Example default location for Darwin ARM64:
 ```
 
 You can also pass `--semantic-bundle`. Without the bundle, the daemon honestly reports semantic search unavailable; it never substitutes fixture vectors for a real model.
+
+When building the daemon from source today, keep the `-tags=purego` flag shown above so the real zvec backend is compiled in. A development build without that tag contains only the explicitly unavailable placeholder. A future supported package should ship the correct variant without exposing build tags to users.
 
 The model, ONNX Runtime, zvec, and Go binding each retain their own license, NOTICE/SBOM, and redistribution obligations. A future install bundle must preserve and qualify them separately; they are not covered automatically by this repository's MIT License.
 

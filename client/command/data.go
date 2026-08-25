@@ -68,15 +68,28 @@ type Capability struct {
 	Notes   string `json:"notes,omitempty"`
 }
 
+// ConfigData is the daemon-owned persisted operator profile. Config contains
+// the validated restoreweave.config.v1 document as a JSON object. Credential
+// fields are references only; secret values are rejected by config validation.
+type ConfigData struct {
+	ConfigPath          string          `json:"config_path"`
+	ConfigDigest        string          `json:"config_digest"`
+	RunningConfigDigest string          `json:"running_config_digest"`
+	RestartRequired     bool            `json:"restart_required"`
+	Config              json.RawMessage `json:"config"`
+}
+
 type SnapshotListData struct {
 	Snapshots []SnapshotSummary `json:"snapshots"`
 }
 
 type SnapshotSummary struct {
-	SnapshotRef    string `json:"snapshot_ref"`
-	CreatedAt      string `json:"created_at,omitempty"`
-	DisplayPath    string `json:"display_path,omitempty"`
-	ManifestDigest string `json:"manifest_digest,omitempty"`
+	SnapshotRef     string `json:"snapshot_ref"`
+	CreatedAt       string `json:"created_at,omitempty"`
+	DisplayPath     string `json:"display_path,omitempty"`
+	ManifestDigest  string `json:"manifest_digest,omitempty"`
+	WorkspaceID     string `json:"workspace_id,omitempty"`
+	NamespaceRootID string `json:"namespace_root_id,omitempty"`
 }
 
 type PlanIngestData struct {
@@ -213,23 +226,28 @@ type DoctorCheck struct {
 }
 
 type PlanApplyData struct {
-	PlanID              string                         `json:"plan_id"`
-	PlanDigest          string                         `json:"plan_digest"`
-	AlreadyApplied      bool                           `json:"already_applied"`
-	SnapshotRef         string                         `json:"snapshot_ref,omitempty"`
-	JobID               string                         `json:"job_id,omitempty"`
-	State               string                         `json:"state,omitempty"`
-	WorkspaceID         string                         `json:"workspace_id,omitempty"`
-	SourceID            string                         `json:"source_id,omitempty"`
-	ScanID              string                         `json:"scan_id,omitempty"`
-	RootID              string                         `json:"root_id,omitempty"`
-	ManifestDigest      string                         `json:"manifest_digest,omitempty"`
-	ProtectionDigest    string                         `json:"protection_digest,omitempty"`
-	ProtectionDecisions []IngestProtectionDecisionData `json:"protection_decisions,omitempty"`
-	Destination         string                         `json:"destination,omitempty"`
-	Files               int                            `json:"files,omitempty"`
-	Bytes               int64                          `json:"bytes,omitempty"`
-	Warnings            []string                       `json:"warnings,omitempty"`
+	PlanID                string                         `json:"plan_id"`
+	PlanDigest            string                         `json:"plan_digest"`
+	AlreadyApplied        bool                           `json:"already_applied"`
+	SnapshotRef           string                         `json:"snapshot_ref,omitempty"`
+	JobID                 string                         `json:"job_id,omitempty"`
+	State                 string                         `json:"state,omitempty"`
+	WorkspaceID           string                         `json:"workspace_id,omitempty"`
+	SourceID              string                         `json:"source_id,omitempty"`
+	ScanID                string                         `json:"scan_id,omitempty"`
+	RootID                string                         `json:"root_id,omitempty"`
+	ManifestDigest        string                         `json:"manifest_digest,omitempty"`
+	ProtectionDigest      string                         `json:"protection_digest,omitempty"`
+	ProtectionDecisions   []IngestProtectionDecisionData `json:"protection_decisions,omitempty"`
+	Destination           string                         `json:"destination,omitempty"`
+	Files                 int                            `json:"files,omitempty"`
+	Bytes                 int64                          `json:"bytes,omitempty"`
+	LocalBytes            int64                          `json:"local_bytes"`
+	NewBytes              int64                          `json:"new_bytes"`
+	SavingsMeasured       bool                           `json:"savings_measured"`
+	NewPhysicalBytes      int64                          `json:"new_physical_bytes"`
+	CompressionSavedBytes int64                          `json:"compression_saved_bytes"`
+	Warnings              []string                       `json:"warnings,omitempty"`
 }
 
 type PlanRestoreData struct {
@@ -339,6 +357,32 @@ type NamespaceListData struct {
 	RootID   string               `json:"root_id"`
 	ParentID string               `json:"parent_id,omitempty"`
 	Entries  []NamespaceEntryData `json:"entries"`
+}
+
+// ContentListData is the flat, read-only content-library projection. Paths
+// are provenance strings; subject refs remain the stable catalog identity.
+type ContentListData struct {
+	WorkspaceID string            `json:"workspace_id"`
+	RootID      string            `json:"root_id"`
+	Roots       []ContentRootData `json:"roots,omitempty"`
+	Items       []ContentItemData `json:"items"`
+}
+
+// ContentRootData is a read-only source-path browsing choice projected from
+// the latest published namespace roots.
+type ContentRootData struct {
+	RootID     string `json:"root_id"`
+	Name       string `json:"name"`
+	SourcePath string `json:"source_path,omitempty"`
+}
+
+type ContentItemData struct {
+	SubjectRef  string `json:"subject_ref"`
+	Name        string `json:"name"`
+	Path        string `json:"path"`
+	EntryType   string `json:"entry_type"`
+	ContentID   string `json:"content_id,omitempty"`
+	LogicalSize *int64 `json:"logical_size,omitempty"`
 }
 
 // NamespaceEntryData is the client-visible projection of one namespace entry.

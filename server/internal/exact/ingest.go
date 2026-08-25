@@ -123,7 +123,10 @@ func (s *Service) executeCapturedIngestWithExecutionKey(ctx context.Context, cap
 	if err != nil {
 		return result, err
 	}
-	result = IngestResult{WorkspaceID: ids.workspaceID, SourceID: ids.sourceID, ScanID: ids.scanID, BindingID: ids.bindingID, RootID: adopted.rootID, SnapshotRef: written.SnapshotRef, ManifestDigest: written.ManifestDigest, ConfigDigest: s.ConfigDigest, ProtectionDigest: protectionDigest, ProtectionMode: policy.mode, ProtectionDecisions: protectionDecisions, Files: placed.files, Bytes: placed.bytes, LocalFiles: placed.localFiles, LocalBytes: placed.localBytes, NewBytes: placed.newBytes, LinkOnlyFiles: placed.linkOnlyFiles, LocatorCount: len(policy.locators), PreparedClosureDigest: closure.PreparedDigest, PublicationCommitDigest: closure.CommitDigest, PublicationGeneration: closure.Generation}
+	result = IngestResult{WorkspaceID: ids.workspaceID, SourceID: ids.sourceID, ScanID: ids.scanID, BindingID: ids.bindingID, RootID: adopted.rootID, SnapshotRef: written.SnapshotRef, ManifestDigest: written.ManifestDigest, ConfigDigest: s.ConfigDigest, ProtectionDigest: protectionDigest, ProtectionMode: policy.mode, ProtectionDecisions: protectionDecisions, Files: placed.files, Bytes: placed.bytes, LocalFiles: placed.localFiles, LocalBytes: placed.localBytes, NewBytes: placed.newBytes, SavingsMeasured: placed.savingsMeasured, NewPhysicalBytes: placed.newPhysicalBytes, CompressionSavedBytes: placed.compressionSavedBytes, LinkOnlyFiles: placed.linkOnlyFiles, LocatorCount: len(policy.locators), PreparedClosureDigest: closure.PreparedDigest, PublicationCommitDigest: closure.CommitDigest, PublicationGeneration: closure.Generation}
+	if placed.savingsWarning != "" {
+		result.Warnings = append(result.Warnings, placed.savingsWarning)
+	}
 	if err := s.Store.Update(ctx, func(tx *sqlite.Tx) error {
 		metadata, _ := json.Marshal(map[string]any{
 			"config_digest":             s.ConfigDigest,
@@ -318,13 +321,18 @@ func (s *Service) finishScan(ctx context.Context, workspaceID, scanID string, st
 }
 
 type placedSet struct {
-	files           int
-	bytes           int64
-	localFiles      int
-	localBytes      int64
-	newBytes        int64
-	linkOnlyFiles   int
-	payloadReceipts []repository.Receipt
+	files                   int
+	bytes                   int64
+	localFiles              int
+	localBytes              int64
+	newBytes                int64
+	newPhysicalBytes        int64
+	compressionSavedBytes   int64
+	savingsMeasured         bool
+	savingsWarning          string
+	savingsPlacementUnknown bool
+	linkOnlyFiles           int
+	payloadReceipts         []repository.Receipt
 }
 
 func (s *Service) placeFiles(
@@ -334,7 +342,7 @@ func (s *Service) placeFiles(
 	policy ingestPolicy,
 ) (placedSet, error) {
 	fsys := scanner.NewRootedFileSystem(session.Root())
-	var placed placedSet
+	placed := placedSet{savingsMeasured: true}
 	seen := map[string]struct{}{}
 	for _, entry := range entries {
 		if entry.Kind != scanner.KindRegularFile {
@@ -368,16 +376,62 @@ func (s *Service) placeFiles(
 		if err != nil {
 			return placed, fmt.Errorf("reopen %s: %w", entry.RelativePath, err)
 		}
+		// A placement response can be lost after the repository has committed.
+		// If the object was not independently verified before PlaceExact but the
+		// helper later recovers it as Existed, its physical delta is unknown.
+		// Keep exact ingest successful, but do not claim a measured increment.
+		wasVerified := s.Repo.Verify(ctx, entry.Content.ContentID) == nil
 		receipt, err := placeExactWithReadback(ctx, s.Repo, entry.Content.ContentID, entry.Content.BytesRead, body)
 		_ = body.Close()
 		if err != nil {
 			return placed, fmt.Errorf("place %s: %w", entry.RelativePath, err)
 		}
+		if !validExactContentID(receipt.ContentID) || receipt.ContentID != entry.Content.ContentID || receipt.Bytes < 0 || receipt.Bytes != entry.Content.BytesRead || receipt.StoredBytes < 0 {
+			placed.savingsMeasured = false
+			placed.savingsWarning = "savings measurement unavailable: placement receipt is invalid"
+		}
+		// The exact lane already independently read back the expected identity
+		// and length. Normalize those fields for publication so a malformed
+		// diagnostic receipt cannot block exact preservation; StoredBytes remains
+		// untrusted and only affects the optional measurement.
+		receipt.ContentID = entry.Content.ContentID
+		receipt.Bytes = entry.Content.BytesRead
 		seen[entry.Content.ContentID] = struct{}{}
 		placed.payloadReceipts = append(placed.payloadReceipts, receipt)
+		if wasVerified && !receipt.Existed {
+			placed.savingsPlacementUnknown = true
+			if placed.savingsWarning == "" {
+				placed.savingsWarning = "savings measurement unavailable: placement receipt contradicted pre-placement verification"
+			}
+		} else if !wasVerified && receipt.Existed {
+			placed.savingsPlacementUnknown = true
+			if placed.savingsWarning == "" {
+				placed.savingsWarning = "savings measurement unavailable: placement response was lost before physical increment was known"
+			}
+		}
 		if !receipt.Existed {
 			placed.newBytes += receipt.Bytes
 		}
+	}
+	for _, receipt := range placed.payloadReceipts {
+		if !validExactContentID(receipt.ContentID) || receipt.Bytes < 0 || receipt.StoredBytes < 0 {
+			placed.savingsMeasured = false
+			placed.savingsWarning = "savings measurement unavailable: placement receipt is invalid"
+			break
+		}
+		if !receipt.Existed {
+			placed.newPhysicalBytes += receipt.StoredBytes
+			if receipt.Bytes > receipt.StoredBytes {
+				placed.compressionSavedBytes += receipt.Bytes - receipt.StoredBytes
+			}
+		}
+	}
+	if placed.savingsPlacementUnknown {
+		placed.savingsMeasured = false
+	}
+	if !placed.savingsMeasured {
+		placed.newPhysicalBytes = 0
+		placed.compressionSavedBytes = 0
 	}
 	return placed, nil
 }

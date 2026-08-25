@@ -119,6 +119,9 @@ type IngestResult struct {
 	LocalFiles              int
 	LocalBytes              int64
 	NewBytes                int64
+	SavingsMeasured         bool
+	NewPhysicalBytes        int64
+	CompressionSavedBytes   int64
 	LinkOnlyFiles           int
 	LocatorCount            int
 	Warnings                []string

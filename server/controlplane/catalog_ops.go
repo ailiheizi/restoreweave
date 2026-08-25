@@ -2,8 +2,10 @@ package controlplane
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -88,6 +90,29 @@ func (d *Dispatcher) handleAnnotationUpsert(ctx context.Context, env command.Env
 		return invalidInputResult(env, started, errString("body is required"))
 	}
 	kind := sqlite.AnnotationKind(strings.ToUpper(strings.TrimSpace(input.Kind)))
+	switch kind {
+	case sqlite.AnnotationTag, sqlite.AnnotationNote, sqlite.AnnotationProgress:
+	default:
+		return invalidInputResult(env, started, errString("kind must be TAG, NOTE, or PROGRESS"))
+	}
+	if _, err := d.store.GetNamespaceEntry(ctx, input.WorkspaceID, input.SubjectRef); err != nil {
+		if containsNotFound(err) {
+			return notFoundResult(env, started, "subject not found")
+		}
+		return catalogErrorResult(env, started, err)
+	}
+	if kind == sqlite.AnnotationNote && input.AnnotationID != "" {
+		if err := requireStableID("annotation_id", input.AnnotationID); err != nil {
+			return invalidInputResult(env, started, err)
+		}
+		existing, err := d.store.GetAnnotation(ctx, input.WorkspaceID, input.AnnotationID)
+		if err != nil {
+			return annotationWriteResult(env, started, err)
+		}
+		if existing.SubjectRef != input.SubjectRef {
+			return invalidInputResult(env, started, errString("annotation_id belongs to a different subject"))
+		}
+	}
 	var record sqlite.Annotation
 	var err error
 	switch kind {
@@ -97,8 +122,6 @@ func (d *Dispatcher) handleAnnotationUpsert(ctx context.Context, env command.Env
 		record, err = d.upsertNote(ctx, input)
 	case sqlite.AnnotationProgress:
 		record, err = d.upsertProgress(ctx, input)
-	default:
-		return invalidInputResult(env, started, errString("kind must be TAG, NOTE, or PROGRESS"))
 	}
 	if err != nil {
 		return annotationWriteResult(env, started, err)
@@ -185,73 +208,117 @@ func (d *Dispatcher) handleAnnotationImport(ctx context.Context, env command.Env
 	if err != nil {
 		return invalidInputResult(env, started, err)
 	}
-	imported := make([]command.AnnotationData, 0, len(bundle.Annotations))
-	workspaces := map[string]struct{}{}
+	seenAnnotationIDs := make(map[string]struct{}, len(bundle.Annotations))
 	for _, item := range bundle.Annotations {
 		if err := requireStableID("annotation_id", item.ID); err != nil {
 			return invalidInputResult(env, started, err)
 		}
+		if _, duplicate := seenAnnotationIDs[item.ID]; duplicate {
+			return invalidInputResult(env, started, errString("duplicate annotation_id "+item.ID))
+		}
+		seenAnnotationIDs[item.ID] = struct{}{}
 		if err := requireStableID("workspace_id", item.WorkspaceID); err != nil {
 			return invalidInputResult(env, started, err)
 		}
 		if err := requireStableID("subject_ref", item.SubjectRef); err != nil {
 			return invalidInputResult(env, started, err)
 		}
+		switch sqlite.AnnotationKind(item.Kind) {
+		case sqlite.AnnotationTag, sqlite.AnnotationNote, sqlite.AnnotationProgress:
+		default:
+			return invalidInputResult(env, started, errString("annotation "+item.ID+" kind must be TAG, NOTE, or PROGRESS"))
+		}
+		if strings.TrimSpace(item.Body) == "" {
+			return invalidInputResult(env, started, errString("annotation "+item.ID+" body is required"))
+		}
+		wantBodyDigest := fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(item.Body)))
+		if item.BodyDigest != "" && item.BodyDigest != wantBodyDigest {
+			return invalidInputResult(env, started, errString("annotation "+item.ID+" body_digest does not match body"))
+		}
+		if item.Revision < 1 {
+			return invalidInputResult(env, started, errString("annotation "+item.ID+" revision must be positive"))
+		}
+		if item.PredecessorRevision < 0 || item.PredecessorRevision >= item.Revision {
+			return invalidInputResult(env, started, errString("annotation "+item.ID+" predecessor_revision must be non-negative and less than revision"))
+		}
+		if _, err := d.store.GetNamespaceEntry(ctx, item.WorkspaceID, item.SubjectRef); err != nil {
+			if containsNotFound(err) {
+				return invalidInputResult(env, started, errString("annotation "+item.ID+" subject not found"))
+			}
+			return catalogErrorResult(env, started, err)
+		}
 		existing, err := d.store.GetAnnotation(ctx, item.WorkspaceID, item.ID)
 		if err == nil {
-			same := existing.Revision == item.Revision && existing.Body == item.Body && existing.Tombstoned == item.Tombstoned
-			if same {
-				imported = append(imported, projectAnnotation(existing))
-				continue
+			if existing.SubjectRef != item.SubjectRef {
+				return invalidInputResult(env, started, errString("annotation "+item.ID+" belongs to a different subject"))
 			}
-			switch policy {
-			case command.AnnotationConflictKeepLocal:
-				imported = append(imported, projectAnnotation(existing))
-				continue
-			case command.AnnotationConflictKeepImported:
-				if existing.Tombstoned {
-					return conflictResult(env, started, "annotation "+item.ID+" is tombstoned locally; keep-imported will not rewrite history")
-				}
-				if err := d.store.ReviseAnnotation(ctx, item.WorkspaceID, item.ID, existing.Revision, item.Body, item.Tombstoned, time.Time{}); err != nil {
-					return annotationWriteResult(env, started, err)
-				}
-				updated, getErr := d.store.GetAnnotation(ctx, item.WorkspaceID, item.ID)
-				if getErr != nil {
-					return catalogErrorResult(env, started, getErr)
-				}
-				imported = append(imported, projectAnnotation(updated))
-				workspaces[item.WorkspaceID] = struct{}{}
-				continue
-			default:
-				return conflictResult(env, started, "annotation "+item.ID+" already exists with a different revision")
+			if string(existing.Kind) != item.Kind {
+				return invalidInputResult(env, started, errString("annotation "+item.ID+" belongs to a different kind"))
 			}
-		}
-		if !containsNotFound(err) {
+		} else if !containsNotFound(err) {
 			return catalogErrorResult(env, started, err)
 		}
-		revision := item.Revision
-		if revision < 1 {
-			revision = 1
+	}
+	imported := make([]command.AnnotationData, 0, len(bundle.Annotations))
+	workspaces := map[string]struct{}{}
+	err = d.store.Update(ctx, func(tx *sqlite.Tx) error {
+		for _, item := range bundle.Annotations {
+			existing, getErr := tx.GetAnnotation(ctx, item.WorkspaceID, item.ID)
+			if getErr == nil {
+				same := existing.Revision == item.Revision && existing.PredecessorRevision == item.PredecessorRevision && existing.Body == item.Body && existing.Tombstoned == item.Tombstoned
+				if same {
+					imported = append(imported, projectAnnotation(existing))
+					continue
+				}
+				switch policy {
+				case command.AnnotationConflictKeepLocal:
+					imported = append(imported, projectAnnotation(existing))
+					continue
+				case command.AnnotationConflictKeepImported:
+					if existing.Tombstoned {
+						return fmt.Errorf("%w: annotation %s is tombstoned locally", sqlite.ErrConflict, item.ID)
+					}
+					if err := tx.UpdateAnnotationRevision(ctx, item.WorkspaceID, item.ID, existing.Revision, item.Body, item.Tombstoned, time.Time{}); err != nil {
+						return err
+					}
+					updated, err := tx.GetAnnotation(ctx, item.WorkspaceID, item.ID)
+					if err != nil {
+						return err
+					}
+					imported = append(imported, projectAnnotation(updated))
+					workspaces[item.WorkspaceID] = struct{}{}
+					continue
+				default:
+					return fmt.Errorf("%w: annotation %s already exists with a different revision", sqlite.ErrConflict, item.ID)
+				}
+			}
+			if !containsNotFound(getErr) {
+				return getErr
+			}
+			record := &sqlite.Annotation{
+				ID:                  item.ID,
+				WorkspaceID:         item.WorkspaceID,
+				SubjectRef:          item.SubjectRef,
+				Kind:                sqlite.AnnotationKind(item.Kind),
+				Body:                item.Body,
+				Revision:            item.Revision,
+				PredecessorRevision: item.PredecessorRevision,
+				Tombstoned:          item.Tombstoned,
+			}
+			if err := tx.InsertAnnotation(ctx, record); err != nil {
+				return err
+			}
+			created, err := tx.GetAnnotation(ctx, item.WorkspaceID, item.ID)
+			if err != nil {
+				return err
+			}
+			imported = append(imported, projectAnnotation(created))
+			workspaces[item.WorkspaceID] = struct{}{}
 		}
-		record := &sqlite.Annotation{
-			ID:                  item.ID,
-			WorkspaceID:         item.WorkspaceID,
-			SubjectRef:          item.SubjectRef,
-			Kind:                sqlite.AnnotationKind(item.Kind),
-			Body:                item.Body,
-			Revision:            revision,
-			PredecessorRevision: item.PredecessorRevision,
-			Tombstoned:          item.Tombstoned,
-		}
-		if err := d.store.CreateAnnotation(ctx, record); err != nil {
-			return annotationWriteResult(env, started, err)
-		}
-		created, err := d.store.GetAnnotation(ctx, item.WorkspaceID, item.ID)
-		if err != nil {
-			return catalogErrorResult(env, started, err)
-		}
-		imported = append(imported, projectAnnotation(created))
-		workspaces[item.WorkspaceID] = struct{}{}
+		return nil
+	})
+	if err != nil {
+		return annotationWriteResult(env, started, err)
 	}
 	for workspaceID := range workspaces {
 		d.rebuildSearch(ctx, workspaceID)

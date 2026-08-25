@@ -2,12 +2,14 @@ package search
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ailiheizi/restoreweave/server/internal/store/sqlite"
 	"github.com/ailiheizi/restoreweave/server/testutil"
@@ -123,6 +125,299 @@ func (g integrationSemanticGeneration) Query(_ context.Context, vector []float32
 }
 
 func (integrationSemanticGeneration) Close() error { return nil }
+
+func TestIndexerRebuildLatestScopesSemanticNotesToPublishedRoot(t *testing.T) {
+	ctx := context.Background()
+	store := testutil.OpenStore(t, filepath.Join(t.TempDir(), "catalog.sqlite"))
+	old := testutil.SeedNamespace(t, store)
+
+	oldBindingID := mustSearchID(t, sqlite.IDPrefixCaptureBinding)
+	oldPublicationID := mustSearchID(t, sqlite.IDPrefixPublication)
+	if err := store.Update(ctx, func(tx *sqlite.Tx) error {
+		if err := tx.InsertCaptureRootBinding(ctx, &sqlite.CaptureRootBinding{
+			ID: oldBindingID, WorkspaceID: old.WorkspaceID, SourceID: old.SourceID,
+			ScanGenerationID: old.ScanGenerationID, CaptureMode: "ROOTED_FD",
+			Profile: "test", DisplayPath: "/old", ConsistencyClaim: "SNAPSHOT",
+			IdentityDigest: "sha256:old-binding", Record: json.RawMessage(`{}`),
+		}); err != nil {
+			return err
+		}
+		return tx.InsertPublication(ctx, &sqlite.Publication{
+			ID: oldPublicationID, WorkspaceID: old.WorkspaceID, SnapshotRef: "snapshot:old",
+			ScanGenerationID: old.ScanGenerationID, BindingID: oldBindingID,
+			NamespaceRootID: old.RootID, ManifestDigest: "sha256:old-manifest",
+			Metadata: json.RawMessage(`{}`), CommittedAt: time.Unix(100, 0).UTC(),
+		})
+	}); err != nil {
+		t.Fatalf("insert old publication: %v", err)
+	}
+
+	newScanID := mustSearchID(t, sqlite.IDPrefixScanGeneration)
+	newRootID := mustSearchID(t, sqlite.IDPrefixNamespaceRoot)
+	newSubjectID := mustSearchID(t, sqlite.IDPrefixNamespaceEntry)
+	newBindingID := mustSearchID(t, sqlite.IDPrefixCaptureBinding)
+	newPublicationID := mustSearchID(t, sqlite.IDPrefixPublication)
+	if err := store.Update(ctx, func(tx *sqlite.Tx) error {
+		if err := tx.InsertScanGeneration(ctx, &sqlite.ScanGeneration{
+			ID: newScanID, WorkspaceID: old.WorkspaceID, SourceID: old.SourceID,
+			Generation: 2, ParentID: old.ScanGenerationID, CaptureSetID: "capture-new",
+			CaptureSetDigest: "sha256:capture-new", State: sqlite.ScanRunning,
+			FullTraversal: true, Summary: json.RawMessage(`{}`),
+		}); err != nil {
+			return err
+		}
+		if err := tx.InsertNamespaceRoot(ctx, &sqlite.NamespaceRoot{
+			ID: newRootID, WorkspaceID: old.WorkspaceID, SourceID: old.SourceID,
+			ScanGenerationID: newScanID, SnapshotRef: "snapshot:new", Name: "New",
+			RootPathKey: []byte{1}, FilesystemSemantics: "TEST", AuthorityDigest: "sha256:new-root",
+			Metadata: json.RawMessage(`{}`),
+		}); err != nil {
+			return err
+		}
+		if err := tx.InsertNamespaceEntry(ctx, &sqlite.NamespaceEntry{
+			ID: newSubjectID, WorkspaceID: old.WorkspaceID, RootID: newRootID,
+			RawName: []byte("new.txt"), DisplayName: "new.txt", FullPathKey: []byte("new.txt"),
+			EntryType: sqlite.EntryDirectory, Metadata: json.RawMessage(`{}`),
+		}); err != nil {
+			return err
+		}
+		if err := tx.InsertCaptureRootBinding(ctx, &sqlite.CaptureRootBinding{
+			ID: newBindingID, WorkspaceID: old.WorkspaceID, SourceID: old.SourceID,
+			ScanGenerationID: newScanID, CaptureMode: "ROOTED_FD", Profile: "test",
+			DisplayPath: "/new", ConsistencyClaim: "SNAPSHOT", IdentityDigest: "sha256:new-binding",
+			Record: json.RawMessage(`{}`),
+		}); err != nil {
+			return err
+		}
+		return tx.InsertPublication(ctx, &sqlite.Publication{
+			ID: newPublicationID, WorkspaceID: old.WorkspaceID, SnapshotRef: "snapshot:new",
+			ScanGenerationID: newScanID, BindingID: newBindingID, NamespaceRootID: newRootID,
+			ManifestDigest: "sha256:new-manifest", Metadata: json.RawMessage(`{}`), CommittedAt: time.Unix(200, 0).UTC(),
+		})
+	}); err != nil {
+		t.Fatalf("insert new publication: %v", err)
+	}
+
+	oldNoteID := mustSearchID(t, sqlite.IDPrefixAnnotation)
+	newNoteID := mustSearchID(t, sqlite.IDPrefixAnnotation)
+	if err := store.Update(ctx, func(tx *sqlite.Tx) error {
+		if err := tx.InsertAnnotation(ctx, &sqlite.Annotation{
+			ID: oldNoteID, WorkspaceID: old.WorkspaceID, SubjectRef: old.FileEntryID,
+			Kind: sqlite.AnnotationNote, Body: "old root recovery note", Revision: 1,
+		}); err != nil {
+			return err
+		}
+		return tx.InsertAnnotation(ctx, &sqlite.Annotation{
+			ID: newNoteID, WorkspaceID: old.WorkspaceID, SubjectRef: newSubjectID,
+			Kind: sqlite.AnnotationNote, Body: "new root recovery note", Revision: 1,
+		})
+	}); err != nil {
+		t.Fatalf("insert notes: %v", err)
+	}
+	oldDescriptionID := mustSearchID(t, sqlite.IDPrefixDescription)
+	newDescriptionID := mustSearchID(t, sqlite.IDPrefixDescription)
+	oldSegmentID := mustSearchID(t, sqlite.IDPrefixSemanticSegment)
+	newSegmentID := mustSearchID(t, sqlite.IDPrefixSemanticSegment)
+	for _, document := range []sqlite.DescriptionDocument{
+		{ID: oldDescriptionID, WorkspaceID: old.WorkspaceID, SubjectRef: old.FileEntryID,
+			Kind: sqlite.DescriptionUser, Title: "Old root description", Language: "en",
+			Body: "old root description", SourceRef: "user:old", ProducerProfile: "human", Accepted: true},
+		{ID: newDescriptionID, WorkspaceID: old.WorkspaceID, SubjectRef: newSubjectID,
+			Kind: sqlite.DescriptionUser, Title: "New root description", Language: "en",
+			Body: "new root description", SourceRef: "user:new", ProducerProfile: "human", Accepted: true},
+	} {
+		if err := store.InsertDescriptionDocument(ctx, &document); err != nil {
+			t.Fatalf("insert description %q: %v", document.ID, err)
+		}
+	}
+	for _, segment := range []sqlite.SemanticSegment{
+		{ID: oldSegmentID, WorkspaceID: old.WorkspaceID, DocumentID: oldDescriptionID,
+			SubjectRef: old.FileEntryID, Ordinal: 0, Text: "old root description", Language: "en", Section: "body"},
+		{ID: newSegmentID, WorkspaceID: old.WorkspaceID, DocumentID: newDescriptionID,
+			SubjectRef: newSubjectID, Ordinal: 0, Text: "new root description", Language: "en", Section: "body"},
+	} {
+		if err := store.InsertSemanticSegment(ctx, &segment); err != nil {
+			t.Fatalf("insert semantic segment %q: %v", segment.ID, err)
+		}
+	}
+
+	manifest := testZvecManifest()
+	driver := &integrationSemanticGenerationDriver{}
+	indexer := &Indexer{
+		Store: store, Engine: &Engine{Dir: t.TempDir()}, ConfigDigest: manifest.ConfigDigest,
+		LexicalProfileDigest: ProfileDigest(DimensionLexical, LexicalProfileV1), SemanticManifest: manifest,
+		SemanticProvider: integrationSemanticProvider{}, SemanticZvec: driver,
+		SemanticLibraryPath: "/private/explicit/libzvec_c_api.dylib", SemanticLibraryDigest: "sha256:" + strings.Repeat("0", 64),
+	}
+	generation, err := indexer.RebuildLatest(ctx, old.WorkspaceID)
+	if err != nil {
+		t.Fatalf("rebuild latest: %v", err)
+	}
+	if generation.NamespaceRootID != newRootID || generation.SnapshotRef != "snapshot:new" {
+		t.Fatalf("latest lexical generation = %+v", generation)
+	}
+	oldHits, err := indexer.Engine.Query(ctx, generation.DBPath, "old root recovery", nil)
+	if err != nil || len(oldHits) != 0 {
+		t.Fatalf("old note leaked into lexical generation: hits=%+v err=%v", oldHits, err)
+	}
+	newHits, err := indexer.Engine.Query(ctx, generation.DBPath, "new root recovery", nil)
+	if err != nil || len(newHits) != 1 || newHits[0].SubjectID != newSubjectID {
+		t.Fatalf("current note missing from lexical generation: hits=%+v err=%v", newHits, err)
+	}
+	semantic, err := store.LatestIndexGeneration(ctx, old.WorkspaceID, DimensionSemantic)
+	if err != nil {
+		t.Fatalf("latest semantic generation: %v", err)
+	}
+	if semantic.NamespaceRootID != newRootID || semantic.SnapshotRef != "snapshot:new" {
+		t.Fatalf("latest semantic generation = %+v", semantic)
+	}
+	if got := len(driver.byPath[semantic.DBPath]); got != 2 {
+		t.Fatalf("semantic segment count = %d, want 2", got)
+	}
+	seen := make(map[string]bool)
+	for _, segment := range driver.byPath[semantic.DBPath] {
+		if segment.SubjectID != newSubjectID {
+			t.Fatalf("semantic segment leaked old subject: %+v", segment)
+		}
+		seen[segment.SegmentID] = true
+	}
+	if !seen[newNoteID] || !seen[newSegmentID] || seen[oldNoteID] || seen[oldSegmentID] {
+		t.Fatalf("semantic segments = %+v", driver.byPath[semantic.DBPath])
+	}
+}
+
+func TestIndexerRebuildLatestRetainsPublishedSources(t *testing.T) {
+	ctx := context.Background()
+	store := testutil.OpenStore(t, filepath.Join(t.TempDir(), "catalog.sqlite"))
+	seed := testutil.SeedNamespace(t, store)
+	oldDescriptionID := mustSearchID(t, sqlite.IDPrefixDescription)
+	oldSegmentID := mustSearchID(t, sqlite.IDPrefixSemanticSegment)
+	if err := store.InsertDescriptionDocument(ctx, &sqlite.DescriptionDocument{
+		ID: oldDescriptionID, WorkspaceID: seed.WorkspaceID, SubjectRef: seed.FileEntryID,
+		Kind: sqlite.DescriptionUser, Title: "Source A", Language: "en",
+		Body: "source A semantic archive", SourceRef: "user:test", ProducerProfile: "human", Accepted: true,
+	}); err != nil {
+		t.Fatalf("insert source A description: %v", err)
+	}
+	if err := store.InsertSemanticSegment(ctx, &sqlite.SemanticSegment{
+		ID: oldSegmentID, WorkspaceID: seed.WorkspaceID, DocumentID: oldDescriptionID,
+		SubjectRef: seed.FileEntryID, Ordinal: 0, Text: "source A semantic archive", Language: "en", Section: "body",
+	}); err != nil {
+		t.Fatalf("insert source A segment: %v", err)
+	}
+
+	// Publish source A first, then publish source B. RebuildLatest must use
+	// both latest roots, rather than only the publication that arrived last.
+	firstBindingID := mustSearchID(t, sqlite.IDPrefixCaptureBinding)
+	firstPublicationID := mustSearchID(t, sqlite.IDPrefixPublication)
+	if err := store.Update(ctx, func(tx *sqlite.Tx) error {
+		if err := tx.InsertCaptureRootBinding(ctx, &sqlite.CaptureRootBinding{
+			ID: firstBindingID, WorkspaceID: seed.WorkspaceID, SourceID: seed.SourceID,
+			ScanGenerationID: seed.ScanGenerationID, CaptureMode: "ROOTED_FD", Profile: "test",
+			DisplayPath: "/source-a", ConsistencyClaim: "SNAPSHOT", IdentityDigest: "sha256:source-a", Record: json.RawMessage(`{}`),
+		}); err != nil {
+			return err
+		}
+		return tx.InsertPublication(ctx, &sqlite.Publication{
+			ID: firstPublicationID, WorkspaceID: seed.WorkspaceID, SnapshotRef: "snapshot:source-a",
+			ScanGenerationID: seed.ScanGenerationID, BindingID: firstBindingID, NamespaceRootID: seed.RootID,
+			ManifestDigest: "sha256:source-a", Metadata: json.RawMessage(`{}`), CommittedAt: time.Unix(100, 0).UTC(),
+		})
+	}); err != nil {
+		t.Fatalf("publish source A: %v", err)
+	}
+
+	secondSourceID := mustSearchID(t, sqlite.IDPrefixSource)
+	secondScanID := mustSearchID(t, sqlite.IDPrefixScanGeneration)
+	secondRootID := mustSearchID(t, sqlite.IDPrefixNamespaceRoot)
+	secondDirID := mustSearchID(t, sqlite.IDPrefixNamespaceEntry)
+	secondFileID := mustSearchID(t, sqlite.IDPrefixNamespaceEntry)
+	secondBindingID := mustSearchID(t, sqlite.IDPrefixCaptureBinding)
+	secondPublicationID := mustSearchID(t, sqlite.IDPrefixPublication)
+	secondSize := int64(5)
+	if err := store.Update(ctx, func(tx *sqlite.Tx) error {
+		if err := tx.InsertSource(ctx, &sqlite.Source{
+			ID: secondSourceID, WorkspaceID: seed.WorkspaceID, StableKey: "local:source-b",
+			Kind: "LOCAL_ROOT", Locator: "/source-b", State: sqlite.SourceActive,
+		}); err != nil {
+			return err
+		}
+		if err := tx.InsertScanGeneration(ctx, &sqlite.ScanGeneration{
+			ID: secondScanID, WorkspaceID: seed.WorkspaceID, SourceID: secondSourceID,
+			Generation: 1, CaptureSetID: "capture-source-b", CaptureSetDigest: "sha256:source-b",
+			State: sqlite.ScanRunning, FullTraversal: true, Summary: json.RawMessage(`{}`),
+		}); err != nil {
+			return err
+		}
+		if err := tx.InsertNamespaceRoot(ctx, &sqlite.NamespaceRoot{
+			ID: secondRootID, WorkspaceID: seed.WorkspaceID, SourceID: secondSourceID,
+			ScanGenerationID: secondScanID, SnapshotRef: "snapshot:source-b", Name: "Source B",
+			RootPathKey: []byte{}, FilesystemSemantics: "TEST", AuthorityDigest: "sha256:source-b", Metadata: json.RawMessage(`{}`),
+		}); err != nil {
+			return err
+		}
+		if err := tx.InsertNamespaceEntry(ctx, &sqlite.NamespaceEntry{
+			ID: secondDirID, WorkspaceID: seed.WorkspaceID, RootID: secondRootID,
+			RawName: []byte("Docs"), DisplayName: "Docs", FullPathKey: []byte("Docs"), EntryType: sqlite.EntryDirectory,
+		}); err != nil {
+			return err
+		}
+		if err := tx.InsertNamespaceEntry(ctx, &sqlite.NamespaceEntry{
+			ID: secondFileID, WorkspaceID: seed.WorkspaceID, RootID: secondRootID, ParentID: secondDirID,
+			RawName: []byte("source-b.txt"), DisplayName: "source-b.txt", FullPathKey: []byte("Docs\x00source-b.txt"),
+			EntryType: sqlite.EntryFile, LogicalSize: &secondSize,
+		}); err != nil {
+			return err
+		}
+		if err := tx.InsertCaptureRootBinding(ctx, &sqlite.CaptureRootBinding{
+			ID: secondBindingID, WorkspaceID: seed.WorkspaceID, SourceID: secondSourceID, ScanGenerationID: secondScanID,
+			CaptureMode: "ROOTED_FD", Profile: "test", DisplayPath: "/source-b", ConsistencyClaim: "SNAPSHOT",
+			IdentityDigest: "sha256:source-b-binding", Record: json.RawMessage(`{}`),
+		}); err != nil {
+			return err
+		}
+		return tx.InsertPublication(ctx, &sqlite.Publication{
+			ID: secondPublicationID, WorkspaceID: seed.WorkspaceID, SnapshotRef: "snapshot:source-b",
+			ScanGenerationID: secondScanID, BindingID: secondBindingID, NamespaceRootID: secondRootID,
+			ManifestDigest: "sha256:source-b", Metadata: json.RawMessage(`{}`), CommittedAt: time.Unix(200, 0).UTC(),
+		})
+	}); err != nil {
+		t.Fatalf("publish source B: %v", err)
+	}
+
+	manifest := testZvecManifest()
+	driver := &integrationSemanticGenerationDriver{}
+	indexer := &Indexer{
+		Store: store, Engine: &Engine{Dir: t.TempDir()}, ConfigDigest: manifest.ConfigDigest,
+		LexicalProfileDigest: ProfileDigest(DimensionLexical, LexicalProfileV1), SemanticManifest: manifest,
+		SemanticProvider: integrationSemanticProvider{}, SemanticZvec: driver,
+		SemanticLibraryPath: "/private/explicit/libzvec_c_api.dylib", SemanticLibraryDigest: "sha256:" + strings.Repeat("0", 64),
+	}
+	generation, err := indexer.RebuildLatest(ctx, seed.WorkspaceID)
+	if err != nil {
+		t.Fatalf("rebuild latest: %v", err)
+	}
+	for query, want := range map[string]string{"source A semantic": seed.FileEntryID, "source-b": secondFileID} {
+		hits, queryErr := indexer.Engine.Query(ctx, generation.DBPath, query, nil)
+		if queryErr != nil || len(hits) != 1 || hits[0].SubjectID != want {
+			t.Fatalf("lexical query %q = %+v, err=%v", query, hits, queryErr)
+		}
+	}
+	semantic, err := store.LatestIndexGeneration(ctx, seed.WorkspaceID, DimensionSemantic)
+	if err != nil {
+		t.Fatalf("latest semantic generation: %v", err)
+	}
+	if !IndexerReadiness(indexer).SemanticReal {
+		t.Fatal("semantic index is not ready after source B rebuild")
+	}
+	_, hits, err := indexer.Query(ctx, QueryRequest{WorkspaceID: seed.WorkspaceID, Dimension: DimensionSemantic, Text: "source A semantic"})
+	if err != nil || len(hits) != 1 || hits[0].SubjectID != seed.FileEntryID {
+		t.Fatalf("semantic source A query = %+v, err=%v", hits, err)
+	}
+	if semantic.NamespaceRootID != secondRootID || semantic.SnapshotRef != "snapshot:source-b" {
+		t.Fatalf("semantic generation trigger = %+v", semantic)
+	}
+}
 
 func TestIndexerSemanticRebuildQueryFuseAndProvenance(t *testing.T) {
 	ctx := context.Background()

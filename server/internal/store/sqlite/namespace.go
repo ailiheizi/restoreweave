@@ -300,6 +300,228 @@ ORDER BY tree.depth, e.full_path_key, e.namespace_entry_id`,
 	return nodes, nil
 }
 
+// ListNamespaceContent returns the non-directory namespace entries for one
+// published root. The workspace and root predicates are both intentional:
+// callers must not be able to use a root from another workspace as a scope.
+func (s *Store) ListNamespaceContent(
+	ctx context.Context,
+	workspaceID, rootID string,
+) ([]NamespaceEntry, error) {
+	if err := requireID("workspace id", workspaceID); err != nil {
+		return nil, err
+	}
+	if err := requireID("namespace root id", rootID); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, namespaceEntrySelect+`
+WHERE workspace_id = ? AND namespace_root_id = ? AND entry_type <> ?
+ORDER BY full_path_key, namespace_entry_id`, workspaceID, rootID, EntryDirectory)
+	if err != nil {
+		return nil, fmt.Errorf("list namespace content: %w", err)
+	}
+	defer rows.Close()
+	var entries []NamespaceEntry
+	for rows.Next() {
+		entry, err := scanNamespaceEntry(rows)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate namespace content: %w", err)
+	}
+	return entries, nil
+}
+
+// ListLatestNamespaceContent returns the flat content projection across all
+// sources in one workspace. A source may have several committed snapshots;
+// only the newest published scan generation for that source contributes
+// entries. The workspace predicate is repeated on every join so a caller
+// cannot widen the result with a root belonging to another workspace.
+func (s *Store) ListLatestNamespaceContent(
+	ctx context.Context,
+	workspaceID string,
+) ([]NamespaceEntry, error) {
+	if err := requireID("workspace id", workspaceID); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `
+WITH latest_publications AS (
+    SELECT p.namespace_root_id
+    FROM publications AS p
+    JOIN scan_generations AS sg
+      ON sg.workspace_id = p.workspace_id
+     AND sg.scan_generation_id = p.scan_generation_id
+    WHERE p.workspace_id = ?
+      AND NOT EXISTS (
+          SELECT 1
+          FROM publications AS newer
+          JOIN scan_generations AS newer_sg
+            ON newer_sg.workspace_id = newer.workspace_id
+           AND newer_sg.scan_generation_id = newer.scan_generation_id
+          WHERE newer.workspace_id = p.workspace_id
+            AND newer_sg.source_id = sg.source_id
+            AND (
+                newer_sg.generation > sg.generation
+                OR (newer_sg.generation = sg.generation
+                    AND (newer.committed_at_ns > p.committed_at_ns
+                         OR (newer.committed_at_ns = p.committed_at_ns
+                             AND newer.snapshot_ref > p.snapshot_ref)))
+            )
+      )
+)
+SELECT e.namespace_entry_id, e.workspace_id, e.namespace_root_id,
+       e.parent_entry_id, e.observation_id, e.raw_name, e.display_name,
+       e.full_path_key, e.entry_type, e.metadata_json, e.content_id,
+       e.file_version_id, e.symlink_target_raw, e.symlink_target_display,
+       e.hardlink_group_id, e.logical_size, e.allocated_size, e.created_at_ns
+FROM namespace_entries AS e
+JOIN latest_publications AS latest
+  ON latest.namespace_root_id = e.namespace_root_id
+WHERE e.workspace_id = ?
+  AND e.entry_type <> ?
+ORDER BY e.full_path_key, e.namespace_entry_id`, workspaceID, workspaceID, EntryDirectory)
+	if err != nil {
+		return nil, fmt.Errorf("list latest namespace content: %w", err)
+	}
+	defer rows.Close()
+	var entries []NamespaceEntry
+	for rows.Next() {
+		entry, err := scanNamespaceEntry(rows)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate latest namespace content: %w", err)
+	}
+	return entries, nil
+}
+
+// ListLatestNamespaceRoots returns the latest published source root for each
+// source in a workspace. Roots are a browse projection, not a second
+// organization model.
+func (s *Store) ListLatestNamespaceRoots(ctx context.Context, workspaceID string) ([]NamespaceRoot, error) {
+	if err := requireID("workspace id", workspaceID); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `
+WITH latest_publications AS (
+    SELECT p.namespace_root_id
+    FROM publications AS p
+    JOIN scan_generations AS sg
+      ON sg.workspace_id = p.workspace_id
+     AND sg.scan_generation_id = p.scan_generation_id
+    WHERE p.workspace_id = ?
+      AND NOT EXISTS (
+          SELECT 1
+          FROM publications AS newer
+          JOIN scan_generations AS newer_sg
+            ON newer_sg.workspace_id = newer.workspace_id
+           AND newer_sg.scan_generation_id = newer.scan_generation_id
+          WHERE newer.workspace_id = p.workspace_id
+            AND newer_sg.source_id = sg.source_id
+            AND (
+                newer_sg.generation > sg.generation
+                OR (newer_sg.generation = sg.generation
+                    AND (newer.committed_at_ns > p.committed_at_ns
+                         OR (newer.committed_at_ns = p.committed_at_ns
+                             AND newer.snapshot_ref > p.snapshot_ref)))
+            )
+      )
+)
+SELECT r.namespace_root_id, r.workspace_id, r.source_id,
+       r.scan_generation_id, r.snapshot_ref, r.name, r.root_path_key,
+       r.filesystem_semantics, r.authority_digest, r.metadata_json,
+       r.created_at_ns
+FROM namespace_roots AS r
+JOIN latest_publications AS latest
+  ON latest.namespace_root_id = r.namespace_root_id
+WHERE r.workspace_id = ?
+ORDER BY r.name, r.namespace_root_id`, workspaceID, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("list latest namespace roots: %w", err)
+	}
+	defer rows.Close()
+	var roots []NamespaceRoot
+	for rows.Next() {
+		root, err := scanNamespaceRoot(rows)
+		if err != nil {
+			return nil, err
+		}
+		roots = append(roots, root)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate latest namespace roots: %w", err)
+	}
+	return roots, nil
+}
+
+// ListLatestNamespaceEntries returns every entry in the newest published root
+// for each source in one workspace. Directories are retained because callers
+// such as the search index need them to reconstruct provenance paths.
+func (s *Store) ListLatestNamespaceEntries(
+	ctx context.Context,
+	workspaceID string,
+) ([]NamespaceEntry, error) {
+	if err := requireID("workspace id", workspaceID); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `
+WITH latest_publications AS (
+    SELECT p.namespace_root_id
+    FROM publications AS p
+    JOIN scan_generations AS sg
+      ON sg.workspace_id = p.workspace_id
+     AND sg.scan_generation_id = p.scan_generation_id
+    WHERE p.workspace_id = ?
+      AND NOT EXISTS (
+          SELECT 1
+          FROM publications AS newer
+          JOIN scan_generations AS newer_sg
+            ON newer_sg.workspace_id = newer.workspace_id
+           AND newer_sg.scan_generation_id = newer.scan_generation_id
+          WHERE newer.workspace_id = p.workspace_id
+            AND newer_sg.source_id = sg.source_id
+            AND (
+                newer_sg.generation > sg.generation
+                OR (newer_sg.generation = sg.generation
+                    AND (newer.committed_at_ns > p.committed_at_ns
+                         OR (newer.committed_at_ns = p.committed_at_ns
+                             AND newer.snapshot_ref > p.snapshot_ref)))
+            )
+      )
+)
+SELECT e.namespace_entry_id, e.workspace_id, e.namespace_root_id,
+       e.parent_entry_id, e.observation_id, e.raw_name, e.display_name,
+       e.full_path_key, e.entry_type, e.metadata_json, e.content_id,
+       e.file_version_id, e.symlink_target_raw, e.symlink_target_display,
+       e.hardlink_group_id, e.logical_size, e.allocated_size, e.created_at_ns
+FROM namespace_entries AS e
+JOIN latest_publications AS latest
+  ON latest.namespace_root_id = e.namespace_root_id
+WHERE e.workspace_id = ?
+ORDER BY e.namespace_root_id, e.full_path_key, e.namespace_entry_id`, workspaceID, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("list latest namespace entries: %w", err)
+	}
+	defer rows.Close()
+	var entries []NamespaceEntry
+	for rows.Next() {
+		entry, err := scanNamespaceEntry(rows)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate latest namespace entries: %w", err)
+	}
+	return entries, nil
+}
+
 const namespaceEntrySelect = `
 SELECT namespace_entry_id, workspace_id, namespace_root_id, parent_entry_id,
        observation_id, raw_name, display_name, full_path_key, entry_type,

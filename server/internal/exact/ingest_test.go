@@ -24,6 +24,26 @@ type payloadPlacementResponseLossRepo struct {
 
 type payloadPlacementFailureRepo struct{ *repository.Dir }
 
+type invalidSavingsReceiptRepo struct{ *repository.Dir }
+
+type contradictorySavingsReceiptRepo struct{ *repository.Dir }
+
+func (r *invalidSavingsReceiptRepo) PlaceExact(ctx context.Context, contentID string, body io.Reader) (repository.Receipt, error) {
+	receipt, err := r.Dir.PlaceExact(ctx, contentID, body)
+	if err == nil {
+		receipt.StoredBytes = -1
+	}
+	return receipt, err
+}
+
+func (r *contradictorySavingsReceiptRepo) PlaceExact(ctx context.Context, contentID string, body io.Reader) (repository.Receipt, error) {
+	receipt, err := r.Dir.PlaceExact(ctx, contentID, body)
+	if err == nil && receipt.Existed {
+		receipt.Existed = false
+	}
+	return receipt, err
+}
+
 // dishonestPayloadReadbackRepo accepts the expected object but exposes
 // different bytes through the reader used by the exact lane. The publication
 // helper must hash that stream instead of trusting Verify alone.
@@ -79,10 +99,131 @@ func TestIngestAdoptsExactPayloadAfterPlacementResponseLoss(t *testing.T) {
 	if result.LocalFiles != 1 || result.NewBytes != 0 {
 		t.Fatalf("placement recovery accounting = %+v", result)
 	}
+	if result.SavingsMeasured || result.NewPhysicalBytes != 0 || result.CompressionSavedBytes != 0 {
+		t.Fatalf("placement recovery fabricated savings = %+v", result)
+	}
 	digest := sha256.Sum256(payload)
 	contentID := "sha256:" + hex.EncodeToString(digest[:])
 	if err := repo.Verify(ctx, contentID); err != nil {
 		t.Fatalf("recovered payload readback: %v", err)
+	}
+}
+
+func TestIngestReportsReceiptBoundSavingsForRawAndZstd(t *testing.T) {
+	ctx := context.Background()
+	payload := bytes.Repeat([]byte("restoreweave savings "), 256)
+	for _, tc := range []struct {
+		name string
+		open func(string) (repository.Driver, error)
+	}{
+		{name: "raw", open: func(root string) (repository.Driver, error) { return repository.OpenDir(root) }},
+		{name: "zstd", open: func(root string) (repository.Driver, error) { return repository.OpenZstdDir(root) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source := t.TempDir()
+			if err := os.WriteFile(filepath.Join(source, "a.bin"), payload, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(source, "b.bin"), payload, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "catalog.sqlite"), sqlite.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = store.Close() })
+			repo, err := tc.open(filepath.Join(t.TempDir(), "repository"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := (&Service{Store: store, Repo: repo}).Ingest(ctx, source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !result.SavingsMeasured || result.LocalBytes != int64(len(payload))*2 || result.NewBytes != int64(len(payload)) || result.NewPhysicalBytes <= 0 {
+				t.Fatalf("savings result = %+v", result)
+			}
+			if result.CompressionSavedBytes < 0 || (tc.name == "zstd" && result.CompressionSavedBytes <= 0) || (tc.name == "raw" && result.CompressionSavedBytes != 0) {
+				t.Fatalf("compression savings = %d", result.CompressionSavedBytes)
+			}
+		})
+	}
+}
+
+func TestIngestReportsMeasuredZeroSavingsForEmptyAndUnavailableForInvalidReceipt(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "empty.sqlite"), sqlite.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	repo, err := repository.OpenDir(filepath.Join(t.TempDir(), "empty-repository"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty, err := (&Service{Store: store, Repo: repo}).Ingest(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !empty.SavingsMeasured || empty.NewPhysicalBytes != 0 || empty.CompressionSavedBytes != 0 {
+		t.Fatalf("empty savings result = %+v", empty)
+	}
+
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "payload.txt"), []byte("invalid receipt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	invalidStore, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "invalid.sqlite"), sqlite.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = invalidStore.Close() })
+	base, err := repository.OpenDir(filepath.Join(t.TempDir(), "invalid-repository"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Service{Store: invalidStore, Repo: &invalidSavingsReceiptRepo{Dir: base}}).Ingest(ctx, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SavingsMeasured || result.NewPhysicalBytes != 0 || result.CompressionSavedBytes != 0 || len(result.Warnings) == 0 {
+		t.Fatalf("invalid receipt savings result = %+v", result)
+	}
+}
+
+func TestIngestRejectsContradictoryPreverifiedReceiptSavings(t *testing.T) {
+	ctx := context.Background()
+	payload := []byte("receipt disagrees with pre-verification")
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "payload.txt"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "catalog.sqlite"), sqlite.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	base, err := repository.OpenDir(filepath.Join(t.TempDir(), "repository"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(payload)
+	contentID := "sha256:" + hex.EncodeToString(digest[:])
+	if _, err := base.PlaceExact(ctx, contentID, bytes.NewReader(payload)); err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Service{Store: store, Repo: &contradictorySavingsReceiptRepo{Dir: base}}).Ingest(ctx, source)
+	if err != nil {
+		t.Fatalf("ingest with contradictory receipt: %v", err)
+	}
+	if result.SavingsMeasured || result.NewPhysicalBytes != 0 || result.CompressionSavedBytes != 0 {
+		t.Fatalf("contradictory receipt fabricated savings = %+v", result)
+	}
+	if len(result.Warnings) == 0 {
+		t.Fatalf("contradictory receipt did not explain unavailable savings: %+v", result)
+	}
+	if err := base.Verify(ctx, contentID); err != nil {
+		t.Fatalf("exact payload was not preserved: %v", err)
 	}
 }
 

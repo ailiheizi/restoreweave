@@ -200,12 +200,22 @@ func (d *Dispatcher) handleSnapshotList(ctx context.Context, env command.Envelop
 	}
 	summaries := make([]command.SnapshotSummary, 0, len(manifests))
 	for _, manifest := range manifests {
-		summaries = append(summaries, command.SnapshotSummary{
+		summary := command.SnapshotSummary{
 			SnapshotRef:    manifest.SnapshotRef,
 			CreatedAt:      manifest.CreatedAt.UTC().Format(time.RFC3339),
 			DisplayPath:    manifest.Binding.DisplayPath,
 			ManifestDigest: manifest.ManifestDigest,
-		})
+		}
+		// Namespace browsing is an optional operational projection. Snapshot
+		// discovery and recovery remain repository-backed when the catalog is
+		// absent, including in the clean-install reader.
+		if d.exact.Store != nil {
+			if root, rootErr := d.exact.Store.GetNamespaceRootBySnapshotRef(ctx, manifest.SnapshotRef); rootErr == nil {
+				summary.WorkspaceID = root.WorkspaceID
+				summary.NamespaceRootID = root.ID
+			}
+		}
+		summaries = append(summaries, summary)
 	}
 	return succeeded(env, started, command.SnapshotListData{Snapshots: summaries})
 }
