@@ -257,7 +257,7 @@ Example default location for Darwin ARM64:
 
 You can also pass `--semantic-bundle`. Without the bundle, the daemon honestly reports semantic search unavailable; it never substitutes fixture vectors for a real model.
 
-The model, ONNX Runtime, zvec, and Go binding each retain their own license, NOTICE/SBOM, and redistribution obligations. A future install bundle must preserve and qualify them separately; they are not covered automatically by this repository's still-unselected project license.
+The model, ONNX Runtime, zvec, and Go binding each retain their own license, NOTICE/SBOM, and redistribution obligations. A future install bundle must preserve and qualify them separately; they are not covered automatically by this repository's MIT License.
 
 ## What comes next
 
@@ -308,5 +308,6 @@ The repository currently contains more than 400 Go test entry points, including 
 - [API and WebUI boundary](docs/requirements/api-and-webui.md)
 - [Release qualification](docs/requirements/release-qualification-and-traceability.md)
 - [Changelog](CHANGELOG.md)
+- [MIT License](LICENSE)
 
-This repository is publicly readable, but no open-source license has been selected or committed yet. Public access alone does not grant permission to copy, redistribute, or sublicense the code; licensing remains a separate owner decision.
+RestoreWeave project source is licensed under the [MIT License](LICENSE). Third-party dependencies, model weights, tokenizers, datasets, and future install bundles remain subject to their own licenses and redistribution terms.

@@ -257,7 +257,7 @@ Darwin ARM64 的默认位置示例：
 
 也可以用 `--semantic-bundle` 显式指定。缺少 bundle 时 daemon 会诚实报告 semantic unavailable，不会使用 fixture vector 冒充真实模型。
 
-模型、ONNX Runtime、zvec 和 Go binding 各自的许可证、NOTICE/SBOM 与再分发条件必须随未来安装 bundle 单独保留和资格化；它们不由本仓库尚未选择的项目许可证自动覆盖。
+模型、ONNX Runtime、zvec 和 Go binding 各自的许可证、NOTICE/SBOM 与再分发条件必须随未来安装 bundle 单独保留和资格化；它们不由本仓库的 MIT License 自动覆盖。
 
 ## 接下来做什么
 
@@ -308,5 +308,6 @@ npm run build
 - [API 与 WebUI 边界](docs/requirements/api-and-webui.md)
 - [发行资格要求](docs/requirements/release-qualification-and-traceability.md)
 - [变更记录](CHANGELOG.md)
+- [MIT License](LICENSE)
 
-仓库目前公开可读，但尚未选择或提交开源许可证。公开访问本身不授予复制、分发或再许可权限；许可证应由项目所有者单独决定。
+RestoreWeave 项目源码采用 [MIT License](LICENSE)。第三方依赖、模型权重、tokenizer、数据集和未来安装 bundle 仍分别遵循各自的许可证与再分发条件。

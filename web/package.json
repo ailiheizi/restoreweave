@@ -2,6 +2,7 @@
   "name": "restoreweave-web",
   "private": true,
   "version": "0.1.0-prealpha.1",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",
