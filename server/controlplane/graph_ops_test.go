@@ -48,13 +48,15 @@ func TestGraphRelationDimension(t *testing.T) {
 	if err := json.Unmarshal(listed.Data, &listData); err != nil {
 		t.Fatalf("decode namespace: %v", err)
 	}
-	var docsID, songID string
+	var docsID, docsSubject, songID, songSubject string
 	for _, entry := range listData.Entries {
 		switch entry.DisplayName {
 		case "docs":
 			docsID = entry.ID
+			docsSubject = entry.SubjectRef
 		case "song.mp3":
 			songID = entry.ID
+			songSubject = entry.SubjectRef
 		}
 	}
 	children := dispatcher.Handle(ctx, mustEnvelope(t, command.OpNamespaceList, map[string]any{
@@ -66,13 +68,14 @@ func TestGraphRelationDimension(t *testing.T) {
 	if err := json.Unmarshal(children.Data, &childrenData); err != nil {
 		t.Fatalf("decode children: %v", err)
 	}
-	var noteID string
+	var noteID, noteSubject string
 	for _, entry := range childrenData.Entries {
 		if entry.DisplayName == "note.txt" {
 			noteID = entry.ID
+			noteSubject = entry.SubjectRef
 		}
 	}
-	if docsID == "" || songID == "" || noteID == "" {
+	if docsID == "" || docsSubject == "" || songID == "" || songSubject == "" || noteID == "" || noteSubject == "" {
 		t.Fatalf("missing subjects docs=%s song=%s note=%s", docsID, songID, noteID)
 	}
 
@@ -101,8 +104,8 @@ func TestGraphRelationDimension(t *testing.T) {
 	if artistData.Dimension != search.DimensionGraph || artistData.Provider != search.ProviderGraphCatalog || artistData.ScoreSemantics != search.ScoreGraphExact {
 		t.Fatalf("graph provenance = %+v", artistData)
 	}
-	if len(artistData.Hits) != 1 || artistData.Hits[0].SubjectRef != songID {
-		t.Fatalf("artist hits = %+v want %s", artistData.Hits, songID)
+	if len(artistData.Hits) != 1 || artistData.Hits[0].SubjectRef != songSubject || artistData.Hits[0].EntryID != songID {
+		t.Fatalf("artist hits = %+v want %s", artistData.Hits, songSubject)
 	}
 	audio := dispatcher.Handle(ctx, mustEnvelope(t, command.OpAudioList, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
@@ -115,8 +118,8 @@ func TestGraphRelationDimension(t *testing.T) {
 	if err := json.Unmarshal(audio.Data, &audioData); err != nil {
 		t.Fatalf("decode audio: %v", err)
 	}
-	if len(audioData.Tracks) != 1 || audioData.Tracks[0].SubjectRef != songID {
-		t.Fatalf("audio.list subject = %+v want %s", audioData.Tracks, songID)
+	if len(audioData.Tracks) != 1 || audioData.Tracks[0].SubjectRef != songSubject {
+		t.Fatalf("audio.list subject = %+v want %s", audioData.Tracks, songSubject)
 	}
 
 	tags := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
@@ -131,14 +134,14 @@ func TestGraphRelationDimension(t *testing.T) {
 	if err := json.Unmarshal(tags.Data, &tagData); err != nil {
 		t.Fatalf("decode tagged: %v", err)
 	}
-	if len(tagData.Hits) != 1 || tagData.Hits[0].SubjectRef != noteID {
-		t.Fatalf("tagged hits = %+v want %s", tagData.Hits, noteID)
+	if len(tagData.Hits) != 1 || tagData.Hits[0].SubjectRef != noteSubject || tagData.Hits[0].EntryID != noteID {
+		t.Fatalf("tagged hits = %+v want %s", tagData.Hits, noteSubject)
 	}
 
 	contains := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
 		"dimension":    search.DimensionGraph,
-		"query":        "contains:" + docsID,
+		"query":        "contains:" + docsSubject,
 	}))
 	if contains.Status != command.StatusSucceeded {
 		t.Fatalf("contains graph = %q: %+v", contains.Status, contains.Reasons)
@@ -147,8 +150,8 @@ func TestGraphRelationDimension(t *testing.T) {
 	if err := json.Unmarshal(contains.Data, &containsData); err != nil {
 		t.Fatalf("decode contains: %v", err)
 	}
-	if len(containsData.Hits) != 1 || containsData.Hits[0].SubjectRef != noteID {
-		t.Fatalf("contains hits = %+v want %s", containsData.Hits, noteID)
+	if len(containsData.Hits) != 1 || containsData.Hits[0].SubjectRef != noteSubject || containsData.Hits[0].EntryID != noteID {
+		t.Fatalf("contains hits = %+v want %s", containsData.Hits, noteSubject)
 	}
 
 	unknown := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{

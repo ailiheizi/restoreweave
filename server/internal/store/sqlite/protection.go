@@ -97,13 +97,10 @@ func optionalText(name, value string) error {
 	return requireText(name, value)
 }
 
-// InsertProtectionRecord adds the current explicit protection fact for a
-// subject. LocalRepresentationID is an optional primary hint; additional
-// local alternatives are represented by exact RecoveryReference rows. The
-// subject uniqueness constraint makes accidental duplicate policy rows fail
-// closed; a future revision API can replace the current row under a
-// transaction while retaining the portable record.
-func (tx *Tx) InsertProtectionRecord(ctx context.Context, record *ProtectionRecord) error {
+// prepareProtectionRecord validates and normalizes one current protection
+// projection before it is inserted or revised. The durable signed snapshot
+// remains immutable; this row is only the latest operational projection.
+func (tx *Tx) prepareProtectionRecord(ctx context.Context, record *ProtectionRecord) error {
 	if record == nil {
 		return errors.New("protection record is required")
 	}
@@ -187,6 +184,19 @@ WHERE workspace_id = ? AND representation_id = ?`,
 	} else {
 		record.UpdatedAt = record.UpdatedAt.UTC()
 	}
+	return nil
+}
+
+// InsertProtectionRecord adds the current explicit protection fact for a
+// subject. LocalRepresentationID is an optional primary hint; additional
+// local alternatives are represented by exact RecoveryReference rows. The
+// subject uniqueness constraint intentionally makes accidental duplicate
+// policy rows fail closed; use UpsertProtectionRecord for a new observation
+// of an existing stable subject.
+func (tx *Tx) InsertProtectionRecord(ctx context.Context, record *ProtectionRecord) error {
+	if err := tx.prepareProtectionRecord(ctx, record); err != nil {
+		return err
+	}
 	if err := insertOne(ctx, tx.tx, `
 INSERT INTO protection_records(
     protection_record_id, workspace_id, subject_ref, mode, outcome,
@@ -199,14 +209,84 @@ ON CONFLICT DO NOTHING`,
 		nullableString(record.ExpectedContentID), nullableInt64(record.ExpectedLogicalLength),
 		nullableString(record.LocalRepresentationID), record.PolicyDecisionRef,
 		record.LastVerificationRef, nullableTime(record.LastVerifiedAt), record.Revision,
-		string(metadata), record.CreatedAt.UnixNano(), record.UpdatedAt.UnixNano()); err != nil {
+		string(record.Metadata), record.CreatedAt.UnixNano(), record.UpdatedAt.UnixNano()); err != nil {
 		return fmt.Errorf("insert protection record: %w", err)
 	}
 	return nil
 }
 
+// UpsertProtectionRecord revises the current protection projection for a
+// stable subject in this transaction. Existing record IDs are retained and
+// their revision is advanced; signed snapshot/recovery facts remain separate
+// immutable history. The returned record is populated with the actual
+// protection_record_id and revision so new recovery references can attach to
+// the current projection safely.
+func (tx *Tx) UpsertProtectionRecord(ctx context.Context, record *ProtectionRecord) (ProtectionRecord, error) {
+	if err := tx.prepareProtectionRecord(ctx, record); err != nil {
+		return ProtectionRecord{}, err
+	}
+	var currentID string
+	var currentRevision int64
+	var currentCreated int64
+	err := tx.tx.QueryRowContext(ctx, `
+SELECT protection_record_id, revision, created_at_ns
+FROM protection_records
+WHERE workspace_id = ? AND subject_ref = ?`, record.WorkspaceID, record.SubjectRef).Scan(
+		&currentID, &currentRevision, &currentCreated)
+	if errors.Is(err, sql.ErrNoRows) {
+		if err := insertOne(ctx, tx.tx, `
+INSERT INTO protection_records(
+    protection_record_id, workspace_id, subject_ref, mode, outcome,
+    expected_content_id, expected_logical_length, local_representation_id,
+    policy_decision_ref, last_verification_ref, last_verified_at_ns,
+    revision, metadata_json, created_at_ns, updated_at_ns
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT DO NOTHING`,
+			record.ID, record.WorkspaceID, record.SubjectRef, record.Mode, record.Outcome,
+			nullableString(record.ExpectedContentID), nullableInt64(record.ExpectedLogicalLength),
+			nullableString(record.LocalRepresentationID), record.PolicyDecisionRef,
+			record.LastVerificationRef, nullableTime(record.LastVerifiedAt), record.Revision,
+			string(record.Metadata), record.CreatedAt.UnixNano(), record.UpdatedAt.UnixNano()); err != nil {
+			return ProtectionRecord{}, fmt.Errorf("insert protection record: %w", err)
+		}
+		return *record, nil
+	}
+	if err != nil {
+		return ProtectionRecord{}, fmt.Errorf("read current protection record: %w", err)
+	}
+	record.ID = currentID
+	record.Revision = currentRevision + 1
+	record.CreatedAt = time.Unix(0, currentCreated).UTC()
+	if _, err := tx.tx.ExecContext(ctx, `
+UPDATE protection_records SET
+    mode = ?, outcome = ?, expected_content_id = ?, expected_logical_length = ?,
+    local_representation_id = ?, policy_decision_ref = ?, last_verification_ref = ?,
+    last_verified_at_ns = ?, revision = ?, metadata_json = ?, updated_at_ns = ?
+WHERE workspace_id = ? AND protection_record_id = ?`,
+		record.Mode, record.Outcome, nullableString(record.ExpectedContentID),
+		nullableInt64(record.ExpectedLogicalLength), nullableString(record.LocalRepresentationID),
+		record.PolicyDecisionRef, record.LastVerificationRef, nullableTime(record.LastVerifiedAt),
+		record.Revision, string(record.Metadata), record.UpdatedAt.UnixNano(),
+		record.WorkspaceID, record.ID); err != nil {
+		return ProtectionRecord{}, fmt.Errorf("update protection record: %w", err)
+	}
+	return *record, nil
+}
+
 func (s *Store) InsertProtectionRecord(ctx context.Context, record *ProtectionRecord) error {
 	return s.Update(ctx, func(tx *Tx) error { return tx.InsertProtectionRecord(ctx, record) })
+}
+
+// UpsertProtectionRecord is the store-level convenience form of the
+// transaction-scoped current-projection revision operation.
+func (s *Store) UpsertProtectionRecord(ctx context.Context, record *ProtectionRecord) (ProtectionRecord, error) {
+	var result ProtectionRecord
+	err := s.Update(ctx, func(tx *Tx) error {
+		var err error
+		result, err = tx.UpsertProtectionRecord(ctx, record)
+		return err
+	})
+	return result, err
 }
 
 func (s *Store) GetProtectionRecord(ctx context.Context, workspaceID, recordID string) (ProtectionRecord, error) {

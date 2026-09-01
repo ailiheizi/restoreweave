@@ -12,6 +12,7 @@ import (
 	"github.com/ailiheizi/restoreweave/client/command"
 	"github.com/ailiheizi/restoreweave/server/internal/exact"
 	"github.com/ailiheizi/restoreweave/server/internal/repository"
+	"github.com/ailiheizi/restoreweave/server/internal/search"
 	"github.com/ailiheizi/restoreweave/server/testutil"
 )
 
@@ -76,6 +77,7 @@ func TestBooksListAfterIngest(t *testing.T) {
 
 	found := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
+		"dimension":    search.DimensionLexical,
 		"query":        "Lighthouse",
 	}))
 	if found.Status != command.StatusSucceeded {

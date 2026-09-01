@@ -64,6 +64,11 @@ func (d *Dispatcher) handleAnnotationList(ctx context.Context, env command.Envel
 		if err := requireStableID("subject_ref", input.SubjectRef); err != nil {
 			return invalidInputResult(env, started, err)
 		}
+		entry, err := d.resolveSubject(ctx, input.WorkspaceID, input.SubjectRef)
+		if err != nil {
+			return namespaceLookupResult(env, started, err)
+		}
+		input.SubjectRef = entry.SubjectRef
 	}
 	records, err := d.store.ListAnnotations(ctx, input.WorkspaceID, input.SubjectRef, false)
 	if err != nil {
@@ -95,12 +100,14 @@ func (d *Dispatcher) handleAnnotationUpsert(ctx context.Context, env command.Env
 	default:
 		return invalidInputResult(env, started, errString("kind must be TAG, NOTE, or PROGRESS"))
 	}
-	if _, err := d.store.GetNamespaceEntry(ctx, input.WorkspaceID, input.SubjectRef); err != nil {
+	entry, err := d.resolveSubject(ctx, input.WorkspaceID, input.SubjectRef)
+	if err != nil {
 		if containsNotFound(err) {
 			return notFoundResult(env, started, "subject not found")
 		}
 		return catalogErrorResult(env, started, err)
 	}
+	input.SubjectRef = entry.SubjectRef
 	if kind == sqlite.AnnotationNote && input.AnnotationID != "" {
 		if err := requireStableID("annotation_id", input.AnnotationID); err != nil {
 			return invalidInputResult(env, started, err)
@@ -114,7 +121,6 @@ func (d *Dispatcher) handleAnnotationUpsert(ctx context.Context, env command.Env
 		}
 	}
 	var record sqlite.Annotation
-	var err error
 	switch kind {
 	case sqlite.AnnotationTag:
 		record, err = d.upsertTag(ctx, input)
@@ -182,6 +188,11 @@ func (d *Dispatcher) handleAnnotationExport(ctx context.Context, env command.Env
 		if err := requireStableID("subject_ref", input.SubjectRef); err != nil {
 			return invalidInputResult(env, started, err)
 		}
+		entry, err := d.resolveSubject(ctx, input.WorkspaceID, input.SubjectRef)
+		if err != nil {
+			return namespaceLookupResult(env, started, err)
+		}
+		input.SubjectRef = entry.SubjectRef
 	}
 	records, err := d.store.ListAnnotations(ctx, input.WorkspaceID, input.SubjectRef, true)
 	if err != nil {
@@ -209,7 +220,8 @@ func (d *Dispatcher) handleAnnotationImport(ctx context.Context, env command.Env
 		return invalidInputResult(env, started, err)
 	}
 	seenAnnotationIDs := make(map[string]struct{}, len(bundle.Annotations))
-	for _, item := range bundle.Annotations {
+	for index := range bundle.Annotations {
+		item := &bundle.Annotations[index]
 		if err := requireStableID("annotation_id", item.ID); err != nil {
 			return invalidInputResult(env, started, err)
 		}
@@ -241,12 +253,14 @@ func (d *Dispatcher) handleAnnotationImport(ctx context.Context, env command.Env
 		if item.PredecessorRevision < 0 || item.PredecessorRevision >= item.Revision {
 			return invalidInputResult(env, started, errString("annotation "+item.ID+" predecessor_revision must be non-negative and less than revision"))
 		}
-		if _, err := d.store.GetNamespaceEntry(ctx, item.WorkspaceID, item.SubjectRef); err != nil {
+		entry, err := d.resolveSubject(ctx, item.WorkspaceID, item.SubjectRef)
+		if err != nil {
 			if containsNotFound(err) {
 				return invalidInputResult(env, started, errString("annotation "+item.ID+" subject not found"))
 			}
 			return catalogErrorResult(env, started, err)
 		}
+		item.SubjectRef = entry.SubjectRef
 		existing, err := d.store.GetAnnotation(ctx, item.WorkspaceID, item.ID)
 		if err == nil {
 			if existing.SubjectRef != item.SubjectRef {
@@ -362,6 +376,13 @@ func (d *Dispatcher) handleSearchQuery(ctx context.Context, env command.Envelope
 			return invalidInputResult(env, started, err)
 		}
 	}
+	defaultBroker := strings.TrimSpace(dimensionID) == "" && len(fuseIDs) == 0 && input.GenerationID == ""
+	if defaultBroker {
+		// The ordinary query path is host-owned fusion. Structured predicates
+		// remain enforced by the lexical projection while semantic contributes
+		// only when its profile-bound generation is actually available.
+		fuseIDs = []string{search.DimensionLexical, search.DimensionSemantic}
+	}
 	if len(fuseIDs) > 0 {
 		if strings.TrimSpace(dimensionID) != "" {
 			return invalidInputResult(env, started, errString("fuse and dimension cannot be set together"))
@@ -369,7 +390,7 @@ func (d *Dispatcher) handleSearchQuery(ctx context.Context, env command.Envelope
 		if input.GenerationID != "" {
 			return invalidInputResult(env, started, errString("fuse cannot pin one index_generation_ref"))
 		}
-		return d.handleFusedSearch(ctx, env, started, input.WorkspaceID, queryText, requestedAxes, fuseIDs, filters)
+		return d.handleFusedSearch(ctx, env, started, input.WorkspaceID, queryText, requestedAxes, fuseIDs, filters, defaultBroker)
 	}
 	dimension, ok := search.LookupDimension(dimensionID, search.IndexerReadiness(d.search))
 	if !ok {
@@ -431,7 +452,7 @@ func (d *Dispatcher) handleSearchQuery(ctx context.Context, env command.Envelope
 	})
 }
 
-func (d *Dispatcher) handleFusedSearch(ctx context.Context, env command.Envelope, started time.Time, workspaceID, queryText string, requestedAxes, fuseIDs []string, filters search.Filters) command.Result {
+func (d *Dispatcher) handleFusedSearch(ctx context.Context, env command.Envelope, started time.Time, workspaceID, queryText string, requestedAxes, fuseIDs []string, filters search.Filters, defaultBroker bool) command.Result {
 	dims, err := search.NormalizeFuse(fuseIDs)
 	if err != nil {
 		return invalidInputResult(env, started, err)
@@ -487,6 +508,13 @@ func (d *Dispatcher) handleFusedSearch(ctx context.Context, env command.Envelope
 	if !search.FuseSucceeded(fused) {
 		return degradedResult(env, started, data, "all fused dimensions were unavailable; namespace, annotations, and restore are unaffected")
 	}
+	if defaultBroker {
+		for _, component := range fused.Components {
+			if component.Status != string(command.StatusSucceeded) {
+				return degradedResult(env, started, data, "one or more default search components are unavailable; available component results are still returned")
+			}
+		}
+	}
 	return succeeded(env, started, data)
 }
 
@@ -496,7 +524,7 @@ func (d *Dispatcher) authorizeHits(ctx context.Context, workspaceID, fallbackWor
 		workspaceID = fallbackWorkspace
 	}
 	for _, hit := range hits {
-		entry, err := d.store.GetNamespaceEntry(ctx, workspaceID, hit.SubjectID)
+		entry, err := d.resolveSubject(ctx, workspaceID, hit.SubjectID)
 		if err != nil {
 			continue
 		}
@@ -505,7 +533,8 @@ func (d *Dispatcher) authorizeHits(ctx context.Context, workspaceID, fallbackWor
 			displayPath = d.namespaceDisplayPath(ctx, workspaceID, entry)
 		}
 		authorized = append(authorized, command.SearchHitData{
-			SubjectRef:    entry.ID,
+			SubjectRef:    entry.SubjectRef,
+			EntryID:       entry.ID,
 			Path:          displayPath,
 			Name:          entry.DisplayName,
 			EntryType:     string(entry.EntryType),

@@ -38,12 +38,12 @@ func (p *retryFixtureProcessor) ProcessPublication(ctx context.Context, workspac
 		if node.Entry.EntryType != sqlite.EntryFile || node.Entry.ContentID == "" {
 			continue
 		}
-		attempt, err := p.insertAttempt(ctx, workspaceID, snapshotRef, node.Entry.ID, "FAILED", "PROCESSOR_STAGE_FAILED", 1, nil)
+		attempt, err := p.insertAttempt(ctx, workspaceID, snapshotRef, node.Entry.SubjectRef, "FAILED", "PROCESSOR_STAGE_FAILED", 1, nil)
 		if err != nil {
 			return err
 		}
 		return &retryFixtureError{targets: []ProcessorRetryTarget{{
-			SubjectRef: node.Entry.ID, RouteDigest: attempt.RouteDigest, Stage: attempt.Stage,
+			SubjectRef: node.Entry.SubjectRef, RouteDigest: attempt.RouteDigest, Stage: attempt.Stage,
 			CapabilityID: attempt.CapabilityID, PredecessorAttemptID: attempt.ID, ReasonCode: attempt.ReasonCode,
 		}}}
 	}

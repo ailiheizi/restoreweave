@@ -105,6 +105,29 @@ func (d *Dispatcher) handleViewList(ctx context.Context, env command.Envelope, s
 	return succeeded(env, started, projected)
 }
 
+// handleExportList returns the current frozen manifests from the durable
+// catalog projection. It never re-evaluates a SavedView or changes a manifest.
+func (d *Dispatcher) handleExportList(ctx context.Context, env command.Envelope, started time.Time) command.Result {
+	manifests, err := d.store.ListExportManifests(ctx)
+	if err != nil {
+		return catalogErrorResult(env, started, err)
+	}
+	projected := make([]command.ExportManifestData, 0, len(manifests))
+	for _, manifest := range manifests {
+		projected = append(projected, command.ExportManifestData{
+			ManifestID:     manifest.ManifestID,
+			ManifestDigest: manifest.ManifestDigest,
+			ViewID:         manifest.ViewID,
+			SubjectCount:   manifest.SubjectCount,
+			Representation: manifest.Representation,
+			Target:         manifest.Target,
+			CreatedAt:      formatUnixNano(manifest.CreatedAtNS),
+			Items:          append([]string(nil), manifest.Items...),
+		})
+	}
+	return succeeded(env, started, projected)
+}
+
 // resolveView reads a view by stable ID or human name. Stable IDs win when
 // both are supplied; an empty reference is an invalid input.
 func (d *Dispatcher) resolveView(ctx context.Context, viewID, name string) (sqlite.SavedView, error) {
@@ -404,7 +427,7 @@ func (d *Dispatcher) lookupSubjectAcrossWorkspaces(ctx context.Context, subjectR
 	if err != nil {
 		return sqlite.NamespaceEntry{}, err
 	}
-	return d.store.GetNamespaceEntry(ctx, workspace.ID, subjectRef)
+	return d.resolveSubject(ctx, workspace.ID, subjectRef)
 }
 
 // freezeExportItems projects stable subjects into frozen manifest items. Only
@@ -421,7 +444,7 @@ func (d *Dispatcher) freezeExportItems(ctx context.Context, entries []sqlite.Nam
 		contentID := strings.TrimSpace(entry.ContentID)
 		exactBytes := false
 		if contentID != "" {
-			if protection, err := d.store.GetProtectionRecordBySubject(ctx, entry.WorkspaceID, entry.ID); err == nil {
+			if protection, err := d.store.GetProtectionRecordBySubject(ctx, entry.WorkspaceID, entry.SubjectRef); err == nil {
 				if protection.Outcome == sqlite.ProtectionExactProtected || protection.Outcome == sqlite.ProtectionExactFallback {
 					exactBytes = true
 				}
@@ -604,7 +627,14 @@ func (d *Dispatcher) rebuildFrozenManifest(ctx context.Context, stored sqlite.Ex
 		TargetProfileDigest: exact.DescribeExportManifestProfile(d.exact.Repo),
 	}
 	for _, frozen := range frozenItems {
-		entry, lookupErr := d.lookupSubjectAcrossWorkspaces(ctx, frozen.SubjectRef)
+		// ExportManifest v1 stores the snapshot-local namespace entry handle.
+		// Never resolve this frozen handle through the stable-subject "latest"
+		// path: a later rescan must not rewrite an already frozen export.
+		workspace, lookupErr := d.store.GetWorkspaceByName(ctx, "default")
+		if lookupErr != nil {
+			return exact.ExportManifest{}, lookupErr
+		}
+		entry, lookupErr := d.store.GetNamespaceEntry(ctx, workspace.ID, frozen.SubjectRef)
 		if lookupErr != nil {
 			if containsNotFound(lookupErr) {
 				return exact.ExportManifest{}, fmt.Errorf("frozen subject %s is no longer in the catalog", frozen.SubjectRef)
@@ -614,20 +644,10 @@ func (d *Dispatcher) rebuildFrozenManifest(ctx context.Context, stored sqlite.Ex
 		if entry.EntryType != sqlite.EntryFile {
 			return exact.ExportManifest{}, fmt.Errorf("frozen subject %s is no longer a regular file", frozen.SubjectRef)
 		}
-		contentID := strings.TrimSpace(entry.ContentID)
-		exactBytes := false
-		if contentID != "" {
-			if protection, protectionErr := d.store.GetProtectionRecordBySubject(ctx, entry.WorkspaceID, entry.ID); protectionErr == nil {
-				if protection.Outcome == sqlite.ProtectionExactProtected || protection.Outcome == sqlite.ProtectionExactFallback {
-					exactBytes = true
-				}
-			}
-		}
-		item := frozen
-		item.ContentID = contentID
-		item.LogicalSize = sizeOrZero(entry.LogicalSize)
-		item.Exact = exactBytes
-		manifest.Items = append(manifest.Items, item)
+		// The stored item is the frozen authority. The entry lookup above only
+		// proves that the snapshot-local handle still identifies a file; current
+		// protection, content, and size records must never rewrite this manifest.
+		manifest.Items = append(manifest.Items, frozen)
 	}
 	digest, err := manifest.PrepareExportManifestDigest()
 	if err != nil {

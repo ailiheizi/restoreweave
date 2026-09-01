@@ -85,6 +85,7 @@ func TestAcousticFingerprintDimension(t *testing.T) {
 
 	lexical := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
+		"dimension":    search.DimensionLexical,
 		"query":        "Nightfall",
 	}))
 	if lexical.Status != command.StatusSucceeded {

@@ -191,6 +191,29 @@ backup, restore, offline check, and byte-tree diff (`repo=6,220 KiB`, ratio
 Plakar were absent and were recorded as failed binary checks. No engine
 selection or release claim follows from this run.
 
+### Restic incremental large-file mutation probe (2026-08-26)
+
+**This is one local candidate probe, not a RepositoryDriver admission or an
+engine-selection decision.** Restic 0.19.1 was exercised in an isolated
+temporary repository on the same Darwin arm64 host. The first snapshot held
+six 16 MiB files: four deterministic pseudo-random sources plus two exact
+duplicates, for 96 MiB logical content. The repository occupied 67,145,728
+bytes. A second snapshot changed a contiguous 1 MiB region inside one 16 MiB
+file and added another exact duplicate, bringing the logical snapshot to
+112 MiB. Retaining both snapshots grew the repository to 68,894,720 bytes, an
+increment of 1,748,992 bytes (about 10.4% of one whole 16 MiB file).
+
+`restic check` passed, and every restored file matched its source SHA-256.
+This demonstrates useful content-defined chunk reuse for a bounded
+large-file versioning case that whole-file deduplication cannot capture. It
+does not establish representative savings, repository compatibility, or
+release readiness. Linux/NAS behavior, the RestoreWeave RepositoryDriver
+mapping, encryption credentials, portable reader closure, corruption
+isolation, migration/rollback, and non-destructive lifecycle ownership remain
+open. The generated RestoreWeave profile therefore continues to use its
+existing whole-file development default; Restic remains a single candidate
+for a separately reviewed adapter and qualification run.
+
 ### Honesty constraints enforced by the measurement
 
 - Logical bytes come from placement receipts and decompressed readback, never

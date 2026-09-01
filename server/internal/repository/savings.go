@@ -272,6 +272,9 @@ func MeasureSavings(ctx context.Context, driver Driver, placements []Receipt) (S
 	if storedObjects > 0 && len(placements) == 0 {
 		return SavingsReport{}, errors.New("cannot measure savings honestly without the placement receipts observed during ingest")
 	}
+	if err := verifyPortableRecords(ctx, driver); err != nil {
+		return SavingsReport{}, fmt.Errorf("verify repository recovery records: %w", err)
+	}
 
 	// Overhead is measured from the repository layout. Index/model overhead is
 	// not measurable for the in-tree profiles and is deliberately not fabricated
@@ -291,6 +294,53 @@ func MeasureSavings(ctx context.Context, driver Driver, placements []Receipt) (S
 		report.Mechanisms = append(report.Mechanisms, SavingsMechanismCompression)
 	}
 	return report, nil
+}
+
+// verifyPortableRecords authenticates every recovery record that contributes
+// to the measured repository footprint. Counting a corrupt record as overhead
+// would allow a damaged recovery closure to accompany a successful savings
+// claim, even though the repository could no longer support its recovery
+// contract.
+func verifyPortableRecords(ctx context.Context, driver Driver) error {
+	records, ok := driver.(RecordDriver)
+	if !ok {
+		return errors.New("savings measurement requires a driver that reports portable recovery records")
+	}
+	for _, role := range []RecordRole{
+		RecordPreparedClosure,
+		RecordPublicationCommit,
+		RecordProcessorAttemptClosure,
+		RecordPortableFactClosure,
+	} {
+		digests, err := records.ListRecordDigests(ctx, role)
+		if err != nil {
+			return fmt.Errorf("list %s: %w", role, err)
+		}
+		for _, digest := range digests {
+			body, err := records.OpenRecord(ctx, role, digest)
+			if err != nil {
+				return fmt.Errorf("open %s/%s: %w", role, digest, err)
+			}
+			bytesRead, readErr := io.Copy(io.Discard, body)
+			closeErr := body.Close()
+			if readErr != nil {
+				return fmt.Errorf("read %s/%s: %w", role, digest, readErr)
+			}
+			if closeErr != nil {
+				return fmt.Errorf("close %s/%s: %w", role, digest, closeErr)
+			}
+			receipt := RecordReceipt{
+				RepositoryID: records.RepositoryIdentity(),
+				Role:         role,
+				Digest:       digest,
+				Bytes:        bytesRead,
+			}
+			if err := records.VerifyRecord(ctx, receipt); err != nil {
+				return fmt.Errorf("verify %s/%s: %w", role, digest, err)
+			}
+		}
+	}
+	return nil
 }
 
 // storageRoot unwraps a directory-backed driver (raw or zstd) and returns its

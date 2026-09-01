@@ -53,6 +53,18 @@ type ZvecSegment struct {
 	Vector    []float32
 }
 
+// ZvecCoverageIdentity is backend-owned evidence for one indexed row. Both
+// fields are required: a segment ID alone cannot prove that the row belongs
+// to the subject whose durable text was admitted.
+type ZvecCoverageIdentity struct {
+	SubjectID string `json:"subject_id"`
+	SegmentID string `json:"segment_id"`
+}
+
+// ZvecSegmentIdentity is retained as a descriptive alias for callers that
+// refer to the evidence as a segment identity rather than coverage evidence.
+type ZvecSegmentIdentity = ZvecCoverageIdentity
+
 type ZvecGenerationReceipt struct {
 	Path          string
 	LibraryDigest string
@@ -88,6 +100,13 @@ type ZvecGenerationReadiness interface {
 	ZvecReady(libraryPath, libraryDigest string, manifest EmbeddingGenerationManifest) bool
 }
 
+// ZvecGenerationMembershipVerifier is an optional backend capability used to
+// validate query candidates against one exact generation without performing a
+// full coverage scan for every query.
+type ZvecGenerationMembershipVerifier interface {
+	VerifyMembership(context.Context, ZvecGenerationSpec, []ZvecCoverageIdentity) error
+}
+
 func NewZvecGenerationDriver(libraryPath string) ZvecGenerationDriver {
 	return newZvecGenerationBackend(libraryPath)
 }
@@ -99,6 +118,7 @@ type zvecGenerationMetadata struct {
 	ProfileDigest string                      `json:"profile_digest"`
 	Manifest      EmbeddingGenerationManifest `json:"manifest"`
 	SegmentIDs    []string                    `json:"segment_ids,omitempty"`
+	Identities    []ZvecCoverageIdentity      `json:"identities,omitempty"`
 }
 
 const zvecGenerationMetadataSchema = "restoreweave.zvec-generation.v1"
@@ -275,6 +295,20 @@ func validateZvecSegments(segments []ZvecSegment, dimension int) error {
 		if len(segment.Vector) != dimension {
 			return fmt.Errorf("%w: segment %q has dimension %d, want %d", ErrInvalidZvecGeneration, segment.SegmentID, len(segment.Vector), dimension)
 		}
+		for _, value := range segment.Vector {
+			if err := validateSemanticVectorValues([]float32{value}, ""); err != nil {
+				return fmt.Errorf("%w: segment %q has invalid vector: %v", ErrInvalidZvecGeneration, segment.SegmentID, err)
+			}
+		}
+	}
+	return nil
+}
+
+func validateZvecSegmentVectors(segments []ZvecSegment, manifest EmbeddingGenerationManifest) error {
+	for _, segment := range segments {
+		if err := validateSemanticVectorValues(segment.Vector, manifest.Normalization); err != nil {
+			return fmt.Errorf("%w: segment %q has invalid vector: %v", ErrInvalidZvecGeneration, segment.SegmentID, err)
+		}
 	}
 	return nil
 }
@@ -282,6 +316,12 @@ func validateZvecSegments(segments []ZvecSegment, dimension int) error {
 func writeZvecGenerationMetadata(path string, metadata zvecGenerationMetadata) error {
 	if metadata.Schema != zvecGenerationMetadataSchema || validateZvecLibraryDigest(metadata.LibraryDigest) != nil {
 		return fmt.Errorf("%w: metadata schema", ErrInvalidZvecGeneration)
+	}
+	if len(metadata.Identities) == 0 {
+		return fmt.Errorf("%w: metadata lacks subject/segment identity pairs", ErrInvalidZvecGeneration)
+	}
+	if err := validateZvecMetadataIdentityBinding(metadata); err != nil {
+		return err
 	}
 	payload, err := json.Marshal(metadata)
 	if err != nil {
@@ -293,6 +333,40 @@ func writeZvecGenerationMetadata(path string, metadata zvecGenerationMetadata) e
 	}
 	if err := os.Rename(tmp, filepath.Join(path, zvecGenerationMeta)); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateZvecCoverageIdentities(identities []ZvecCoverageIdentity) error {
+	seen := make(map[string]struct{}, len(identities))
+	for _, identity := range identities {
+		if strings.TrimSpace(identity.SubjectID) == "" || strings.TrimSpace(identity.SegmentID) == "" {
+			return fmt.Errorf("%w: metadata contains an incomplete subject/segment identity pair", ErrZvecUnavailable)
+		}
+		if _, ok := seen[identity.SegmentID]; ok {
+			return fmt.Errorf("%w: metadata contains duplicate segment identity %q", ErrZvecUnavailable, identity.SegmentID)
+		}
+		seen[identity.SegmentID] = struct{}{}
+	}
+	return nil
+}
+
+func validateZvecMetadataIdentityBinding(metadata zvecGenerationMetadata) error {
+	if len(metadata.Identities) == 0 {
+		return fmt.Errorf("%w: metadata lacks subject/segment identity pairs", ErrInvalidZvecGeneration)
+	}
+	if err := validateZvecCoverageIdentities(metadata.Identities); err != nil {
+		return err
+	}
+	if len(metadata.SegmentIDs) > 0 {
+		if len(metadata.SegmentIDs) != len(metadata.Identities) {
+			return fmt.Errorf("%w: metadata segment IDs and identity pairs differ", ErrInvalidZvecGeneration)
+		}
+		for i, id := range metadata.SegmentIDs {
+			if id != metadata.Identities[i].SegmentID {
+				return fmt.Errorf("%w: metadata segment IDs and identity pairs differ", ErrInvalidZvecGeneration)
+			}
+		}
 	}
 	return nil
 }
@@ -323,5 +397,17 @@ func readZvecGenerationMetadata(path string) (zvecGenerationMetadata, error) {
 		normalizedIDs = append(normalizedIDs, id)
 	}
 	metadata.SegmentIDs = normalizedIDs
+	if len(metadata.Identities) > 0 {
+		if err := validateZvecCoverageIdentities(metadata.Identities); err != nil {
+			return zvecGenerationMetadata{}, err
+		}
+		for i := range metadata.Identities {
+			metadata.Identities[i].SubjectID = strings.TrimSpace(metadata.Identities[i].SubjectID)
+			metadata.Identities[i].SegmentID = strings.TrimSpace(metadata.Identities[i].SegmentID)
+		}
+		if err := validateZvecMetadataIdentityBinding(metadata); err != nil {
+			return zvecGenerationMetadata{}, fmt.Errorf("%w: %v", ErrZvecUnavailable, err)
+		}
+	}
 	return metadata, nil
 }

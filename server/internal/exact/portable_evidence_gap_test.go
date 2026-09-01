@@ -22,6 +22,13 @@ type portableEvidenceFixture struct {
 	result  IngestResult
 }
 
+func portableFactRecordSchemaForTest(bundle portableFactBundle) string {
+	if bundle.Schema == PortableFactBundleSchemaV2 {
+		return PortableFactRecordSchemaV2
+	}
+	return PortableFactRecordSchemaV1
+}
+
 func newPortableEvidenceFixture(t *testing.T) portableEvidenceFixture {
 	t.Helper()
 	ctx := context.Background()
@@ -138,8 +145,12 @@ func replacePortableFactBundleForTest(t *testing.T, fixture signedPublicationFix
 	if err != nil {
 		t.Fatal(err)
 	}
+	envelopeSchema := PortableFactClosureEnvelopeSchemaV1
+	if signed.Schema == PortableFactClosureSchemaV2 {
+		envelopeSchema = PortableFactClosureEnvelopeSchemaV2
+	}
 	payload, err := CanonicalJSON(PortableFactClosureEnvelope{
-		Schema: PortableFactClosureEnvelopeSchemaV1, Closure: signed, Bundle: bundleBytes,
+		Schema: envelopeSchema, Closure: signed, Bundle: bundleBytes,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -388,7 +399,7 @@ func TestPortableEvidenceAllowsAdditionalDurableMetadataFact(t *testing.T) {
 			t.Fatal(err)
 		}
 		bundle.Records = append(bundle.Records, portableFactRecord{
-			Schema: PortableFactRecordSchemaV1, RecordKind: "METADATA_FACT", RecordID: "metadata:durable-extra",
+			Schema: portableFactRecordSchemaForTest(*bundle), RecordKind: "METADATA_FACT", RecordID: "metadata:durable-extra",
 			WorkspaceID: bundle.WorkspaceID, SnapshotRef: bundle.SnapshotRef, StableSubjectRef: subject,
 			Revision: 1, PayloadDigest: DigestBytes(payload), PayloadLength: int64(len(payload)),
 			Provenance: json.RawMessage(`{"authority":"test"}`), Payload: payload,
@@ -423,7 +434,7 @@ func appendPortableMetadataFactForTest(t *testing.T, bundle *portableFactBundle)
 		t.Fatal(err)
 	}
 	bundle.Records = append(bundle.Records, portableFactRecord{
-		Schema: PortableFactRecordSchemaV1, RecordKind: "METADATA_FACT", RecordID: value.ID,
+		Schema: portableFactRecordSchemaForTest(*bundle), RecordKind: "METADATA_FACT", RecordID: value.ID,
 		WorkspaceID: bundle.WorkspaceID, SnapshotRef: bundle.SnapshotRef, StableSubjectRef: subject,
 		Revision: 1, PayloadDigest: DigestBytes(payload), PayloadLength: int64(len(payload)),
 		Provenance: json.RawMessage(`{"authority":"test"}`), Payload: payload,
@@ -572,7 +583,7 @@ func appendPortableAnnotationRevisionForTest(t *testing.T, bundle *portableFactB
 		t.Fatal(err)
 	}
 	bundle.Records = append(bundle.Records, portableFactRecord{
-		Schema: PortableFactRecordSchemaV1, RecordKind: "ANNOTATION_REVISION", RecordID: value.ID,
+		Schema: portableFactRecordSchemaForTest(*bundle), RecordKind: "ANNOTATION_REVISION", RecordID: value.ID,
 		WorkspaceID: bundle.WorkspaceID, SnapshotRef: bundle.SnapshotRef, StableSubjectRef: subjectRef,
 		Revision: revision, PredecessorRecordID: predecessorID, PayloadDigest: DigestBytes(payload),
 		PayloadLength: int64(len(payload)), Provenance: append(json.RawMessage(nil), previous.Provenance...), Payload: payload,
@@ -598,7 +609,7 @@ func appendPortableDescriptionRevisionForTest(t *testing.T, bundle *portableFact
 		t.Fatal(err)
 	}
 	bundle.Records = append(bundle.Records, portableFactRecord{
-		Schema: PortableFactRecordSchemaV1, RecordKind: "DESCRIPTION_REVISION", RecordID: value.ID,
+		Schema: portableFactRecordSchemaForTest(*bundle), RecordKind: "DESCRIPTION_REVISION", RecordID: value.ID,
 		WorkspaceID: bundle.WorkspaceID, SnapshotRef: bundle.SnapshotRef, StableSubjectRef: subjectRef,
 		Revision: revision, PredecessorRecordID: predecessorID, PayloadDigest: DigestBytes(payload),
 		PayloadLength: int64(len(payload)), Provenance: append(json.RawMessage(nil), previous.Provenance...), Payload: payload,
@@ -1054,7 +1065,11 @@ func TestPortableEvidenceRejectsConflictingFactSuccessor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload, err := CanonicalJSON(PortableFactClosureEnvelope{Schema: PortableFactClosureEnvelopeSchemaV1, Closure: signed, Bundle: bundleBytes})
+	envelopeSchema := PortableFactClosureEnvelopeSchemaV1
+	if signed.Schema == PortableFactClosureSchemaV2 {
+		envelopeSchema = PortableFactClosureEnvelopeSchemaV2
+	}
+	payload, err := CanonicalJSON(PortableFactClosureEnvelope{Schema: envelopeSchema, Closure: signed, Bundle: bundleBytes})
 	if err != nil {
 		t.Fatal(err)
 	}

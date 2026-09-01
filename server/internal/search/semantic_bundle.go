@@ -99,6 +99,15 @@ func PackageSemanticBundle(destination string, descriptor SemanticBundleDescript
 	if err := descriptor.validateFacts(); err != nil {
 		return SemanticBundleAdmission{}, err
 	}
+	// Validate every descriptor path before creating a staging directory or
+	// opening any source.  LoadSemanticBundle performs the same check on the
+	// published tree, but doing it here prevents a malicious descriptor from
+	// writing outside the stage before that later admission step can reject it.
+	for _, entry := range descriptor.assets() {
+		if err := validateSemanticBundleAssetPath(entry.Asset.Path); err != nil {
+			return SemanticBundleAdmission{}, fmt.Errorf("%w %s: %v", ErrSemanticBundleAsset, entry.Name, err)
+		}
+	}
 	destination, err := canonicalSemanticBundleRoot(destination)
 	if err != nil {
 		return SemanticBundleAdmission{}, err
@@ -204,24 +213,127 @@ func validateSemanticBundlePath(path string, allowMissingFinal bool) error {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return fmt.Errorf("%w: path must be absolute and canonical", ErrInvalidSemanticBundle)
 	}
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) && allowMissingFinal {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("%w: symlink component %q", ErrInvalidSemanticBundle, path)
-	}
-	parent := filepath.Dir(path)
-	if parent != path {
-		parentInfo, parentErr := os.Lstat(parent)
-		if parentErr == nil && parentInfo.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("%w: symlink component %q", ErrInvalidSemanticBundle, parent)
+	volume := filepath.VolumeName(path)
+	current := volume + string(filepath.Separator)
+	remainder := strings.TrimPrefix(path, current)
+	parts := strings.Split(remainder, string(filepath.Separator))
+	for i, part := range parts {
+		if part == "" {
+			continue
+		}
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) {
+			if allowMissingFinal {
+				// Once a component is missing, MkdirAll may create the
+				// remainder, but every existing ancestor has already been
+				// checked above.
+				return nil
+			}
+			return err
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			resolved, resolveErr := filepath.EvalSymlinks(current)
+			if resolveErr != nil || !isAllowedPlatformPathAlias(current, resolved) {
+				return fmt.Errorf("%w: symlink component %q", ErrInvalidSemanticBundle, current)
+			}
+		}
+		if i < len(parts)-1 && !info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+			return fmt.Errorf("%w: path component %q is not a directory", ErrInvalidSemanticBundle, current)
 		}
 	}
 	return nil
+}
+
+// validateSemanticBundleAssetPath is the shared descriptor-path admission
+// check used before packaging and again while reading an installed bundle.
+// Paths are portable slash-separated relative paths and may not name the
+// manifest, escape the bundle root, or contain ambiguous components.
+func validateSemanticBundleAssetPath(value string) error {
+	if strings.TrimSpace(value) == "" {
+		return errors.New("path is required")
+	}
+	path := filepath.Clean(filepath.FromSlash(value))
+	portable := pathpkg.Clean(value)
+	if filepath.IsAbs(value) || pathpkg.IsAbs(value) || portable == "." || portable == ".." || strings.HasPrefix(portable, "../") || path == "." || filepath.ToSlash(path) != value {
+		return errors.New("path must be a canonical relative path inside the bundle")
+	}
+	for _, part := range strings.Split(value, "/") {
+		if part == "" || part == "." || part == ".." {
+			return errors.New("path contains a non-canonical component")
+		}
+	}
+	if value == SemanticBundleManifestName {
+		return fmt.Errorf("path is reserved for %s", SemanticBundleManifestName)
+	}
+	return nil
+}
+
+// ValidateSemanticBundleInstallDestination confirms that an admitted bundle
+// was published below the configured models root.  EvalSymlinks is used for
+// the containment comparison so Darwin aliases such as /var -> /private/var
+// compare correctly, while an internal symlink that resolves outside the
+// configured root is rejected.
+func ValidateSemanticBundleInstallDestination(modelsRoot, destination string) error {
+	modelsRoot, err := canonicalSemanticBundleRoot(modelsRoot)
+	if err != nil {
+		return err
+	}
+	destination, err = canonicalSemanticBundleRoot(destination)
+	if err != nil {
+		return err
+	}
+	if err := validateSemanticBundlePath(modelsRoot, false); err != nil {
+		return fmt.Errorf("%w: models root: %v", ErrInvalidSemanticBundle, err)
+	}
+	if err := validateSemanticBundlePath(destination, false); err != nil {
+		return fmt.Errorf("%w: destination path: %v", ErrInvalidSemanticBundle, err)
+	}
+	rootInfo, err := os.Stat(modelsRoot)
+	if err != nil {
+		return fmt.Errorf("%w: stat models root: %v", ErrInvalidSemanticBundle, err)
+	}
+	if !rootInfo.IsDir() {
+		return fmt.Errorf("%w: models root is not a directory", ErrInvalidSemanticBundle)
+	}
+	destinationInfo, err := os.Lstat(destination)
+	if err != nil {
+		return fmt.Errorf("%w: stat destination: %v", ErrInvalidSemanticBundle, err)
+	}
+	if destinationInfo.Mode()&os.ModeSymlink != 0 || !destinationInfo.IsDir() {
+		return fmt.Errorf("%w: destination must be a real directory", ErrInvalidSemanticBundle)
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(modelsRoot)
+	if err != nil {
+		return fmt.Errorf("%w: resolve models root: %v", ErrInvalidSemanticBundle, err)
+	}
+	resolvedDestination, err := filepath.EvalSymlinks(destination)
+	if err != nil {
+		return fmt.Errorf("%w: resolve destination: %v", ErrInvalidSemanticBundle, err)
+	}
+	relative, err := filepath.Rel(filepath.Clean(resolvedRoot), filepath.Clean(resolvedDestination))
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return fmt.Errorf("%w: destination escapes models root", ErrInvalidSemanticBundle)
+	}
+	return nil
+}
+
+func isAllowedPlatformPathAlias(path, resolved string) bool {
+	if runtime.GOOS != "darwin" {
+		return false
+	}
+	path = filepath.Clean(path)
+	resolved = filepath.Clean(resolved)
+	for _, alias := range []string{"/var", "/tmp", "/etc"} {
+		if path == alias || strings.HasPrefix(path, alias+string(filepath.Separator)) {
+			canonical := filepath.Join("/private", strings.TrimPrefix(path, "/"))
+			return resolved == canonical || strings.HasPrefix(resolved, canonical+string(filepath.Separator))
+		}
+	}
+	return false
 }
 
 const (
@@ -325,6 +437,12 @@ func (d SemanticBundleDescriptor) validateFacts() error {
 	seen := make(map[string]string, len(d.assets()))
 	for _, entry := range d.assets() {
 		path := entry.Asset.Path
+		if err := validateSemanticBundleAssetPath(path); err != nil {
+			return fmt.Errorf("%w: asset %s: %v", ErrInvalidSemanticBundle, entry.Name, err)
+		}
+		if err := validateSHA256(entry.Asset.SHA256); err != nil {
+			return fmt.Errorf("%w: asset %s digest: %v", ErrInvalidSemanticBundle, entry.Name, err)
+		}
 		if previous, ok := seen[path]; ok && path != "" {
 			return fmt.Errorf("%w: assets %s and %s reuse path %q", ErrInvalidSemanticBundle, previous, entry.Name, path)
 		}
@@ -382,16 +500,10 @@ func canonicalSemanticBundleRoot(root string) (string, error) {
 // returned by the platform no-follow opener. Unix builds use descriptor-
 // relative openat calls; fallback builds retain the strict component walk.
 func openBundleAsset(root string, entry semanticBundleAssetEntry) (*os.File, error) {
+	if err := validateSemanticBundleAssetPath(entry.Asset.Path); err != nil {
+		return nil, fmt.Errorf("%w %s: %v", ErrSemanticBundleAsset, entry.Name, err)
+	}
 	path := filepath.Clean(filepath.FromSlash(entry.Asset.Path))
-	portablePath := pathpkg.Clean(entry.Asset.Path)
-	if strings.TrimSpace(entry.Asset.Path) == "" || filepath.IsAbs(entry.Asset.Path) || pathpkg.IsAbs(entry.Asset.Path) || portablePath == "." || portablePath == ".." || strings.HasPrefix(portablePath, "../") || filepath.ToSlash(path) != entry.Asset.Path {
-		return nil, fmt.Errorf("%w %s: path must be a relative path inside bundle root", ErrSemanticBundleAsset, entry.Name)
-	}
-	for _, part := range strings.Split(entry.Asset.Path, "/") {
-		if part == ".." || part == "." || part == "" {
-			return nil, fmt.Errorf("%w %s: path contains non-canonical component", ErrSemanticBundleAsset, entry.Name)
-		}
-	}
 	if err := validateSHA256(entry.Asset.SHA256); err != nil {
 		return nil, fmt.Errorf("%w %s: %v", ErrSemanticBundleAsset, entry.Name, err)
 	}
@@ -636,6 +748,14 @@ func (a SemanticBundleAdmission) validate() error {
 		return fmt.Errorf("%w: admission profile digest does not match descriptor", ErrInvalidSemanticBundle)
 	}
 	return nil
+}
+
+// Validate rechecks the complete content-addressed admission. Callers that
+// receive an admission through a process boundary must not trust only its
+// profile ID or digest string; every declared asset and the derived profile
+// digest are part of the claim.
+func (a SemanticBundleAdmission) Validate() error {
+	return a.validate()
 }
 
 // VerifyPinnedProfile compares the measured bundle identity with a digest

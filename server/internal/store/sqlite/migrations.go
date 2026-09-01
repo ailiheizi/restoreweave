@@ -1554,6 +1554,94 @@ END;
 PRAGMA user_version = 21;
 `,
 	},
+	{
+		version: 22,
+		name:    "stable_subject_refs",
+		sql: `
+-- Namespace entry IDs are immutable snapshot-local observations.  A stable
+-- subject reference lets later committed observations at the same source
+-- path retain user-facing facts without making paths or content identity the
+-- subject.  Legacy rows retain their existing nse_* identity until a future
+-- observation establishes a new subj_* identity.
+ALTER TABLE namespace_entries ADD COLUMN subject_ref TEXT NOT NULL DEFAULT '';
+DROP TRIGGER namespace_entries_no_update;
+UPDATE namespace_entries SET subject_ref = namespace_entry_id WHERE subject_ref = '';
+
+-- Do not rewrite pre-upgrade rows. Their entry IDs may already be referenced
+-- by durable facts and portable records, so changing them would silently
+-- reinterpret historical ownership. The first post-upgrade refresh resolves
+-- the newest committed entry ID for a source/path/type and new observations
+-- then carry that ID forward through the operational resolver.
+
+CREATE TRIGGER namespace_entries_no_update
+BEFORE UPDATE ON namespace_entries BEGIN
+    SELECT RAISE(ABORT, 'namespace entries are immutable; publish a new snapshot');
+END;
+
+CREATE INDEX namespace_entries_subject_idx
+    ON namespace_entries(workspace_id, subject_ref, created_at_ns, namespace_entry_id);
+CREATE INDEX namespace_entries_continuity_idx
+    ON namespace_entries(workspace_id, namespace_root_id, full_path_key, entry_type);
+CREATE TRIGGER namespace_entries_subject_source_consistency
+BEFORE INSERT ON namespace_entries
+WHEN EXISTS (
+    SELECT 1
+    FROM namespace_entries AS existing
+    JOIN namespace_roots AS existing_root
+      ON existing_root.workspace_id = existing.workspace_id
+     AND existing_root.namespace_root_id = existing.namespace_root_id
+    JOIN namespace_roots AS incoming_root
+      ON incoming_root.workspace_id = NEW.workspace_id
+     AND incoming_root.namespace_root_id = NEW.namespace_root_id
+    WHERE existing.workspace_id = NEW.workspace_id
+      AND existing.subject_ref = NEW.subject_ref
+      AND existing_root.source_id <> incoming_root.source_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'a stable subject cannot span sources');
+END;
+
+PRAGMA user_version = 22;
+`,
+	},
+	{
+		version: 23,
+		name:    "index_generation_roots",
+		sql: `
+-- A generation is a projection of the exact namespace roots admitted at
+-- build time. The legacy namespace_root_id column remains for compatibility;
+-- this relation is the authoritative multi-source scope for new generations.
+CREATE TABLE index_generation_roots (
+    generation_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    namespace_root_id TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, generation_id, source_id),
+    UNIQUE (workspace_id, generation_id, namespace_root_id),
+    FOREIGN KEY (workspace_id, generation_id)
+        REFERENCES index_generations(workspace_id, generation_id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, source_id)
+        REFERENCES sources(workspace_id, source_id) ON DELETE RESTRICT,
+    FOREIGN KEY (workspace_id, namespace_root_id)
+        REFERENCES namespace_roots(workspace_id, namespace_root_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE INDEX index_generation_roots_root_idx
+    ON index_generation_roots(workspace_id, namespace_root_id);
+
+CREATE TRIGGER index_generation_roots_source_root_consistency
+BEFORE INSERT ON index_generation_roots BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM namespace_roots
+        WHERE workspace_id = NEW.workspace_id
+          AND namespace_root_id = NEW.namespace_root_id
+          AND source_id = NEW.source_id
+    ) THEN RAISE(ABORT, 'index generation root source mismatch') END;
+END;
+
+PRAGMA user_version = 23;
+`,
+	},
 }
 
 func (s *Store) migrate(ctx context.Context) error {

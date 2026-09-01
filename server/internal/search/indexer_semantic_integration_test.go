@@ -38,8 +38,9 @@ func (failingSemanticProvider) Embed(context.Context, SemanticEmbeddingRequest) 
 }
 
 type integrationSemanticGenerationDriver struct {
-	mu     sync.Mutex
-	byPath map[string][]ZvecSegment
+	mu               sync.Mutex
+	byPath           map[string][]ZvecSegment
+	membershipByPath map[string]map[ZvecCoverageIdentity]struct{}
 }
 
 func (d *integrationSemanticGenerationDriver) ZvecReady(string, string, EmbeddingGenerationManifest) bool {
@@ -58,9 +59,17 @@ func (d *integrationSemanticGenerationDriver) Build(_ context.Context, spec Zvec
 	if d.byPath == nil {
 		d.byPath = make(map[string][]ZvecSegment)
 	}
+	if d.membershipByPath == nil {
+		d.membershipByPath = make(map[string]map[ZvecCoverageIdentity]struct{})
+	}
 	copySegments := make([]ZvecSegment, len(segments))
 	copy(copySegments, segments)
 	d.byPath[spec.Path] = copySegments
+	membership := make(map[ZvecCoverageIdentity]struct{}, len(segments))
+	for _, segment := range segments {
+		membership[ZvecCoverageIdentity{SubjectID: segment.SubjectID, SegmentID: segment.SegmentID}] = struct{}{}
+	}
+	d.membershipByPath[spec.Path] = membership
 	return ZvecGenerationReceipt{Path: spec.Path, LibraryDigest: spec.LibraryDigest, ProfileDigest: spec.ProfileDigest, Dimension: spec.Manifest.Dimension, SegmentCount: len(segments)}, nil
 }
 
@@ -80,6 +89,29 @@ func (d *integrationSemanticGenerationDriver) Coverage(_ context.Context, spec Z
 		ids = append(ids, segment.SegmentID)
 	}
 	return ids, nil
+}
+
+func (d *integrationSemanticGenerationDriver) CoveragePairs(_ context.Context, spec ZvecGenerationSpec) ([]ZvecCoverageIdentity, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	segments := d.byPath[spec.Path]
+	pairs := make([]ZvecCoverageIdentity, 0, len(segments))
+	for _, segment := range segments {
+		pairs = append(pairs, ZvecCoverageIdentity{SubjectID: segment.SubjectID, SegmentID: segment.SegmentID})
+	}
+	return pairs, nil
+}
+
+func (d *integrationSemanticGenerationDriver) VerifyMembership(_ context.Context, spec ZvecGenerationSpec, candidates []ZvecCoverageIdentity) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	known := d.membershipByPath[spec.Path]
+	for _, candidate := range candidates {
+		if _, ok := known[candidate]; !ok {
+			return ErrZvecUnavailable
+		}
+	}
+	return nil
 }
 
 func (d *integrationSemanticGenerationDriver) remove(path, segmentID string) {
@@ -271,8 +303,8 @@ func TestIndexerRebuildLatestScopesSemanticNotesToPublishedRoot(t *testing.T) {
 	if semantic.NamespaceRootID != newRootID || semantic.SnapshotRef != "snapshot:new" {
 		t.Fatalf("latest semantic generation = %+v", semantic)
 	}
-	if got := len(driver.byPath[semantic.DBPath]); got != 2 {
-		t.Fatalf("semantic segment count = %d, want 2", got)
+	if got := len(driver.byPath[semantic.DBPath]); got != 3 {
+		t.Fatalf("semantic segment count = %d, want 3 (directory filename plus note/description)", got)
 	}
 	seen := make(map[string]bool)
 	for _, segment := range driver.byPath[semantic.DBPath] {
@@ -399,7 +431,7 @@ func TestIndexerRebuildLatestRetainsPublishedSources(t *testing.T) {
 	}
 	for query, want := range map[string]string{"source A semantic": seed.FileEntryID, "source-b": secondFileID} {
 		hits, queryErr := indexer.Engine.Query(ctx, generation.DBPath, query, nil)
-		if queryErr != nil || len(hits) != 1 || hits[0].SubjectID != want {
+		if queryErr != nil || !containsSemanticSubject(hits, want) {
 			t.Fatalf("lexical query %q = %+v, err=%v", query, hits, queryErr)
 		}
 	}
@@ -411,11 +443,209 @@ func TestIndexerRebuildLatestRetainsPublishedSources(t *testing.T) {
 		t.Fatal("semantic index is not ready after source B rebuild")
 	}
 	_, hits, err := indexer.Query(ctx, QueryRequest{WorkspaceID: seed.WorkspaceID, Dimension: DimensionSemantic, Text: "source A semantic"})
-	if err != nil || len(hits) != 1 || hits[0].SubjectID != seed.FileEntryID {
+	if err != nil || !containsSemanticSubject(hits, seed.FileEntryID) {
 		t.Fatalf("semantic source A query = %+v, err=%v", hits, err)
+	}
+	_, hits, err = indexer.Query(ctx, QueryRequest{WorkspaceID: seed.WorkspaceID, Dimension: DimensionSemantic, Text: "source-b"})
+	if err != nil || !containsSemanticSubject(hits, secondFileID) {
+		t.Fatalf("semantic source B query = %+v, err=%v", hits, err)
 	}
 	if semantic.NamespaceRootID != secondRootID || semantic.SnapshotRef != "snapshot:source-b" {
 		t.Fatalf("semantic generation trigger = %+v", semantic)
+	}
+	roots, err := store.ListIndexGenerationRoots(ctx, seed.WorkspaceID, semantic.ID)
+	if err != nil || len(roots) != 2 {
+		t.Fatalf("semantic generation roots = %+v, err=%v", roots, err)
+	}
+	rootSet := map[string]bool{}
+	for _, root := range roots {
+		rootSet[root.ID] = true
+	}
+	if !rootSet[seed.RootID] || !rootSet[secondRootID] {
+		t.Fatalf("semantic generation roots = %+v, want both published roots", roots)
+	}
+}
+
+func TestIndexerPinnedSemanticGenerationRetainsOldRootAfterRepublish(t *testing.T) {
+	ctx := context.Background()
+	store := testutil.OpenStore(t, filepath.Join(t.TempDir(), "catalog.sqlite"))
+	seed := testutil.SeedNamespace(t, store)
+	oldDescriptionID := mustSearchID(t, sqlite.IDPrefixDescription)
+	oldSegmentID := mustSearchID(t, sqlite.IDPrefixSemanticSegment)
+	if err := store.InsertDescriptionDocument(ctx, &sqlite.DescriptionDocument{
+		ID: oldDescriptionID, WorkspaceID: seed.WorkspaceID, SubjectRef: seed.FileEntryID,
+		Kind: sqlite.DescriptionUser, Language: "en", Body: "old pinned root text",
+		SourceRef: "user:old-pinned", ProducerProfile: "human", Accepted: true,
+	}); err != nil {
+		t.Fatalf("insert old description: %v", err)
+	}
+	if err := store.InsertSemanticSegment(ctx, &sqlite.SemanticSegment{
+		ID: oldSegmentID, WorkspaceID: seed.WorkspaceID, DocumentID: oldDescriptionID,
+		SubjectRef: seed.FileEntryID, Ordinal: 0, Text: "old pinned root text", Language: "en", Section: "body",
+	}); err != nil {
+		t.Fatalf("insert old segment: %v", err)
+	}
+	manifest := testZvecManifest()
+	driver := &integrationSemanticGenerationDriver{}
+	indexer := &Indexer{
+		Store: store, Engine: &Engine{Dir: t.TempDir()}, ConfigDigest: manifest.ConfigDigest,
+		LexicalProfileDigest: ProfileDigest(DimensionLexical, LexicalProfileV1), SemanticManifest: manifest,
+		SemanticProvider: integrationSemanticProvider{}, SemanticZvec: driver,
+		SemanticLibraryPath: "/private/explicit/libzvec_c_api.dylib", SemanticLibraryDigest: "sha256:" + strings.Repeat("0", 64),
+	}
+	if _, err := indexer.Rebuild(ctx, seed.WorkspaceID, "snapshot:pinned-old", seed.RootID); err != nil {
+		t.Fatalf("build old generation: %v", err)
+	}
+	oldGeneration, err := store.LatestIndexGeneration(ctx, seed.WorkspaceID, DimensionSemantic)
+	if err != nil {
+		t.Fatalf("read old semantic generation: %v", err)
+	}
+
+	newScanID := mustSearchID(t, sqlite.IDPrefixScanGeneration)
+	newRootID := mustSearchID(t, sqlite.IDPrefixNamespaceRoot)
+	newEntryID := mustSearchID(t, sqlite.IDPrefixNamespaceEntry)
+	newBindingID := mustSearchID(t, sqlite.IDPrefixCaptureBinding)
+	newPublicationID := mustSearchID(t, sqlite.IDPrefixPublication)
+	if err := store.Update(ctx, func(tx *sqlite.Tx) error {
+		if err := tx.InsertScanGeneration(ctx, &sqlite.ScanGeneration{
+			ID: newScanID, WorkspaceID: seed.WorkspaceID, SourceID: seed.SourceID,
+			Generation: 2, ParentID: seed.ScanGenerationID, CaptureSetID: "capture:pinned-new",
+			CaptureSetDigest: "sha256:capture-pinned-new", State: sqlite.ScanRunning,
+			FullTraversal: true, Summary: json.RawMessage(`{}`),
+		}); err != nil {
+			return err
+		}
+		if err := tx.InsertNamespaceRoot(ctx, &sqlite.NamespaceRoot{
+			ID: newRootID, WorkspaceID: seed.WorkspaceID, SourceID: seed.SourceID,
+			ScanGenerationID: newScanID, SnapshotRef: "snapshot:pinned-new", Name: "Republished",
+			RootPathKey: []byte{}, FilesystemSemantics: "TEST", AuthorityDigest: "sha256:pinned-new",
+			Metadata: json.RawMessage(`{}`),
+		}); err != nil {
+			return err
+		}
+		if err := tx.InsertNamespaceEntry(ctx, &sqlite.NamespaceEntry{
+			ID: newEntryID, WorkspaceID: seed.WorkspaceID, RootID: newRootID,
+			RawName: []byte("new-pinned.txt"), DisplayName: "new-pinned.txt", FullPathKey: []byte("new-pinned.txt"),
+			EntryType: sqlite.EntryFile,
+		}); err != nil {
+			return err
+		}
+		if err := tx.InsertCaptureRootBinding(ctx, &sqlite.CaptureRootBinding{
+			ID: newBindingID, WorkspaceID: seed.WorkspaceID, SourceID: seed.SourceID,
+			ScanGenerationID: newScanID, CaptureMode: "ROOTED_FD", Profile: "test",
+			DisplayPath: "/republished", ConsistencyClaim: "SNAPSHOT", IdentityDigest: "sha256:pinned-binding",
+			Record: json.RawMessage(`{}`),
+		}); err != nil {
+			return err
+		}
+		return tx.InsertPublication(ctx, &sqlite.Publication{
+			ID: newPublicationID, WorkspaceID: seed.WorkspaceID, SnapshotRef: "snapshot:pinned-new",
+			ScanGenerationID: newScanID, BindingID: newBindingID, NamespaceRootID: newRootID,
+			ManifestDigest: "sha256:pinned-publication", Metadata: json.RawMessage(`{}`), CommittedAt: time.Unix(300, 0).UTC(),
+		})
+	}); err != nil {
+		t.Fatalf("publish replacement root: %v", err)
+	}
+	newDescriptionID := mustSearchID(t, sqlite.IDPrefixDescription)
+	newSegmentID := mustSearchID(t, sqlite.IDPrefixSemanticSegment)
+	if err := store.InsertDescriptionDocument(ctx, &sqlite.DescriptionDocument{
+		ID: newDescriptionID, WorkspaceID: seed.WorkspaceID, SubjectRef: newEntryID,
+		Kind: sqlite.DescriptionUser, Language: "en", Body: "new pinned root text",
+		SourceRef: "user:new-pinned", ProducerProfile: "human", Accepted: true,
+	}); err != nil {
+		t.Fatalf("insert new description: %v", err)
+	}
+	if err := store.InsertSemanticSegment(ctx, &sqlite.SemanticSegment{
+		ID: newSegmentID, WorkspaceID: seed.WorkspaceID, DocumentID: newDescriptionID,
+		SubjectRef: newEntryID, Ordinal: 0, Text: "new pinned root text", Language: "en", Section: "body",
+	}); err != nil {
+		t.Fatalf("insert new segment: %v", err)
+	}
+	if _, err := indexer.RebuildLatest(ctx, seed.WorkspaceID); err != nil {
+		t.Fatalf("build replacement generation: %v", err)
+	}
+	newGeneration, err := store.LatestIndexGeneration(ctx, seed.WorkspaceID, DimensionSemantic)
+	if err != nil {
+		t.Fatalf("read new semantic generation: %v", err)
+	}
+	if oldGeneration.ID == newGeneration.ID {
+		t.Fatal("republish reused the pinned semantic generation")
+	}
+	if _, hits, err := indexer.Query(ctx, QueryRequest{WorkspaceID: seed.WorkspaceID, GenerationID: oldGeneration.ID, Dimension: DimensionSemantic, Text: "old pinned"}); err != nil || !containsSemanticSubject(hits, seed.FileEntryID) || containsSemanticSubject(hits, newEntryID) {
+		t.Fatalf("pinned old semantic query = %+v, err=%v", hits, err)
+	}
+	if _, hits, err := indexer.Query(ctx, QueryRequest{WorkspaceID: seed.WorkspaceID, GenerationID: newGeneration.ID, Dimension: DimensionSemantic, Text: "new pinned"}); err != nil || !containsSemanticSubject(hits, newEntryID) || containsSemanticSubject(hits, seed.FileEntryID) {
+		t.Fatalf("new semantic query = %+v, err=%v", hits, err)
+	}
+	oldRoots, err := store.ListIndexGenerationRoots(ctx, seed.WorkspaceID, oldGeneration.ID)
+	if err != nil || len(oldRoots) != 1 || oldRoots[0].ID != seed.RootID {
+		t.Fatalf("old semantic roots = %+v, err=%v", oldRoots, err)
+	}
+	newRoots, err := store.ListIndexGenerationRoots(ctx, seed.WorkspaceID, newGeneration.ID)
+	if err != nil || len(newRoots) != 1 || newRoots[0].ID != newRootID {
+		t.Fatalf("new semantic roots = %+v, err=%v", newRoots, err)
+	}
+	otherWorkspace := mustSearchID(t, sqlite.IDPrefixWorkspace)
+	if _, _, err := indexer.Query(ctx, QueryRequest{WorkspaceID: otherWorkspace, GenerationID: oldGeneration.ID, Dimension: DimensionSemantic, Text: "old pinned"}); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("cross-workspace pinned query error = %v, want ErrUnavailable", err)
+	}
+}
+
+func TestIndexerSemanticWarmAndQueryFailClosedForMissingGenerationMapping(t *testing.T) {
+	ctx := context.Background()
+	store := testutil.OpenStore(t, filepath.Join(t.TempDir(), "catalog.sqlite"))
+	seed := testutil.SeedNamespace(t, store)
+	manifest := testZvecManifest()
+	driver := &integrationSemanticGenerationDriver{}
+	indexer := &Indexer{
+		Store: store, Engine: &Engine{Dir: t.TempDir()}, ConfigDigest: manifest.ConfigDigest,
+		LexicalProfileDigest: ProfileDigest(DimensionLexical, LexicalProfileV1), SemanticManifest: manifest,
+		SemanticProvider: integrationSemanticProvider{}, SemanticZvec: driver,
+		SemanticLibraryPath: "/private/explicit/libzvec_c_api.dylib", SemanticLibraryDigest: "sha256:" + strings.Repeat("0", 64),
+	}
+	legacy := &sqlite.IndexGeneration{
+		ID: mustSearchID(t, sqlite.IDPrefixIndexGeneration), WorkspaceID: seed.WorkspaceID,
+		SnapshotRef: seed.RootID, NamespaceRootID: seed.RootID, DBPath: filepath.Join(t.TempDir(), "legacy.zvec"),
+		Dimension: DimensionSemantic, ConfigDigest: manifest.ConfigDigest,
+		ProviderProfileDigest: manifest.CanonicalDigest(), SemanticSpace: manifest.SemanticSpace,
+	}
+	if err := store.InsertIndexGeneration(ctx, legacy); err != nil {
+		t.Fatalf("insert legacy semantic generation: %v", err)
+	}
+	if err := indexer.WarmSemanticGeneration(ctx, seed.WorkspaceID); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("warm missing mapping error = %v, want ErrUnavailable", err)
+	}
+	if IndexerReadiness(indexer).SemanticReal {
+		t.Fatal("missing generation mapping advertised semantic readiness")
+	}
+	if _, _, err := indexer.Query(ctx, QueryRequest{WorkspaceID: seed.WorkspaceID, GenerationID: legacy.ID, Dimension: DimensionSemantic, Text: "legacy"}); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("query missing mapping error = %v, want ErrUnavailable", err)
+	}
+	coverage, err := indexer.SemanticCoverage(ctx, seed.WorkspaceID)
+	if err != nil || coverage.Available || coverage.Complete || coverage.Notes != "semantic namespace provenance is unavailable" {
+		t.Fatalf("missing mapping coverage = %+v, err=%v", coverage, err)
+	}
+}
+
+func TestIndexerSemanticRebuildRequiresMembershipVerifier(t *testing.T) {
+	ctx := context.Background()
+	store := testutil.OpenStore(t, filepath.Join(t.TempDir(), "catalog.sqlite"))
+	seed := testutil.SeedNamespace(t, store)
+	manifest := testZvecManifest()
+	indexer := &Indexer{
+		Store: store, Engine: &Engine{Dir: t.TempDir()}, ConfigDigest: manifest.ConfigDigest,
+		LexicalProfileDigest: ProfileDigest(DimensionLexical, LexicalProfileV1), SemanticManifest: manifest,
+		SemanticProvider: integrationSemanticProvider{}, SemanticZvec: readinessZvecDriver{},
+		SemanticLibraryPath: "/private/explicit/libzvec_c_api.dylib", SemanticLibraryDigest: "sha256:" + strings.Repeat("0", 64),
+	}
+	if _, err := indexer.Rebuild(ctx, seed.WorkspaceID, "snapshot:missing-membership", seed.RootID); err != nil {
+		t.Fatalf("lexical rebuild should survive missing membership seam: %v", err)
+	}
+	if _, err := store.LatestIndexGeneration(ctx, seed.WorkspaceID, DimensionSemantic); !errors.Is(err, sqlite.ErrNotFound) {
+		t.Fatalf("semantic generation without membership seam = %v, want ErrNotFound", err)
+	}
+	if IndexerReadiness(indexer).SemanticReal {
+		t.Fatal("semantic rebuild without membership verifier advertised readiness")
 	}
 }
 
@@ -498,16 +728,23 @@ func TestIndexerSemanticRebuildQueryFuseAndProvenance(t *testing.T) {
 	}
 
 	_, hits, err := indexer.Query(ctx, QueryRequest{WorkspaceID: seed.WorkspaceID, Dimension: DimensionSemantic, Text: "flooded city"})
-	if err != nil || len(hits) != 1 || hits[0].SubjectID != seed.FileEntryID {
+	if err != nil || !containsSemanticSubject(hits, seed.FileEntryID) {
 		t.Fatalf("semantic query = %+v, err=%v", hits, err)
 	}
-	if len(hits[0].Segments) != 3 {
-		t.Fatalf("semantic provenance = %+v", hits[0].Segments)
+	var subjectHit *Hit
+	for i := range hits {
+		if hits[i].SubjectID == seed.FileEntryID {
+			subjectHit = &hits[i]
+			break
+		}
+	}
+	if subjectHit == nil || len(subjectHit.Segments) != 4 {
+		t.Fatalf("semantic provenance = %+v", hits)
 	}
 	seenSegments := map[string]bool{}
-	for _, segment := range hits[0].Segments {
+	for _, segment := range subjectHit.Segments {
 		if segment.MatchedText == "" || !segment.Accepted {
-			t.Fatalf("semantic provenance = %+v", hits[0].Segments)
+			t.Fatalf("semantic provenance = %+v", subjectHit.Segments)
 		}
 		if segment.SourceType == "DESCRIPTION" && (segment.DescriptionDocumentID != descriptionID || segment.SourceID != descriptionID || segment.Producer != "human") {
 			t.Fatalf("description provenance = %+v", segment)
@@ -518,7 +755,7 @@ func TestIndexerSemanticRebuildQueryFuseAndProvenance(t *testing.T) {
 		seenSegments[segment.SegmentID] = true
 	}
 	if !seenSegments[segmentID] || !seenSegments[segmentID2] || !seenSegments[annotationID] {
-		t.Fatalf("semantic segment provenance = %+v", hits[0].Segments)
+		t.Fatalf("semantic segment provenance = %+v", subjectHit.Segments)
 	}
 
 	_, filtered, err := indexer.Query(ctx, QueryRequest{WorkspaceID: seed.WorkspaceID, Dimension: DimensionSemantic, Text: "flooded", Filters: Filters{EntryType: string(sqlite.EntryFile), Language: "en"}})
@@ -526,8 +763,8 @@ func TestIndexerSemanticRebuildQueryFuseAndProvenance(t *testing.T) {
 		t.Fatalf("filtered semantic query = %+v, err=%v", filtered, err)
 	}
 	_, excluded, err := indexer.Query(ctx, QueryRequest{WorkspaceID: seed.WorkspaceID, Dimension: DimensionSemantic, Text: "flooded", Filters: Filters{EntryType: string(sqlite.EntryDirectory)}})
-	if err != nil || len(excluded) != 0 {
-		t.Fatalf("mismatched semantic filter = %+v, err=%v", excluded, err)
+	if err != nil || len(excluded) != 1 || excluded[0].SubjectID != seed.DirEntryID {
+		t.Fatalf("directory semantic filter = %+v, err=%v", excluded, err)
 	}
 
 	fused, err := indexer.Fuse(ctx, QueryRequest{WorkspaceID: seed.WorkspaceID, Text: "flooded", Fuse: []string{DimensionLexical, DimensionSemantic}, Filters: Filters{EntryType: string(sqlite.EntryFile)}})
@@ -543,7 +780,7 @@ func TestIndexerSemanticRebuildQueryFuseAndProvenance(t *testing.T) {
 		t.Fatal("semantic provider was not reported as real and ready")
 	}
 	coverage, err := indexer.SemanticCoverage(ctx, seed.WorkspaceID)
-	if err != nil || !coverage.Available || !coverage.Complete || coverage.Expected != 3 || coverage.Indexed != 3 || len(coverage.Missing) != 0 {
+	if err != nil || !coverage.Available || !coverage.Complete || coverage.Expected != 6 || coverage.Indexed != 6 || len(coverage.Missing) != 0 {
 		t.Fatalf("complete semantic coverage = %+v, err=%v", coverage, err)
 	}
 	driver.tamper(semantic.DBPath, ZvecSegment{SubjectID: seed.FileEntryID, SegmentID: "unknown-segment", Vector: []float32{1, 0, 0, 0}})
@@ -553,7 +790,7 @@ func TestIndexerSemanticRebuildQueryFuseAndProvenance(t *testing.T) {
 	}
 	driver.remove(semantic.DBPath, segmentID2)
 	coverage, err = indexer.SemanticCoverage(ctx, seed.WorkspaceID)
-	if err != nil || !coverage.Available || coverage.Complete || coverage.Expected != 3 || coverage.Indexed != 2 || len(coverage.Missing) != 1 || coverage.Missing[0] != segmentID2 {
+	if err != nil || !coverage.Available || coverage.Complete || coverage.Expected != 6 || coverage.Indexed != 5 || len(coverage.Missing) != 1 || coverage.Missing[0] != segmentID2 {
 		t.Fatalf("partial semantic coverage = %+v, err=%v", coverage, err)
 	}
 	// Restore the test generation before exercising provenance tampering below.
@@ -652,10 +889,19 @@ func TestIndexerSemanticProfileSwitchPreservesOldGenerationAndDescriptions(t *te
 		SemanticProvider: integrationSemanticProvider{}, SemanticZvec: driver,
 		SemanticLibraryPath: indexer.SemanticLibraryPath, SemanticLibraryDigest: indexer.SemanticLibraryDigest,
 	}
-	if _, hits, err := oldIndexer.Query(ctx, QueryRequest{WorkspaceID: seed.WorkspaceID, GenerationID: generationA.ID, Dimension: DimensionSemantic, Text: "profile"}); err != nil || len(hits) != 1 {
+	if _, hits, err := oldIndexer.Query(ctx, QueryRequest{WorkspaceID: seed.WorkspaceID, GenerationID: generationA.ID, Dimension: DimensionSemantic, Text: "profile"}); err != nil || !containsSemanticSubject(hits, seed.FileEntryID) {
 		t.Fatalf("old profile generation query = %+v, err=%v", hits, err)
 	}
-	if _, hits, err := indexer.Query(ctx, QueryRequest{WorkspaceID: seed.WorkspaceID, GenerationID: generationB.ID, Dimension: DimensionSemantic, Text: "profile"}); err != nil || len(hits) != 1 {
+	if _, hits, err := indexer.Query(ctx, QueryRequest{WorkspaceID: seed.WorkspaceID, GenerationID: generationB.ID, Dimension: DimensionSemantic, Text: "profile"}); err != nil || !containsSemanticSubject(hits, seed.FileEntryID) {
 		t.Fatalf("new profile generation query = %+v, err=%v", hits, err)
 	}
+}
+
+func containsSemanticSubject(hits []Hit, subjectID string) bool {
+	for _, hit := range hits {
+		if hit.SubjectID == subjectID {
+			return true
+		}
+	}
+	return false
 }

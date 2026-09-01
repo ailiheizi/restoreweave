@@ -214,7 +214,10 @@ func (h *Host) RetryPublication(ctx context.Context, workspaceID, snapshotRef, r
 	}
 	entries := make(map[string]sqlite.NamespaceEntry, len(nodes))
 	for _, node := range nodes {
-		entries[node.Entry.ID] = node.Entry
+		// Retry targets name stable subjects. Keep the namespace entry itself as
+		// the lookup value because source bytes and route evidence still come
+		// from the snapshot-local observation.
+		entries[node.Entry.SubjectRef] = node.Entry
 	}
 	attempts, err := h.Store.ListProcessorAttempts(ctx, workspaceID, snapshotRef)
 	if err != nil {
@@ -302,7 +305,7 @@ func (h *Host) RetryPublication(ctx context.Context, workspaceID, snapshotRef, r
 				message = runErr.Error()
 			}
 			issues = append(issues, SubjectIssue{
-				SubjectRef: entry.ID, ContentID: entry.ContentID, DisplayName: entry.DisplayName,
+				SubjectRef: entry.SubjectRef, ContentID: entry.ContentID, DisplayName: entry.DisplayName,
 				Stage: node.Stage, Capability: node.CapabilityID, Status: status,
 				ReasonCode: "PROCESSOR_RETRY_FAILED", Message: message,
 			})
@@ -403,7 +406,7 @@ func (h *Host) Process(ctx context.Context, workspaceID, snapshotRef, rootID str
 		if entry.EntryType != sqlite.EntryFile || entry.ContentID == "" {
 			continue
 		}
-		protection, protectionErr := h.Store.GetProtectionRecordBySubject(ctx, workspaceID, entry.ID)
+		protection, protectionErr := h.Store.GetProtectionRecordBySubject(ctx, workspaceID, entry.SubjectRef)
 		if protectionErr == nil && protection.LocalRepresentationID == "" {
 			switch protection.Mode {
 			case sqlite.ProtectionLinkOnly, sqlite.ProtectionMetadataOnly:
@@ -414,7 +417,7 @@ func (h *Host) Process(ctx context.Context, workspaceID, snapshotRef, rootID str
 			default:
 				report.Failed++
 				appendSubjectIssue(&report, SubjectIssue{
-					SubjectRef: entry.ID, ContentID: entry.ContentID, DisplayName: entry.DisplayName,
+					SubjectRef: entry.SubjectRef, ContentID: entry.ContentID, DisplayName: entry.DisplayName,
 					Status: StatusFailed, ReasonCode: "LOCAL_REPRESENTATION_UNAVAILABLE",
 					Message: "exact protection record has no local representation",
 				})
@@ -428,7 +431,7 @@ func (h *Host) Process(ctx context.Context, workspaceID, snapshotRef, rootID str
 			mu.Lock()
 			report.Cancelled++
 			appendSubjectIssue(&report, SubjectIssue{
-				SubjectRef: entry.ID, ContentID: entry.ContentID, DisplayName: entry.DisplayName,
+				SubjectRef: entry.SubjectRef, ContentID: entry.ContentID, DisplayName: entry.DisplayName,
 				Status: StatusCancelled, ReasonCode: "PROCESSOR_HOST_CANCELLED", Message: err.Error(),
 			})
 			mu.Unlock()
@@ -444,7 +447,7 @@ func (h *Host) Process(ctx context.Context, workspaceID, snapshotRef, rootID str
 			}
 			if processErr != nil && len(issues) == 0 {
 				appendSubjectIssue(&report, SubjectIssue{
-					SubjectRef: entry.ID, ContentID: entry.ContentID, DisplayName: entry.DisplayName,
+					SubjectRef: entry.SubjectRef, ContentID: entry.ContentID, DisplayName: entry.DisplayName,
 					Status: StatusFailed, ReasonCode: "PROCESSOR_SUBJECT_FAILED", Message: processErr.Error(),
 				})
 			}
@@ -464,7 +467,7 @@ func (h *Host) Process(ctx context.Context, workspaceID, snapshotRef, rootID str
 			mu.Lock()
 			report.Failed++
 			appendSubjectIssue(&report, SubjectIssue{
-				SubjectRef: entry.ID, ContentID: entry.ContentID, DisplayName: entry.DisplayName,
+				SubjectRef: entry.SubjectRef, ContentID: entry.ContentID, DisplayName: entry.DisplayName,
 				Status: StatusFailed, ReasonCode: "PROCESSOR_HOST_FAILED", Message: err.Error(),
 			})
 			mu.Unlock()
@@ -537,7 +540,7 @@ func (h *Host) processEntry(ctx context.Context, workspaceID, snapshotRef string
 				message = err.Error()
 			}
 			issues = append(issues, SubjectIssue{
-				SubjectRef: entry.ID, ContentID: entry.ContentID, DisplayName: entry.DisplayName,
+				SubjectRef: entry.SubjectRef, ContentID: entry.ContentID, DisplayName: entry.DisplayName,
 				Stage: node.Stage, Capability: node.CapabilityID, Status: status,
 				ReasonCode: reasonCode, Message: message,
 			})
@@ -648,7 +651,7 @@ func (h *Host) admitNode(ctx context.Context, workspaceID, snapshotRef string, e
 	admittedArtifact = &sqlite.ProcessorArtifact{
 		ID:             artifactID,
 		WorkspaceID:    workspaceID,
-		SubjectRef:     entry.ID,
+		SubjectRef:     entry.SubjectRef,
 		SnapshotRef:    snapshotRef,
 		RouteDigest:    route.Digest(),
 		Stage:          string(node.Stage),
@@ -732,7 +735,7 @@ func (h *Host) recordProcessorAttemptWithArtifact(ctx context.Context, attemptID
 	attempt := &sqlite.ProcessorAttempt{
 		ID:              attemptID,
 		WorkspaceID:     workspaceID,
-		SubjectRef:      entry.ID,
+		SubjectRef:      entry.SubjectRef,
 		SnapshotRef:     snapshotRef,
 		RouteDigest:     route.Digest(),
 		Route:           routeJSON,

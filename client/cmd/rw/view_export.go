@@ -149,7 +149,7 @@ func newExportCommand(env *clientEnv) *cobra.Command {
 	export.AddCommand(newExitCommand(env, "list",
 		"List frozen export manifests",
 		func(cmd *cobra.Command, env *clientEnv, args []string) int {
-			return env.request(cmd, command.OpViewList, nil, func(cmd *cobra.Command, result command.Result) error {
+			return env.request(cmd, command.OpExportList, nil, func(cmd *cobra.Command, result command.Result) error {
 				var data []command.ExportManifestData
 				if err := json.Unmarshal(result.Data, &data); err != nil {
 					return err

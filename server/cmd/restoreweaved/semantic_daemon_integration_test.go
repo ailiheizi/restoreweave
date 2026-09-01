@@ -99,7 +99,7 @@ func TestRealDaemonSemanticEndToEnd(t *testing.T) {
 	if semanticData.Dimension != search.DimensionSemantic || semanticData.Provider != search.ProviderSemanticONNX || len(semanticData.Hits) != 1 {
 		t.Fatalf("real daemon semantic query = %+v", semanticData)
 	}
-	if semanticData.Hits[0].SubjectRef != resolvedData.PathRef || len(semanticData.Hits[0].Segments) != 1 || semanticData.Hits[0].Segments[0].DescriptionDocumentID != description.Document.ID {
+	if semanticData.Hits[0].SubjectRef != resolvedData.Entry.SubjectRef || semanticData.Hits[0].EntryID != resolvedData.PathRef || len(semanticData.Hits[0].Segments) != 1 || semanticData.Hits[0].Segments[0].DescriptionDocumentID != description.Document.ID {
 		t.Fatalf("real daemon semantic provenance = %+v", semanticData.Hits[0])
 	}
 	assertSemanticCapability(t, runRWProcess(t, rwBin, socketPath, "capability", "list"), command.CapabilityAvailable)
@@ -159,7 +159,7 @@ func TestRealDaemonSemanticEndToEnd(t *testing.T) {
 		t.Fatalf("rebuilt semantic generation = %+v", rebuiltData)
 	}
 	for _, hit := range rebuiltData.Hits {
-		if hit.SubjectRef != resolvedData.PathRef {
+		if hit.SubjectRef != resolvedData.Entry.SubjectRef || hit.EntryID != resolvedData.PathRef {
 			t.Fatalf("rebuilt semantic hit escaped subject = %+v", hit)
 		}
 	}

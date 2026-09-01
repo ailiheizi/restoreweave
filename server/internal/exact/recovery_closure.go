@@ -21,6 +21,7 @@ const (
 	ProcessorAttemptClosureSchemaV1 = "org.restoreweave.processor-attempt-closure.v1"
 	ProcessorAttemptClosureSchemaV2 = "org.restoreweave.processor-attempt-closure.v2"
 	PortableFactClosureSchemaV1     = "org.restoreweave.portable-fact-closure.v1"
+	PortableFactClosureSchemaV2     = "org.restoreweave.portable-fact-closure.v2"
 	RecoverySignatureDomainV1       = "org.restoreweave.rw-mvp-1.recovery.v1"
 
 	PreparedClosureKind         = "PREPARED_CLOSURE"
@@ -510,7 +511,7 @@ func (record ProcessorAttemptClosureRecord) Verify(anchor TrustAnchor) error {
 }
 
 func (record PortableFactClosureRecord) validate() error {
-	if record.Schema != PortableFactClosureSchemaV1 || record.RecordKind != PortableFactClosureKind || record.SignatureDomain != RecoverySignatureDomainV1 {
+	if (record.Schema != PortableFactClosureSchemaV1 && record.Schema != PortableFactClosureSchemaV2) || record.RecordKind != PortableFactClosureKind || record.SignatureDomain != RecoverySignatureDomainV1 {
 		return fmt.Errorf("%w: portable fact closure schema, kind, or signature domain is invalid", ErrRecoveryRecordInvalid)
 	}
 	for name, value := range map[string]string{
@@ -528,7 +529,7 @@ func (record PortableFactClosureRecord) validate() error {
 	if !validExactContentID(record.ManifestDigest) || !validExactContentID(record.ParentCommitDigest) || !validExactContentID(record.BundleDigest) {
 		return fmt.Errorf("%w: portable fact closure digest is invalid", ErrRecoveryRecordInvalid)
 	}
-	if record.BundleSchema != PortableFactBundleSchemaV1 {
+	if record.Schema == PortableFactClosureSchemaV1 && record.BundleSchema != PortableFactBundleSchemaV1 || record.Schema == PortableFactClosureSchemaV2 && record.BundleSchema != PortableFactBundleSchemaV2 {
 		return fmt.Errorf("%w: unsupported portable fact bundle schema %q", ErrRecoveryRecordInvalid, record.BundleSchema)
 	}
 	if record.ProcessorAttemptDigest != "" && !validExactContentID(record.ProcessorAttemptDigest) {

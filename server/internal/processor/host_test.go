@@ -54,6 +54,83 @@ func TestTextExtractAdmitsUTF8AndSkipsBinary(t *testing.T) {
 	assertAttempt(t, attempts, CapabilityTextEmbedding, string(StatusInapplicable), "CAPABILITY_NOT_CONFIGURED")
 }
 
+func TestProcessorRescanUsesStableSubjectRefForAttemptsAndArtifacts(t *testing.T) {
+	ctx := context.Background()
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "stable.txt"), []byte("stable processor subject"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, repo := testLane(t)
+	host := NewHost(store, repo, Options{StagingDir: t.TempDir()})
+	service := &exact.Service{Store: store, Repo: repo, Processor: host}
+
+	first, err := service.Ingest(ctx, source)
+	if err != nil {
+		t.Fatalf("first ingest: %v", err)
+	}
+	firstEntries, err := store.ListNamespaceContent(ctx, first.WorkspaceID, first.RootID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(firstEntries) != 1 || firstEntries[0].SubjectRef == "" {
+		t.Fatalf("first namespace content = %+v", firstEntries)
+	}
+	firstEntry := firstEntries[0]
+
+	second, err := service.Ingest(ctx, source)
+	if err != nil {
+		t.Fatalf("second ingest: %v", err)
+	}
+	secondEntries, err := store.ListNamespaceContent(ctx, second.WorkspaceID, second.RootID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(secondEntries) != 1 {
+		t.Fatalf("second namespace content = %+v", secondEntries)
+	}
+	secondEntry := secondEntries[0]
+	if secondEntry.ID == firstEntry.ID || secondEntry.SubjectRef != firstEntry.SubjectRef {
+		t.Fatalf("processor rescan subject mapping = first=%+v second=%+v", firstEntry, secondEntry)
+	}
+
+	for _, result := range []struct {
+		name        string
+		workspace   string
+		snapshot    string
+		wantSubject string
+	}{
+		{name: "first", workspace: first.WorkspaceID, snapshot: first.SnapshotRef, wantSubject: firstEntry.SubjectRef},
+		{name: "second", workspace: second.WorkspaceID, snapshot: second.SnapshotRef, wantSubject: secondEntry.SubjectRef},
+	} {
+		t.Run(result.name, func(t *testing.T) {
+			attempts, err := store.ListProcessorAttempts(ctx, result.workspace, result.snapshot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(attempts) == 0 {
+				t.Fatalf("processor attempts = %+v", attempts)
+			}
+			for _, attempt := range attempts {
+				if attempt.SubjectRef != result.wantSubject {
+					t.Fatalf("attempt subject ref = %q, want %q: %+v", attempt.SubjectRef, result.wantSubject, attempt)
+				}
+			}
+			artifacts, err := store.ListAdmittedArtifacts(ctx, result.workspace, result.snapshot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(artifacts) == 0 {
+				t.Fatalf("processor artifacts = %+v", artifacts)
+			}
+			for _, artifact := range artifacts {
+				if artifact.SubjectRef != result.wantSubject {
+					t.Fatalf("artifact subject ref = %q, want %q: %+v", artifact.SubjectRef, result.wantSubject, artifact)
+				}
+			}
+		})
+	}
+}
+
 func TestUnsealedOutputIsNotAdmitted(t *testing.T) {
 	ctx := context.Background()
 	source := t.TempDir()

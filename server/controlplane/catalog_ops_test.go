@@ -67,13 +67,14 @@ func TestIndexLossDegradesSearchOnly(t *testing.T) {
 	if err := json.Unmarshal(children.Data, &childrenData); err != nil {
 		t.Fatalf("decode children: %v", err)
 	}
-	var fileID string
+	var fileID, fileSubject string
 	for _, entry := range childrenData.Entries {
 		if entry.DisplayName == "quarterly-report.txt" {
 			fileID = entry.ID
+			fileSubject = entry.SubjectRef
 		}
 	}
-	if fileID == "" {
+	if fileID == "" || fileSubject == "" {
 		t.Fatalf("quarterly-report.txt missing: %+v", childrenData.Entries)
 	}
 
@@ -87,8 +88,30 @@ func TestIndexLossDegradesSearchOnly(t *testing.T) {
 		t.Fatalf("tag = %q: %+v", tagged.Status, tagged.Reasons)
 	}
 
+	defaultQuery := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
+		"workspace_id": ingestData.WorkspaceID,
+		"query":        "quarterly",
+	}))
+	if defaultQuery.Status != command.StatusDegraded || !hasReasonCode(defaultQuery, ReasonCodeUnavailable) {
+		t.Fatalf("default broker without semantic = %q: %+v", defaultQuery.Status, defaultQuery.Reasons)
+	}
+	var defaultData command.SearchQueryData
+	if err := json.Unmarshal(defaultQuery.Data, &defaultData); err != nil {
+		t.Fatalf("decode default broker: %v", err)
+	}
+	if defaultData.Provider != search.ProviderBrokerFuse || defaultData.Dimension != "" ||
+		len(defaultData.FusedDimensions) != 2 || len(defaultData.Components) != 2 ||
+		defaultData.Components[0].Dimension != search.DimensionLexical ||
+		defaultData.Components[0].Status != string(command.StatusSucceeded) ||
+		defaultData.Components[1].Dimension != search.DimensionSemantic ||
+		defaultData.Components[1].Status != string(command.StatusDegraded) ||
+		len(defaultData.Hits) != 1 || defaultData.Hits[0].SubjectRef != fileSubject {
+		t.Fatalf("default broker payload = %+v", defaultData)
+	}
+
 	found := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
+		"dimension":    search.DimensionLexical,
 		"query":        "quarterly",
 	}))
 	if found.Status != command.StatusSucceeded {
@@ -98,7 +121,7 @@ func TestIndexLossDegradesSearchOnly(t *testing.T) {
 	if err := json.Unmarshal(found.Data, &searchData); err != nil {
 		t.Fatalf("decode search: %v", err)
 	}
-	if len(searchData.Hits) != 1 || searchData.Hits[0].SubjectRef != fileID {
+	if len(searchData.Hits) != 1 || searchData.Hits[0].SubjectRef != fileSubject || searchData.Hits[0].EntryID != fileID {
 		t.Fatalf("search hits = %+v", searchData.Hits)
 	}
 	if searchData.Dimension != search.DimensionLexical || searchData.Provider != search.ProviderLexicalFTS5 {
@@ -110,6 +133,7 @@ func TestIndexLossDegradesSearchOnly(t *testing.T) {
 
 	taggedHits := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
+		"dimension":    search.DimensionLexical,
 		"query":        "reviewed",
 	}))
 	if taggedHits.Status != command.StatusSucceeded {
@@ -126,6 +150,7 @@ func TestIndexLossDegradesSearchOnly(t *testing.T) {
 
 	degraded := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
+		"dimension":    search.DimensionLexical,
 		"query":        "quarterly",
 	}))
 	if degraded.Status != command.StatusDegraded || !hasReasonCode(degraded, ReasonCodeUnavailable) {
@@ -212,6 +237,7 @@ func TestIndexLossDegradesSearchOnly(t *testing.T) {
 	}
 	recovered := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
+		"dimension":    search.DimensionLexical,
 		"query":        "reviewed",
 	}))
 	if recovered.Status != command.StatusSucceeded {
@@ -221,7 +247,7 @@ func TestIndexLossDegradesSearchOnly(t *testing.T) {
 	if err := json.Unmarshal(recovered.Data, &recoveredData); err != nil {
 		t.Fatalf("decode recovered search: %v", err)
 	}
-	if len(recoveredData.Hits) != 1 || recoveredData.Hits[0].SubjectRef != fileID {
+	if len(recoveredData.Hits) != 1 || recoveredData.Hits[0].SubjectRef != fileSubject || recoveredData.Hits[0].EntryID != fileID {
 		t.Fatalf("recovered hits = %+v", recoveredData.Hits)
 	}
 }
@@ -796,10 +822,11 @@ func TestSearchQueryDimensions(t *testing.T) {
 	if err := json.Unmarshal(children.Data, &childrenData); err != nil {
 		t.Fatalf("decode children: %v", err)
 	}
-	var fileID string
+	var fileID, fileSubject string
 	for _, entry := range childrenData.Entries {
 		if entry.DisplayName == "quarterly-report.txt" {
 			fileID = entry.ID
+			fileSubject = entry.SubjectRef
 		}
 	}
 	if fileID == "" {
@@ -850,6 +877,7 @@ func TestSearchQueryDimensions(t *testing.T) {
 
 	tagsOnly := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
 		"workspace_id":   ingestData.WorkspaceID,
+		"dimension":      search.DimensionLexical,
 		"query":          "reviewed",
 		"construct_axes": []string{"tags"},
 	}))
@@ -860,7 +888,7 @@ func TestSearchQueryDimensions(t *testing.T) {
 	if err := json.Unmarshal(tagsOnly.Data, &tagsData); err != nil {
 		t.Fatalf("decode tags-only: %v", err)
 	}
-	if tagsData.Dimension != search.DimensionLexical || len(tagsData.Hits) != 1 || tagsData.Hits[0].SubjectRef != fileID {
+	if tagsData.Dimension != search.DimensionLexical || len(tagsData.Hits) != 1 || tagsData.Hits[0].SubjectRef != fileSubject || tagsData.Hits[0].EntryID != fileID {
 		t.Fatalf("tags-only hits = %+v", tagsData)
 	}
 	if len(tagsData.ConstructAxes) != 1 || tagsData.ConstructAxes[0] != search.AxisTags {
@@ -869,6 +897,7 @@ func TestSearchQueryDimensions(t *testing.T) {
 
 	extractedOnly := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
 		"workspace_id":   ingestData.WorkspaceID,
+		"dimension":      search.DimensionLexical,
 		"query":          "reviewed",
 		"construct_axes": []string{"extracted"},
 	}))

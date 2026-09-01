@@ -126,3 +126,26 @@ func TestZvecGenerationRejectsStagedLibraryReplacement(t *testing.T) {
 		t.Fatalf("staged symlink error = %v, want ErrZvecUnavailable", err)
 	}
 }
+
+func TestZvecCoverageIdentityValidationRejectsIncompleteOrDuplicatePairs(t *testing.T) {
+	if err := validateZvecCoverageIdentities([]ZvecCoverageIdentity{{SubjectID: "subject", SegmentID: "segment"}}); err != nil {
+		t.Fatalf("valid identity pair rejected: %v", err)
+	}
+	for _, tc := range []struct {
+		name       string
+		identities []ZvecCoverageIdentity
+	}{
+		{name: "empty subject", identities: []ZvecCoverageIdentity{{SegmentID: "segment"}}},
+		{name: "empty segment", identities: []ZvecCoverageIdentity{{SubjectID: "subject"}}},
+		{name: "duplicate segment", identities: []ZvecCoverageIdentity{
+			{SubjectID: "subject-a", SegmentID: "segment"},
+			{SubjectID: "subject-b", SegmentID: "segment"},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateZvecCoverageIdentities(tc.identities); !errors.Is(err, ErrZvecUnavailable) {
+				t.Fatalf("validation error = %v, want ErrZvecUnavailable", err)
+			}
+		})
+	}
+}

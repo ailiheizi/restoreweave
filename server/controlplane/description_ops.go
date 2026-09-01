@@ -61,6 +61,11 @@ func (d *Dispatcher) handleDescriptionList(ctx context.Context, env command.Enve
 		if err := requireStableID("subject_ref", input.SubjectRef); err != nil {
 			return invalidInputResult(env, started, err)
 		}
+		entry, err := d.resolveSubject(ctx, input.WorkspaceID, input.SubjectRef)
+		if err != nil {
+			return namespaceLookupResult(env, started, err)
+		}
+		input.SubjectRef = entry.SubjectRef
 	}
 	limit := input.Limit
 	if limit == 0 {
@@ -126,6 +131,14 @@ func (d *Dispatcher) handleDescriptionCreate(ctx context.Context, env command.En
 	if err := requireStableID("subject_ref", input.SubjectRef); err != nil {
 		return invalidInputResult(env, started, err)
 	}
+	entry, err := d.resolveSubject(ctx, input.WorkspaceID, input.SubjectRef)
+	if err != nil {
+		if containsNotFound(err) {
+			return notFoundResult(env, started, "subject not found")
+		}
+		return catalogErrorResult(env, started, err)
+	}
+	input.SubjectRef = entry.SubjectRef
 	if strings.TrimSpace(input.Body) == "" {
 		return invalidInputResult(env, started, errString("body is required"))
 	}

@@ -40,6 +40,34 @@ func TestZvecGenerationLifecycle(t *testing.T) {
 	if receipt.LibraryDigest != spec.LibraryDigest {
 		t.Fatalf("receipt library digest = %q, want %q", receipt.LibraryDigest, spec.LibraryDigest)
 	}
+	pairs, err := driver.(interface {
+		CoveragePairs(context.Context, ZvecGenerationSpec) ([]ZvecCoverageIdentity, error)
+	}).CoveragePairs(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("CoveragePairs() error = %v", err)
+	}
+	if len(pairs) != len(segments) {
+		t.Fatalf("CoveragePairs() returned %d pairs, want %d", len(pairs), len(segments))
+	}
+	for i, pair := range pairs {
+		if pair != (ZvecCoverageIdentity{SubjectID: segments[i].SubjectID, SegmentID: segments[i].SegmentID}) {
+			t.Fatalf("CoveragePairs()[%d] = %+v, want %+v", i, pair, segments[i])
+		}
+	}
+	verifier := driver.(interface {
+		VerifyMembership(context.Context, ZvecGenerationSpec, []ZvecCoverageIdentity) error
+	})
+	if err := verifier.VerifyMembership(context.Background(), spec, pairs[:1]); err != nil {
+		t.Fatalf("VerifyMembership() error = %v", err)
+	}
+	wrongSubject := []ZvecCoverageIdentity{{SubjectID: "wrong-subject", SegmentID: segments[0].SegmentID}}
+	if err := verifier.VerifyMembership(context.Background(), spec, wrongSubject); !errors.Is(err, ErrZvecUnavailable) {
+		t.Fatalf("wrong-subject VerifyMembership() error = %v, want ErrZvecUnavailable", err)
+	}
+	unknownSegment := []ZvecCoverageIdentity{{SubjectID: segments[0].SubjectID, SegmentID: "unknown-segment"}}
+	if err := verifier.VerifyMembership(context.Background(), spec, unknownSegment); !errors.Is(err, ErrZvecUnavailable) {
+		t.Fatalf("unknown-segment VerifyMembership() error = %v, want ErrZvecUnavailable", err)
+	}
 	second := spec
 	second.Path = filepath.Join(t.TempDir(), "generation-second")
 	if _, err := driver.Build(context.Background(), second, segments); err != nil {

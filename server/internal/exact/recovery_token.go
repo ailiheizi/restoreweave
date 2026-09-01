@@ -685,8 +685,19 @@ func (s *Service) stableSubjectRef(ctx context.Context, driver repository.Record
 		if matched != "" {
 			return "", fmt.Errorf("%w: portable subject mapping is duplicated for %q", ErrRecoveryTokenInvalid, entry.RelativePath)
 		}
-		if mapping.NamespaceEntryID != record.StableSubjectRef || mapping.NamespaceEntryID == "" {
+		if mapping.NamespaceEntryID == "" {
 			return "", fmt.Errorf("%w: portable subject mapping identity is invalid for %q", ErrRecoveryTokenInvalid, entry.RelativePath)
+		}
+		if bundle.Schema == PortableFactBundleSchemaV1 {
+			if mapping.StableSubjectRef != "" || mapping.NamespaceEntryID != record.StableSubjectRef {
+				return "", fmt.Errorf("%w: portable v1 subject mapping identity is invalid for %q", ErrRecoveryTokenInvalid, entry.RelativePath)
+			}
+		} else if bundle.Schema == PortableFactBundleSchemaV2 {
+			if strings.TrimSpace(mapping.StableSubjectRef) == "" || mapping.StableSubjectRef != record.StableSubjectRef {
+				return "", fmt.Errorf("%w: portable v2 subject mapping identity is invalid for %q", ErrRecoveryTokenInvalid, entry.RelativePath)
+			}
+		} else {
+			return "", fmt.Errorf("%w: portable subject mapping bundle schema is invalid", ErrRecoveryTokenInvalid)
 		}
 		if !bytes.Equal(mapping.RawPath, entry.RawPath) || !bytes.Equal(mapping.RawName, entry.RawName) ||
 			mapping.EntryType != entry.EntryType || mapping.ContentID != entry.ContentID ||

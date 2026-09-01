@@ -88,6 +88,7 @@ func TestSearchQueryTypedStructuredFilters(t *testing.T) {
 
 	entryTypeFilter := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
+		"dimension":    search.DimensionLexical,
 		"query":        "quarterly",
 		"filters": map[string]any{
 			"entry_type":      "REGULAR_FILE",
@@ -110,6 +111,7 @@ func TestSearchQueryTypedStructuredFilters(t *testing.T) {
 
 	languageMatch := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
+		"dimension":    search.DimensionLexical,
 		"query":        "quarterly",
 		"filters": map[string]any{
 			"language": "en",
@@ -122,12 +124,13 @@ func TestSearchQueryTypedStructuredFilters(t *testing.T) {
 	if err := json.Unmarshal(languageMatch.Data, &languageData); err != nil {
 		t.Fatalf("decode language-filtered search: %v", err)
 	}
-	if len(languageData.Hits) != 1 || languageData.Hits[0].SubjectRef != resolvedData.PathRef {
-		t.Fatalf("language-filtered hits = %+v, want only described subject %s", languageData.Hits, resolvedData.PathRef)
+	if len(languageData.Hits) != 1 || languageData.Hits[0].SubjectRef != resolvedData.Entry.SubjectRef || languageData.Hits[0].EntryID != resolvedData.PathRef {
+		t.Fatalf("language-filtered hits = %+v, want only described subject %s", languageData.Hits, resolvedData.Entry.SubjectRef)
 	}
 
 	missingLanguage := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
+		"dimension":    search.DimensionLexical,
 		"query":        "quarterly",
 		"filters": map[string]any{
 			"language": "fr",
@@ -147,6 +150,7 @@ func TestSearchQueryTypedStructuredFilters(t *testing.T) {
 	// A suffix that does not exist must fail closed with zero hits.
 	noMatch := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
+		"dimension":    search.DimensionLexical,
 		"query":        "quarterly",
 		"filters": map[string]any{
 			"suffix": "zzz",
@@ -166,6 +170,7 @@ func TestSearchQueryTypedStructuredFilters(t *testing.T) {
 	// A filters-only request (no free text) must still be valid.
 	filtersOnly := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
+		"dimension":    search.DimensionLexical,
 		"filters": map[string]any{
 			"entry_type": "REGULAR_FILE",
 		},
@@ -277,6 +282,7 @@ func TestSearchQueryDescriptionSegmentProvenanceProjectsForNormalAndFusedHits(t 
 
 	normal := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
+		"dimension":    search.DimensionLexical,
 		"query":        "taggedfused",
 	}))
 	if normal.Status != command.StatusSucceeded {

@@ -494,10 +494,11 @@ func (s *Service) adopt(
 		item.protectionOutcome, item.protectionReason = protectionOutcome(entry, item.protectionMode)
 		if entry.RelativePath == "." {
 			rootPathID = entry.PathID
-		} else if entryType != sqlite.EntryFile && entryType != sqlite.EntryDirectory && entryType != sqlite.EntrySymlink {
-			preparedEntries = append(preparedEntries, item)
 			continue
 		} else {
+			// Special entries are metadata-only, but they still participate in
+			// the namespace and protection projections. No content is opened or
+			// placed for them; insertPreparedProtection records UNAVAILABLE.
 			namespaceID, idErr := sqlite.NewStableID(sqlite.IDPrefixNamespaceEntry)
 			if idErr != nil {
 				return out, idErr
@@ -564,15 +565,32 @@ func (s *Service) adopt(
 		if err := validatePreparedProtection(item); err != nil {
 			return out, fmt.Errorf("%w: %v", ErrBlocked, err)
 		}
-		manifestEntry, err := toManifestEntry(entry, entryType, item, binding)
-		if err != nil {
-			return out, err
-		}
 		preparedEntries = append(preparedEntries, item)
-		out.entries = append(out.entries, manifestEntry)
 	}
 
 	err = s.Store.Update(ctx, func(tx *sqlite.Tx) error {
+		// Allocate/reuse stable subjects inside the same transaction that
+		// publishes namespace observations. Only committed publications are
+		// considered by ResolveNamespaceSubjectRef, so an abandoned scan can
+		// never become the continuity basis.
+		for index := range preparedEntries {
+			if preparedEntries[index].namespaceID == "" {
+				continue
+			}
+			item := &preparedEntries[index]
+			subjectRef, err := tx.ResolveNamespaceSubjectRef(
+				ctx, ids.workspaceID, ids.sourceID, fullPathKey(item.entry), item.entryType)
+			if err != nil {
+				return err
+			}
+			if subjectRef == "" {
+				subjectRef, err = sqlite.NewStableID(sqlite.IDPrefixSubject)
+				if err != nil {
+					return err
+				}
+			}
+			item.subjectRef = subjectRef
+		}
 		insertedRep := map[string]struct{}{}
 		for _, item := range preparedEntries {
 			if item.observationID != "" {
@@ -608,7 +626,8 @@ func (s *Service) adopt(
 			}
 			insertedRep[item.representation] = struct{}{}
 		}
-		for _, item := range preparedEntries {
+		for index := range preparedEntries {
+			item := &preparedEntries[index]
 			if item.entryType != sqlite.EntryFile {
 				continue
 			}
@@ -629,7 +648,7 @@ func (s *Service) adopt(
 				AuthoritativeRepresentationID: item.representation,
 				ExtentSetDigest:               extentDigest,
 				HardlinkGroupID:               item.entry.HardLink.GroupID,
-				VerificationRef:               fileVersionVerificationRef(item),
+				VerificationRef:               fileVersionVerificationRef(*item),
 				RecordDigest:                  item.entry.Content.ContentID,
 			}); err != nil {
 				return err
@@ -668,7 +687,8 @@ func (s *Service) adopt(
 		}); err != nil {
 			return err
 		}
-		for _, item := range preparedEntries {
+		for index := range preparedEntries {
+			item := &preparedEntries[index]
 			if item.namespaceID == "" {
 				continue
 			}
@@ -678,6 +698,7 @@ func (s *Service) adopt(
 			}
 			ns := sqlite.NamespaceEntry{
 				ID:              item.namespaceID,
+				SubjectRef:      item.subjectRef,
 				WorkspaceID:     ids.workspaceID,
 				RootID:          rootID,
 				ParentID:        parentID,
@@ -708,12 +729,29 @@ func (s *Service) adopt(
 			if err := tx.InsertNamespaceEntry(ctx, &ns); err != nil {
 				return err
 			}
-			if err := insertPreparedProtection(ctx, tx, ids.workspaceID, item); err != nil {
+			protectionID, err := insertPreparedProtection(ctx, tx, ids.workspaceID, *item)
+			if err != nil {
 				return err
 			}
+			item.protectionID = protectionID
 		}
 		return nil
 	})
+	if err != nil {
+		return out, err
+	}
+	// Build manifests only after the current protection projection has been
+	// revised, then replace the provisional record IDs with the actual stable
+	// row IDs returned by the upsert.
+	for index := range preparedEntries {
+		manifestEntry, manifestErr := toManifestEntry(
+			preparedEntries[index].entry, preparedEntries[index].entryType,
+			preparedEntries[index], binding)
+		if manifestErr != nil {
+			return out, manifestErr
+		}
+		out.entries = append(out.entries, manifestEntry)
+	}
 	return out, err
 }
 
@@ -779,6 +817,7 @@ type prepared struct {
 	entry              scanner.EntryRecord
 	observationID      string
 	namespaceID        string
+	subjectRef         string
 	protectionID       string
 	recoveryID         string
 	externalRecoveryID string

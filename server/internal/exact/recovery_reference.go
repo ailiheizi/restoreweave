@@ -121,6 +121,9 @@ func (s *Service) BuildRecoveryReference(ctx context.Context, snapshotRef string
 		return reference, err
 	}
 	deps := portableFactReaderDependencies(s.Repo)
+	if len(closures) > 0 {
+		deps = append([]string(nil), closures[len(closures)-1].Closure.RequiredReaderDependencies...)
+	}
 	reference = RecoveryReference{
 		Schema:                     RecoveryReferenceSchemaV2,
 		SnapshotRef:                snapshotRef,
@@ -296,7 +299,15 @@ func (reference RecoveryReference) ValidateAgainstRepository(ctx context.Context
 	if reference.PublicationCommit.TargetIdentity != driver.RepositoryIdentity() {
 		return errors.New("publication target identity differs from repository")
 	}
-	if !sameStrings(reference.RequiredReaderDependencies, portableFactReaderDependencies(repo)) {
+	expectedDependencies := portableFactReaderDependencies(repo)
+	if len(reference.PortableFactClosures) > 0 {
+		closureSchema, _, schemaErr := portableFactClosureSchemas(reference.PortableFactClosures[len(reference.PortableFactClosures)-1].Envelope.Closure.BundleSchema)
+		if schemaErr != nil {
+			return fmt.Errorf("recovery reference portable-fact schema is unavailable: %w", schemaErr)
+		}
+		expectedDependencies = portableFactReaderDependenciesForSchema(repo, closureSchema)
+	}
+	if !sameStrings(reference.RequiredReaderDependencies, expectedDependencies) {
 		return errors.New("recovery reference reader dependencies are unavailable")
 	}
 	commits, err := listCommitMarkers(ctx, driver, anchor, reference.PublicationDomain)
@@ -550,7 +561,9 @@ func validateReferenceFactChain(reference RecoveryReference, anchor TrustAnchor)
 			return err
 		}
 		closure := fact.Envelope.Closure
-		if fact.Envelope.Schema != PortableFactClosureEnvelopeSchemaV1 ||
+		closureSchema, envelopeSchema, schemaErr := portableFactClosureSchemas(closure.BundleSchema)
+		expectedClosureDependencies := portableFactReaderDependenciesForReference(reference.Repository, closureSchema)
+		if schemaErr != nil || fact.Envelope.Schema != envelopeSchema || closure.Schema != closureSchema ||
 			closure.ParentCommitDigest != reference.PublicationCommitDigest ||
 			closure.PublicationID != reference.PublicationCommit.PublicationID ||
 			closure.PublicationDomain != reference.PublicationDomain ||
@@ -560,10 +573,9 @@ func validateReferenceFactChain(reference RecoveryReference, anchor TrustAnchor)
 			closure.TargetIdentity != reference.Repository.RepositoryID ||
 			closure.TargetIdentity != reference.PublicationCommit.TargetIdentity ||
 			closure.FenceToken != reference.PublicationCommit.FenceToken ||
-			closure.BundleSchema != PortableFactBundleSchemaV1 ||
 			closure.CanonicalizationProfile != "encoding/json-compact-v1" ||
 			closure.SignedAt.Before(reference.PublicationCommit.SignedAt) ||
-			!sameStrings(closure.RequiredReaderDependencies, reference.RequiredReaderDependencies) {
+			!sameStrings(closure.RequiredReaderDependencies, expectedClosureDependencies) {
 			return errors.New("portable fact reference parent or dependency binding mismatch")
 		}
 		if index == 0 {
@@ -592,7 +604,26 @@ func validateReferenceFactChain(reference RecoveryReference, anchor TrustAnchor)
 		}
 		previous = closureDigest
 	}
+	// The reference-level tuple describes the reader needed for the newest
+	// closure. Older successors may legitimately retain an earlier schema and
+	// therefore an earlier reader tuple.
+	if !sameStrings(reference.RequiredReaderDependencies, reference.PortableFactClosures[len(reference.PortableFactClosures)-1].Envelope.Closure.RequiredReaderDependencies) {
+		return errors.New("portable fact reference latest reader dependency binding mismatch")
+	}
 	return nil
+}
+
+func portableFactReaderDependenciesForReference(binding RecoveryRepositoryBinding, closureSchema string) []string {
+	readerVersion := "v2"
+	if closureSchema == PortableFactClosureSchemaV1 {
+		readerVersion = "v1"
+	}
+	return []string{
+		"canonicalization:encoding/json-compact-v1",
+		"repository:" + binding.Profile + "/" + binding.Compression,
+		"restoreweave-reader:portable-fact-" + readerVersion,
+		"signature:ed25519-v1",
+	}
 }
 
 // validateReferenceProcessorAttemptChild resolves the child by the closure

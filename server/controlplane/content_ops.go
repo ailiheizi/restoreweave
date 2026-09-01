@@ -21,7 +21,8 @@ const (
 
 type contentOpenInput struct {
 	WorkspaceID string `json:"workspace_id"`
-	EntryID     string `json:"entry_id"`
+	EntryID     string `json:"entry_id,omitempty"`
+	SubjectRef  string `json:"subject_ref,omitempty"`
 }
 
 type contentReadInput struct {
@@ -67,10 +68,22 @@ func (d *Dispatcher) handleContentOpen(ctx context.Context, env command.Envelope
 	if err := requireStableID("workspace_id", input.WorkspaceID); err != nil {
 		return invalidInputResult(env, started, err)
 	}
-	if err := requireStableID("entry_id", input.EntryID); err != nil {
+	if input.SubjectRef != "" && input.EntryID != "" {
+		return invalidInputResult(env, started, errString("subject_ref and entry_id are mutually exclusive"))
+	}
+	ref := firstNonEmpty(input.SubjectRef, input.EntryID)
+	if err := requireStableID("subject_ref or entry_id", ref); err != nil {
 		return invalidInputResult(env, started, err)
 	}
-	entry, err := d.store.GetNamespaceEntry(ctx, input.WorkspaceID, input.EntryID)
+	var entry sqlite.NamespaceEntry
+	var err error
+	if input.SubjectRef != "" {
+		entry, err = d.resolveSubject(ctx, input.WorkspaceID, input.SubjectRef)
+	} else {
+		// entry_id is an explicit snapshot-local handle and must not resolve to
+		// a later observation of the same stable subject.
+		entry, err = d.store.GetNamespaceEntry(ctx, input.WorkspaceID, input.EntryID)
+	}
 	if err != nil {
 		return namespaceLookupResult(env, started, err)
 	}
@@ -98,6 +111,7 @@ func (d *Dispatcher) handleContentOpen(ctx context.Context, env command.Envelope
 	return succeeded(env, started, command.ContentOpenData{
 		Handle:      handle,
 		EntryID:     entry.ID,
+		SubjectRef:  entry.SubjectRef,
 		ContentID:   entry.ContentID,
 		LogicalSize: size,
 		MaxRead:     maxContentRead,

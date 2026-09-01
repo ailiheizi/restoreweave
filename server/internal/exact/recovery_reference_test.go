@@ -31,7 +31,7 @@ func artifactRecoveryReferenceFixture(t *testing.T) (signedPublicationFixture, I
 	var subject string
 	for _, node := range nodes {
 		if node.Entry.ContentID != "" {
-			subject = node.Entry.ID
+			subject = node.Entry.SubjectRef
 			break
 		}
 	}
@@ -163,8 +163,12 @@ func publishArtifactPortableFactClosureForTest(t *testing.T, fixture signedPubli
 	if err != nil {
 		t.Fatalf("admitted processor attempt digest: %v", err)
 	}
+	closureSchema, _, schemaErr := portableFactClosureSchemas(bundle.Schema)
+	if schemaErr != nil {
+		t.Fatal(schemaErr)
+	}
 	closure, err := SignPortableFactClosure(*fixture.service.SigningIdentity, PortableFactClosureRecord{
-		Schema: PortableFactClosureSchemaV1, SignatureDomain: RecoverySignatureDomainV1, RecordKind: PortableFactClosureKind,
+		Schema: closureSchema, SignatureDomain: RecoverySignatureDomainV1, RecordKind: PortableFactClosureKind,
 		WorkspaceID: result.WorkspaceID, PublicationID: parent.Commit.PublicationID, PublicationDomain: testPublicationDomain,
 		SnapshotRef: result.SnapshotRef, ManifestDigest: parent.Commit.ManifestDigest, ParentCommitDigest: result.PublicationCommitDigest,
 		ParentGeneration: parent.Commit.Generation, ClosureSequence: 2, PredecessorClosureDigest: predecessor,
@@ -172,13 +176,17 @@ func publishArtifactPortableFactClosureForTest(t *testing.T, fixture signedPubli
 		RecordCount: int64(len(bundle.Records)), AttachmentCount: int64(len(bundle.Attachments)), ProcessorAttemptDigest: processorDigest,
 		TargetIdentity: fixture.repo.RepositoryIdentity(), WriterIdentity: fixture.service.SigningIdentity.WriterIdentity,
 		KeyID: fixture.service.SigningIdentity.KeyID, FenceToken: parent.Commit.FenceToken,
-		RequiredReaderDependencies: portableFactReaderDependencies(fixture.repo), CanonicalizationProfile: "encoding/json-compact-v1",
+		RequiredReaderDependencies: portableFactReaderDependenciesForSchema(fixture.repo, closureSchema), CanonicalizationProfile: "encoding/json-compact-v1",
 		CriticalExtensions: []string{}, OptionalExtensions: json.RawMessage(`{}`), SignedAt: fixture.service.now(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload, err := CanonicalJSON(PortableFactClosureEnvelope{Schema: PortableFactClosureEnvelopeSchemaV1, Closure: closure, Bundle: bundleBytes})
+	_, envelopeSchema, schemaErr := portableFactClosureSchemas(bundle.Schema)
+	if schemaErr != nil {
+		t.Fatal(schemaErr)
+	}
+	payload, err := CanonicalJSON(PortableFactClosureEnvelope{Schema: envelopeSchema, Closure: closure, Bundle: bundleBytes})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +317,11 @@ func TestRecoveryReferenceRejectsTamperedOrMismatchedProcessorAttemptChild(t *te
 		if err != nil {
 			t.Fatal(err)
 		}
-		factPayload, err := CanonicalJSON(PortableFactClosureEnvelope{Schema: PortableFactClosureEnvelopeSchemaV1, Closure: signedFact, Bundle: fact.Envelope.Bundle})
+		envelopeSchema := PortableFactClosureEnvelopeSchemaV1
+		if signedFact.Schema == PortableFactClosureSchemaV2 {
+			envelopeSchema = PortableFactClosureEnvelopeSchemaV2
+		}
+		factPayload, err := CanonicalJSON(PortableFactClosureEnvelope{Schema: envelopeSchema, Closure: signedFact, Bundle: fact.Envelope.Bundle})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -317,7 +329,7 @@ func TestRecoveryReferenceRejectsTamperedOrMismatchedProcessorAttemptChild(t *te
 		if err != nil {
 			t.Fatal(err)
 		}
-		reference.PortableFactClosures[factIndex].Envelope = PortableFactClosureEnvelope{Schema: PortableFactClosureEnvelopeSchemaV1, Closure: signedFact, Bundle: fact.Envelope.Bundle}
+		reference.PortableFactClosures[factIndex].Envelope = PortableFactClosureEnvelope{Schema: envelopeSchema, Closure: signedFact, Bundle: fact.Envelope.Bundle}
 		reference.PortableFactClosures[factIndex].RecordDigest = factReceipt.Digest
 		reference.PortableFactClosures[factIndex].ClosureDigest, err = signedFact.Digest()
 		if err != nil {
@@ -471,7 +483,11 @@ func rewriteRecoveryReferenceFactForTest(t *testing.T, fixture signedPublication
 	if err != nil {
 		t.Fatal(err)
 	}
-	envelope := PortableFactClosureEnvelope{Schema: PortableFactClosureEnvelopeSchemaV1, Closure: closure, Bundle: bundleBytes}
+	envelopeSchema := PortableFactClosureEnvelopeSchemaV1
+	if closure.Schema == PortableFactClosureSchemaV2 {
+		envelopeSchema = PortableFactClosureEnvelopeSchemaV2
+	}
+	envelope := PortableFactClosureEnvelope{Schema: envelopeSchema, Closure: closure, Bundle: bundleBytes}
 	envelopeBytes, err := CanonicalJSON(envelope)
 	if err != nil {
 		t.Fatal(err)
@@ -560,6 +576,178 @@ func TestRecoveryReferenceRejectsNonMonotonicFactSuccessorTime(t *testing.T) {
 	if err := reference.Validate(*evidence.fixture.service.TrustAnchor); err == nil {
 		t.Fatal("non-monotonic portable fact successor time was accepted")
 	}
+}
+
+// downgradePortableBundleToV1ForTest models a repository that was written by
+// the frozen v1 writer before a v2 successor was published.  It deliberately
+// converts only the v1-compatible identity fields; the signed v1 closure is
+// rebuilt by the mixed-chain test below.
+func downgradePortableBundleToV1ForTest(t *testing.T, source portableFactBundle) portableFactBundle {
+	t.Helper()
+	stableToEntry := make(map[string]string)
+	for _, record := range source.Records {
+		if record.RecordKind != "SUBJECT_MAPPING" {
+			continue
+		}
+		var mapping subjectMappingPayload
+		if err := decodeStrictRecord(record.Payload, &mapping); err != nil {
+			t.Fatal(err)
+		}
+		stableToEntry[mapping.StableSubjectRef] = mapping.NamespaceEntryID
+	}
+	result := source
+	result.Schema = PortableFactBundleSchemaV1
+	result.Records = make([]portableFactRecord, len(source.Records))
+	for index, sourceRecord := range source.Records {
+		record := sourceRecord
+		record.Schema = PortableFactRecordSchemaV1
+		entryID, ok := stableToEntry[record.StableSubjectRef]
+		if !ok {
+			t.Fatalf("v2 record %q has no subject mapping", record.RecordID)
+		}
+		record.StableSubjectRef = entryID
+		if record.RecordKind == "SUBJECT_MAPPING" {
+			var mapping subjectMappingPayload
+			if err := decodeStrictRecord(record.Payload, &mapping); err != nil {
+				t.Fatal(err)
+			}
+			mapping.StableSubjectRef = ""
+			if mapping.ParentSubjectRef != "" {
+				parentID, ok := stableToEntry[mapping.ParentSubjectRef]
+				if !ok {
+					t.Fatalf("mapping %q has no parent mapping", record.RecordID)
+				}
+				mapping.ParentSubjectRef = parentID
+			}
+			record.Payload, _ = CanonicalJSON(mapping)
+		} else if !portableCaptureFactRecord(record) {
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(record.Payload, &fields); err != nil {
+				t.Fatal(err)
+			}
+			if _, hasSubject := fields["subject_ref"]; hasSubject {
+				fields["subject_ref"], _ = json.Marshal(entryID)
+			}
+			record.Payload, _ = CanonicalJSON(fields)
+		}
+		record.PayloadDigest = DigestBytes(record.Payload)
+		record.PayloadLength = int64(len(record.Payload))
+		result.Records[index] = record
+	}
+	return result
+}
+
+func TestRecoveryReferenceValidatesMixedV1V2FactChain(t *testing.T) {
+	evidence := newPortableEvidenceFixture(t)
+	reference, err := evidence.fixture.service.BuildRecoveryReference(context.Background(), evidence.result.SnapshotRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reference.PortableFactClosures) != 2 {
+		t.Fatalf("portable fact closures = %d, want 2", len(reference.PortableFactClosures))
+	}
+	first := reference.PortableFactClosures[0]
+	var firstBundle portableFactBundle
+	if err := decodeStrictRecord(first.Envelope.Bundle, &firstBundle); err != nil {
+		t.Fatal(err)
+	}
+	firstBundle = downgradePortableBundleToV1ForTest(t, firstBundle)
+	firstBundleBytes, err := CanonicalJSON(firstBundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstClosure := first.Envelope.Closure
+	firstClosure.Schema = PortableFactClosureSchemaV1
+	firstClosure.BundleSchema = PortableFactBundleSchemaV1
+	firstClosure.BundleDigest = DigestBytes(firstBundleBytes)
+	firstClosure.BundleLength = int64(len(firstBundleBytes))
+	firstClosure.RecordCount = int64(len(firstBundle.Records))
+	firstClosure.AttachmentCount = int64(len(firstBundle.Attachments))
+	firstClosure.RequiredReaderDependencies = portableFactReaderDependenciesForReference(reference.Repository, PortableFactClosureSchemaV1)
+	firstClosure.Signature = nil
+	firstClosure, err = SignPortableFactClosure(*evidence.fixture.service.SigningIdentity, firstClosure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstEnvelope := PortableFactClosureEnvelope{Schema: PortableFactClosureEnvelopeSchemaV1, Closure: firstClosure, Bundle: firstBundleBytes}
+	firstEnvelopeBytes, err := CanonicalJSON(firstEnvelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstClosureDigest, err := firstClosure.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	second := reference.PortableFactClosures[1]
+	secondClosure := second.Envelope.Closure
+	secondClosure.PredecessorClosureDigest = firstClosureDigest
+	secondClosure.Signature = nil
+	secondClosure, err = SignPortableFactClosure(*evidence.fixture.service.SigningIdentity, secondClosure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondEnvelope := second.Envelope
+	secondEnvelope.Closure = secondClosure
+	secondEnvelopeBytes, err := CanonicalJSON(secondEnvelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference.PortableFactClosures = []RecoveryFactClosureReference{
+		{RecordDigest: DigestBytes(firstEnvelopeBytes), ClosureDigest: firstClosureDigest, Envelope: firstEnvelope},
+		{RecordDigest: DigestBytes(secondEnvelopeBytes), ClosureDigest: mustPortableClosureDigest(t, secondClosure), Envelope: secondEnvelope},
+	}
+	// The global tuple remains the newest (v2) reader tuple.
+	reference.RequiredReaderDependencies = append([]string(nil), secondClosure.RequiredReaderDependencies...)
+	if err := reference.Validate(*evidence.fixture.service.TrustAnchor); err != nil {
+		t.Fatalf("mixed v1/v2 reference rejected: %v", err)
+	}
+
+	driver := repository.RecordDriver(evidence.fixture.repo)
+	for _, old := range []RecoveryFactClosureReference{first, second} {
+		if err := os.Remove(recordRelocationPath(t, evidence.fixture.repo.Root(), repository.RecordPortableFactClosure, old.RecordDigest)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, item := range reference.PortableFactClosures {
+		payload, err := CanonicalJSON(item.Envelope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := driver.PlaceRecord(context.Background(), repository.RecordPortableFactClosure, bytes.NewReader(payload)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := reference.ValidateAgainstRepository(context.Background(), evidence.fixture.repo, *evidence.fixture.service.TrustAnchor); err != nil {
+		t.Fatalf("mixed v1/v2 repository reference rejected: %v", err)
+	}
+
+	// A change to the legacy closure's own dependency tuple is rejected even
+	// though the reference-level tuple belongs to the v2 successor.
+	tampered := reference
+	tampered.PortableFactClosures = append([]RecoveryFactClosureReference(nil), reference.PortableFactClosures...)
+	tampered.PortableFactClosures[0].Envelope.Closure.RequiredReaderDependencies = []string{"restoreweave-reader:portable-fact-v2"}
+	tampered.PortableFactClosures[0].Envelope.Closure.Signature = nil
+	tampered.PortableFactClosures[0].Envelope.Closure, err = SignPortableFactClosure(*evidence.fixture.service.SigningIdentity, tampered.PortableFactClosures[0].Envelope.Closure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tampered.PortableFactClosures[0].ClosureDigest, err = tampered.PortableFactClosures[0].Envelope.Closure.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tampered.Validate(*evidence.fixture.service.TrustAnchor); err == nil {
+		t.Fatal("mixed chain with wrong legacy dependency tuple was accepted")
+	}
+}
+
+func mustPortableClosureDigest(t *testing.T, closure PortableFactClosureRecord) string {
+	t.Helper()
+	digest, err := closure.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return digest
 }
 
 func TestRecoveryReferenceRejectsBrokenPublicationParentLineage(t *testing.T) {

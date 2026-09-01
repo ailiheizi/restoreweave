@@ -20,6 +20,8 @@ import (
 const (
 	PortableFactBundleSchemaV1 = "org.restoreweave.portable-fact-bundle.v1"
 	PortableFactRecordSchemaV1 = "org.restoreweave.portable-fact-record.v1"
+	PortableFactBundleSchemaV2 = "org.restoreweave.portable-fact-bundle.v2"
+	PortableFactRecordSchemaV2 = "org.restoreweave.portable-fact-record.v2"
 )
 
 type PortableFactClosureEnvelope struct {
@@ -69,6 +71,7 @@ type subjectMappingPayload struct {
 	WorkspaceID                string             `json:"workspace_id"`
 	NamespaceRootID            string             `json:"namespace_root_id"`
 	NamespaceEntryID           string             `json:"namespace_entry_id"`
+	StableSubjectRef           string             `json:"stable_subject_ref,omitempty"`
 	SourceID                   string             `json:"source_id"`
 	ParentSubjectRef           string             `json:"parent_subject_ref,omitempty"`
 	RawPath                    []byte             `json:"raw_path"`
@@ -220,9 +223,13 @@ func (s *Service) publishPortableFactClosure(ctx context.Context, workspaceID, s
 	if err != nil {
 		return err
 	}
-	readerDependencies := portableFactReaderDependencies(s.Repo)
+	closureSchema, envelopeSchema, err := portableFactClosureSchemas(bundle.Schema)
+	if err != nil {
+		return err
+	}
+	readerDependencies := portableFactReaderDependenciesForSchema(s.Repo, closureSchema)
 	closure, err := SignPortableFactClosure(*s.SigningIdentity, PortableFactClosureRecord{
-		Schema: PortableFactClosureSchemaV1, SignatureDomain: RecoverySignatureDomainV1, RecordKind: PortableFactClosureKind,
+		Schema: closureSchema, SignatureDomain: RecoverySignatureDomainV1, RecordKind: PortableFactClosureKind,
 		WorkspaceID: workspaceID, PublicationID: parent.Commit.PublicationID, PublicationDomain: s.PublicationDomain,
 		SnapshotRef: snapshotRef, ManifestDigest: parent.Commit.ManifestDigest, ParentCommitDigest: parentDigest,
 		ParentGeneration: parent.Commit.Generation, ClosureSequence: sequence, PredecessorClosureDigest: predecessor, BundleSchema: bundle.Schema,
@@ -235,7 +242,7 @@ func (s *Service) publishPortableFactClosure(ctx context.Context, workspaceID, s
 	if err != nil {
 		return err
 	}
-	payload, err := CanonicalJSON(PortableFactClosureEnvelope{Schema: PortableFactClosureEnvelopeSchemaV1, Closure: closure, Bundle: bundleBytes})
+	payload, err := CanonicalJSON(PortableFactClosureEnvelope{Schema: envelopeSchema, Closure: closure, Bundle: bundleBytes})
 	if err != nil {
 		return err
 	}
@@ -262,7 +269,10 @@ func (s *Service) PublishPortableFactClosure(ctx context.Context, workspaceID, s
 	return s.publishPortableFactClosure(ctx, workspaceID, snapshotRef, parentDigest)
 }
 
-const PortableFactClosureEnvelopeSchemaV1 = "org.restoreweave.portable-fact-closure-envelope.v1"
+const (
+	PortableFactClosureEnvelopeSchemaV1 = "org.restoreweave.portable-fact-closure-envelope.v1"
+	PortableFactClosureEnvelopeSchemaV2 = "org.restoreweave.portable-fact-closure-envelope.v2"
+)
 
 func (s *Service) admittedProcessorAttemptDigest(ctx context.Context, workspaceID, snapshotRef, parentDigest string) (string, error) {
 	artifacts, err := s.Store.ListAdmittedArtifacts(ctx, workspaceID, snapshotRef)
@@ -330,8 +340,14 @@ func (s *Service) buildPortableFactBundleUnplaced(ctx context.Context, workspace
 		return portableFactBundle{}, nil, err
 	}
 	subjects := make(map[string]sqlite.NamespaceEntry, len(nodes))
+	stableByRef := make(map[string]string, len(nodes)*2)
 	for _, node := range nodes {
 		subjects[node.Entry.ID] = node.Entry
+		if node.Entry.SubjectRef != "" {
+			subjects[node.Entry.SubjectRef] = node.Entry
+			stableByRef[node.Entry.SubjectRef] = node.Entry.SubjectRef
+		}
+		stableByRef[node.Entry.ID] = node.Entry.SubjectRef
 	}
 	manifestByPath := make(map[string]ManifestEntry, len(manifest.Entries))
 	for _, entry := range manifest.Entries {
@@ -344,8 +360,9 @@ func (s *Service) buildPortableFactBundleUnplaced(ctx context.Context, workspace
 		}
 		manifestByPath[key] = entry
 	}
-	bundle := portableFactBundle{Schema: PortableFactBundleSchemaV1, WorkspaceID: workspaceID, SnapshotRef: snapshotRef, Records: make([]portableFactRecord, 0), Attachments: make([]portableFactAttachment, 0)}
+	bundle := portableFactBundle{Schema: PortableFactBundleSchemaV2, WorkspaceID: workspaceID, SnapshotRef: snapshotRef, Records: make([]portableFactRecord, 0), Attachments: make([]portableFactAttachment, 0)}
 	attachments := make([]portableFactAttachment, 0)
+	recordSchema := PortableFactRecordSchemaV2
 	add := func(kind, id, subject string, revision int64, predecessor string, payload any, provenance any) error {
 		payloadBytes, err := CanonicalJSON(payload)
 		if err != nil {
@@ -355,7 +372,7 @@ func (s *Service) buildPortableFactBundleUnplaced(ctx context.Context, workspace
 		if err != nil {
 			return err
 		}
-		bundle.Records = append(bundle.Records, portableFactRecord{Schema: PortableFactRecordSchemaV1, RecordKind: kind, RecordID: id, WorkspaceID: workspaceID, SnapshotRef: snapshotRef, StableSubjectRef: subject, Revision: revision, PredecessorRecordID: predecessor, PayloadDigest: DigestBytes(payloadBytes), PayloadLength: int64(len(payloadBytes)), Provenance: provenanceBytes, Payload: payloadBytes})
+		bundle.Records = append(bundle.Records, portableFactRecord{Schema: recordSchema, RecordKind: kind, RecordID: id, WorkspaceID: workspaceID, SnapshotRef: snapshotRef, StableSubjectRef: subject, Revision: revision, PredecessorRecordID: predecessor, PayloadDigest: DigestBytes(payloadBytes), PayloadLength: int64(len(payloadBytes)), Provenance: provenanceBytes, Payload: payloadBytes})
 		return nil
 	}
 	for _, node := range nodes {
@@ -378,9 +395,20 @@ func (s *Service) buildPortableFactBundleUnplaced(ctx context.Context, workspace
 			selectedRefs = append(selectedRefs, ref)
 		}
 		sort.Strings(selectedRefs)
+		if strings.TrimSpace(entry.SubjectRef) == "" {
+			return bundle, nil, fmt.Errorf("portable subject %q has no stable subject reference", entry.ID)
+		}
+		parentSubject := ""
+		if entry.ParentID != "" && entry.ParentID != root.ID {
+			parent, ok := subjects[entry.ParentID]
+			if !ok || strings.TrimSpace(parent.SubjectRef) == "" {
+				return bundle, nil, fmt.Errorf("portable subject %q has no stable parent reference", entry.ID)
+			}
+			parentSubject = parent.SubjectRef
+		}
 		mapping := subjectMappingPayload{
 			WorkspaceID: workspaceID, NamespaceRootID: root.ID, NamespaceEntryID: entry.ID,
-			SourceID: root.SourceID, ParentSubjectRef: entry.ParentID,
+			StableSubjectRef: entry.SubjectRef, SourceID: root.SourceID, ParentSubjectRef: parentSubject,
 			RawPath: append([]byte(nil), portableEntry.RawPath...), RawName: append([]byte(nil), portableEntry.RawName...),
 			DisplayName: entry.DisplayName, EntryType: portableEntry.EntryType,
 			ContentID: portableEntry.ContentID, LogicalLength: portableEntry.LogicalSize,
@@ -389,14 +417,14 @@ func (s *Service) buildPortableFactBundleUnplaced(ctx context.Context, workspace
 			MetadataAfter:  append(json.RawMessage(nil), portableEntry.MetadataAfter...),
 			Protection:     portableEntry.Protection,
 		}
-		if err := add("SUBJECT_MAPPING", entry.ID, entry.ID, 1, "", mapping, map[string]any{"namespace_root_id": root.ID, "entry_type": entry.EntryType}); err != nil {
+		if err := add("SUBJECT_MAPPING", entry.ID, entry.SubjectRef, 1, "", mapping, map[string]any{"namespace_root_id": root.ID, "entry_type": entry.EntryType}); err != nil {
 			return bundle, nil, err
 		}
 		if portableEntry.Facts == nil {
 			return bundle, nil, fmt.Errorf("portable subject %q has no captured facts", entry.ID)
 		}
 		for _, fact := range portableEntry.Facts.Facts {
-			if err := add("METADATA_FACT", entry.ID+":capture:"+fact.Name, entry.ID, 1, "", fact, map[string]any{
+			if err := add("METADATA_FACT", entry.ID+":capture:"+fact.Name, entry.SubjectRef, 1, "", fact, map[string]any{
 				"source_profile": fact.SourceProfile, "authority": fact.Authority,
 				"capture_time": fact.CapturedAt, "provenance_digest": fact.ProvenanceDigest,
 			}); err != nil {
@@ -409,10 +437,12 @@ func (s *Service) buildPortableFactBundleUnplaced(ctx context.Context, workspace
 		return bundle, nil, err
 	}
 	for _, fact := range facts {
-		if _, ok := subjects[fact.SubjectRef]; !ok {
+		stableSubject, ok := stableByRef[fact.SubjectRef]
+		if !ok || stableSubject == "" {
 			continue
 		}
-		if err := add("METADATA_FACT", fact.ID, fact.SubjectRef, fact.Revision, "", fact, map[string]any{"authority": fact.AuthorityClass, "source_ref": fact.SourceRef}); err != nil {
+		fact.SubjectRef = stableSubject
+		if err := add("METADATA_FACT", fact.ID, stableSubject, fact.Revision, "", fact, map[string]any{"authority": fact.AuthorityClass, "source_ref": fact.SourceRef}); err != nil {
 			return bundle, nil, err
 		}
 	}
@@ -421,9 +451,11 @@ func (s *Service) buildPortableFactBundleUnplaced(ctx context.Context, workspace
 		return bundle, nil, err
 	}
 	for _, annotation := range annotations {
-		if _, ok := subjects[annotation.SubjectRef]; !ok {
+		stableSubject, ok := stableByRef[annotation.SubjectRef]
+		if !ok || stableSubject == "" {
 			continue
 		}
+		annotation.SubjectRef = stableSubject
 		if err := add("ANNOTATION_REVISION", annotation.ID, annotation.SubjectRef, annotation.Revision, annotation.PredecessorID, annotation, map[string]any{"created_at": annotation.CreatedAt}); err != nil {
 			return bundle, nil, err
 		}
@@ -433,9 +465,11 @@ func (s *Service) buildPortableFactBundleUnplaced(ctx context.Context, workspace
 		return bundle, nil, err
 	}
 	for _, doc := range docs {
-		if _, ok := subjects[doc.SubjectRef]; !ok {
+		stableSubject, ok := stableByRef[doc.SubjectRef]
+		if !ok || stableSubject == "" {
 			continue
 		}
+		doc.SubjectRef = stableSubject
 		bodyID := "attachment:description:" + doc.ID
 		bodyBytes := []byte(doc.Body)
 		bodyDigest := DigestBytes(bodyBytes)
@@ -456,6 +490,7 @@ func (s *Service) buildPortableFactBundleUnplaced(ctx context.Context, workspace
 			return bundle, nil, e
 		}
 		for _, segment := range segments {
+			segment.SubjectRef = stableSubject
 			if err := add("SEMANTIC_SEGMENT", segment.ID, segment.SubjectRef, segment.Ordinal+1, "", segment, map[string]any{"description_document_id": doc.ID, "document_revision": segment.DocumentRevision, "segmentation_profile_digest": segment.SegmentationProfileDigest}); err != nil {
 				return bundle, nil, err
 			}
@@ -466,9 +501,11 @@ func (s *Service) buildPortableFactBundleUnplaced(ctx context.Context, workspace
 		return bundle, nil, err
 	}
 	for _, artifact := range artifacts {
-		if _, ok := subjects[artifact.SubjectRef]; !ok {
+		stableSubject, ok := stableByRef[artifact.SubjectRef]
+		if !ok || stableSubject == "" {
 			return bundle, nil, errors.New("processor artifact subject is absent from snapshot")
 		}
+		artifact.SubjectRef = stableSubject
 		bodyID := "attachment:artifact:" + artifact.ID
 		bodyBytes := append([]byte(nil), artifact.Body...)
 		bodyDigest := DigestBytes(bodyBytes)
@@ -533,16 +570,27 @@ func listPortableFactClosures(ctx context.Context, repo repository.Driver, drive
 		if err := decodeStrictRecord(payload, &envelope); err != nil {
 			return nil, err
 		}
-		if envelope.Schema != PortableFactClosureEnvelopeSchemaV1 || DigestBytes(payload) != digest {
+		if envelope.Schema != PortableFactClosureEnvelopeSchemaV1 && envelope.Schema != PortableFactClosureEnvelopeSchemaV2 || DigestBytes(payload) != digest {
 			return nil, errors.New("portable fact closure envelope is invalid")
+		}
+		closureSchema := PortableFactClosureSchemaV1
+		if envelope.Schema == PortableFactClosureEnvelopeSchemaV2 {
+			closureSchema = PortableFactClosureSchemaV2
+		}
+		if envelope.Closure.Schema != closureSchema {
+			return nil, errors.New("portable fact closure envelope and closure schema differ")
 		}
 		if err := envelope.Closure.Verify(anchor); err != nil {
 			return nil, err
 		}
-		if envelope.Closure.BundleSchema != PortableFactBundleSchemaV1 ||
+		if envelope.Closure.BundleSchema != PortableFactBundleSchemaV1 && envelope.Closure.BundleSchema != PortableFactBundleSchemaV2 ||
 			envelope.Closure.CanonicalizationProfile != "encoding/json-compact-v1" ||
-			!sameStrings(envelope.Closure.RequiredReaderDependencies, portableFactReaderDependencies(repo)) {
+			!sameStrings(envelope.Closure.RequiredReaderDependencies, portableFactReaderDependenciesForSchema(repo, closureSchema)) {
 			return nil, errors.New("portable fact closure reader dependencies are unavailable")
+		}
+		expectedClosureSchema, _, schemaErr := portableFactClosureSchemas(envelope.Closure.BundleSchema)
+		if schemaErr != nil || expectedClosureSchema != closureSchema {
+			return nil, errors.New("portable fact closure bundle and closure schema differ")
 		}
 		if envelope.Closure.PublicationDomain != domain {
 			continue
@@ -607,12 +655,42 @@ func listPortableFactClosures(ctx context.Context, repo repository.Driver, drive
 }
 
 func portableFactReaderDependencies(repo repository.Driver) []string {
+	return portableFactReaderDependenciesForSchema(repo, PortableFactClosureSchemaV2)
+}
+
+func portableFactReaderDependenciesForSchema(repo repository.Driver, closureSchema string) []string {
 	profile := repository.DescribeProfile(repo)
+	readerVersion := "v2"
+	if closureSchema == PortableFactClosureSchemaV1 {
+		readerVersion = "v1"
+	}
 	return []string{
 		"canonicalization:encoding/json-compact-v1",
 		"repository:" + profile.Repository + "/" + profile.Compression,
-		"restoreweave-reader:portable-fact-v1",
+		"restoreweave-reader:portable-fact-" + readerVersion,
 		"signature:ed25519-v1",
+	}
+}
+
+func portableFactClosureSchemas(bundleSchema string) (closureSchema, envelopeSchema string, err error) {
+	switch bundleSchema {
+	case PortableFactBundleSchemaV1:
+		return PortableFactClosureSchemaV1, PortableFactClosureEnvelopeSchemaV1, nil
+	case PortableFactBundleSchemaV2:
+		return PortableFactClosureSchemaV2, PortableFactClosureEnvelopeSchemaV2, nil
+	default:
+		return "", "", fmt.Errorf("%w: unsupported portable fact bundle schema %q", ErrRecoveryRecordInvalid, bundleSchema)
+	}
+}
+
+func portableFactRecordSchema(bundleSchema string) (string, error) {
+	switch bundleSchema {
+	case PortableFactBundleSchemaV1:
+		return PortableFactRecordSchemaV1, nil
+	case PortableFactBundleSchemaV2:
+		return PortableFactRecordSchemaV2, nil
+	default:
+		return "", fmt.Errorf("%w: unsupported portable fact bundle schema %q", ErrRecoveryRecordInvalid, bundleSchema)
 	}
 }
 
@@ -682,6 +760,7 @@ func (s *Service) ListPortableFactClosures(ctx context.Context, snapshotRef stri
 }
 
 func validatePortableFactRecords(bundle portableFactBundle) error {
+	v2 := bundle.Schema == PortableFactBundleSchemaV2
 	mappings := make(map[string]struct{})
 	attachments := make(map[string]struct{}, len(bundle.Attachments))
 	attachmentByID := make(map[string]portableFactAttachment, len(bundle.Attachments))
@@ -701,11 +780,18 @@ func validatePortableFactRecords(bundle portableFactBundle) error {
 	for _, record := range bundle.Records {
 		if record.RecordKind == "SUBJECT_MAPPING" {
 			var mapping subjectMappingPayload
-			if err := decodeStrictRecord(record.Payload, &mapping); err != nil || mapping.WorkspaceID != bundle.WorkspaceID || mapping.NamespaceEntryID != record.StableSubjectRef || mapping.NamespaceRootID == "" || mapping.SourceID == "" || len(mapping.RawPath) == 0 || len(mapping.RawName) == 0 || mapping.DisplayName == "" || mapping.EntryType == "" || mapping.Protection.Mode == "" || mapping.Protection.Outcome == "" || mapping.SelectedRepresentationRefs == nil {
+			if err := decodeStrictRecord(record.Payload, &mapping); err != nil || mapping.WorkspaceID != bundle.WorkspaceID || mapping.NamespaceRootID == "" || mapping.SourceID == "" || len(mapping.RawPath) == 0 || len(mapping.RawName) == 0 || mapping.DisplayName == "" || mapping.EntryType == "" || mapping.Protection.Mode == "" || mapping.Protection.Outcome == "" || mapping.SelectedRepresentationRefs == nil {
 				return errors.New("portable subject mapping is incomplete")
 			}
 			if record.RecordID != mapping.NamespaceEntryID || !sameStrings(mapping.SelectedRepresentationRefs, portableSelectedRepresentationRefs(mapping.Protection)) {
 				return errors.New("portable subject mapping identity or representation set is invalid")
+			}
+			if v2 {
+				if strings.TrimSpace(mapping.StableSubjectRef) == "" || mapping.StableSubjectRef != record.StableSubjectRef {
+					return errors.New("portable v2 subject mapping stable identity is invalid")
+				}
+			} else if mapping.StableSubjectRef != "" || mapping.NamespaceEntryID != record.StableSubjectRef {
+				return errors.New("portable v1 subject mapping identity is invalid")
 			}
 			if namespaceRootID == "" {
 				namespaceRootID = mapping.NamespaceRootID
@@ -1011,6 +1097,7 @@ func validatePortableFactRecordsAgainstManifest(bundle portableFactBundle, manif
 	if manifest.SnapshotRef != bundle.SnapshotRef {
 		return errors.New("portable fact manifest snapshot binding mismatch")
 	}
+	v2 := bundle.Schema == PortableFactBundleSchemaV2
 
 	expectedByPath := make(map[string]ManifestEntry, len(manifest.Entries))
 	seenManifestPaths := make(map[string]struct{}, len(manifest.Entries))
@@ -1063,7 +1150,7 @@ func validatePortableFactRecordsAgainstManifest(bundle portableFactBundle, manif
 		if _, exists := mappingsByPath[pathKey]; exists {
 			return fmt.Errorf("portable subject mapping path %q is duplicated", pathKey)
 		}
-		if record.RecordID != mapping.NamespaceEntryID || record.StableSubjectRef != mapping.NamespaceEntryID {
+		if record.RecordID != mapping.NamespaceEntryID || (v2 && (mapping.StableSubjectRef == "" || record.StableSubjectRef != mapping.StableSubjectRef)) || (!v2 && (mapping.StableSubjectRef != "" || record.StableSubjectRef != mapping.NamespaceEntryID)) {
 			return errors.New("portable subject mapping outer identity is not bound")
 		}
 		if !bytes.Equal(mapping.RawPath, entry.RawPath) || !bytes.Equal(mapping.RawName, entry.RawName) ||
@@ -1089,7 +1176,15 @@ func validatePortableFactRecordsAgainstManifest(bundle portableFactBundle, manif
 			continue
 		}
 		parent, exists := mappingsByPath[parentPath]
-		if !exists || mapping.ParentSubjectRef == "" || mapping.ParentSubjectRef == mapping.NamespaceEntryID || mapping.ParentSubjectRef != parent.NamespaceEntryID {
+		wantParent := parent.NamespaceEntryID
+		if v2 {
+			wantParent = parent.StableSubjectRef
+		}
+		childSubject := mapping.NamespaceEntryID
+		if v2 {
+			childSubject = mapping.StableSubjectRef
+		}
+		if !exists || mapping.ParentSubjectRef == "" || mapping.ParentSubjectRef == childSubject || mapping.ParentSubjectRef != wantParent {
 			return fmt.Errorf("portable subject mapping %q has an invalid parent reference", pathKey)
 		}
 	}
@@ -1108,7 +1203,11 @@ func validatePortableFactRecordsAgainstManifest(bundle portableFactBundle, manif
 				return fmt.Errorf("portable captured fact %q is missing or duplicated", captureID)
 			}
 			record := candidates[0]
-			if record.StableSubjectRef != mapping.NamespaceEntryID || record.Revision != 1 || record.PredecessorRecordID != "" {
+			wantSubject := mapping.NamespaceEntryID
+			if v2 {
+				wantSubject = mapping.StableSubjectRef
+			}
+			if record.StableSubjectRef != wantSubject || record.Revision != 1 || record.PredecessorRecordID != "" {
 				return fmt.Errorf("portable captured fact %q identity is invalid", captureID)
 			}
 			wantPayload, err := CanonicalJSON(fact)
@@ -1264,8 +1363,12 @@ func validatePortableFactBundle(payload []byte, workspaceID, snapshotRef string)
 	if err := decodeStrictRecord(payload, &bundle); err != nil {
 		return bundle, err
 	}
-	if bundle.Schema != PortableFactBundleSchemaV1 || bundle.WorkspaceID != workspaceID || bundle.SnapshotRef != snapshotRef || bundle.Records == nil || bundle.Attachments == nil {
+	if bundle.Schema != PortableFactBundleSchemaV1 && bundle.Schema != PortableFactBundleSchemaV2 || bundle.WorkspaceID != workspaceID || bundle.SnapshotRef != snapshotRef || bundle.Records == nil || bundle.Attachments == nil {
 		return bundle, errors.New("portable fact bundle binding is invalid")
+	}
+	recordSchema, err := portableFactRecordSchema(bundle.Schema)
+	if err != nil {
+		return bundle, err
 	}
 	canonical, err := CanonicalJSON(bundle)
 	if err != nil || !bytes.Equal(payload, canonical) {
@@ -1274,7 +1377,7 @@ func validatePortableFactBundle(payload []byte, workspaceID, snapshotRef string)
 	previous := ""
 	seen := make(map[string]string)
 	for _, record := range bundle.Records {
-		if record.Schema != PortableFactRecordSchemaV1 || record.WorkspaceID != workspaceID || record.SnapshotRef != snapshotRef || strings.TrimSpace(record.RecordID) == "" || strings.TrimSpace(record.StableSubjectRef) == "" || record.Revision < 1 || !validExactContentID(record.PayloadDigest) || record.PayloadLength < 0 || len(record.Payload) == 0 || len(record.Provenance) == 0 || !json.Valid(record.Payload) || !json.Valid(record.Provenance) || DigestBytes(record.Payload) != record.PayloadDigest || int64(len(record.Payload)) != record.PayloadLength {
+		if record.Schema != recordSchema || record.WorkspaceID != workspaceID || record.SnapshotRef != snapshotRef || strings.TrimSpace(record.RecordID) == "" || strings.TrimSpace(record.StableSubjectRef) == "" || record.Revision < 1 || !validExactContentID(record.PayloadDigest) || record.PayloadLength < 0 || len(record.Payload) == 0 || len(record.Provenance) == 0 || !json.Valid(record.Payload) || !json.Valid(record.Provenance) || DigestBytes(record.Payload) != record.PayloadDigest || int64(len(record.Payload)) != record.PayloadLength {
 			return bundle, errors.New("portable fact record is invalid")
 		}
 		key := record.RecordKind + "\x00" + record.RecordID + "\x00" + fmt.Sprint(record.Revision)

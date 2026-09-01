@@ -258,39 +258,139 @@ WHERE workspace_id = ? AND subject_ref = ? AND kind = 'PROGRESS' AND tombstoned 
 
 func (s *Store) InsertIndexGeneration(ctx context.Context, record *IndexGeneration) error {
 	return s.Update(ctx, func(tx *Tx) error {
-		if record == nil {
-			return errors.New("index generation is required")
+		return insertIndexGenerationTx(ctx, tx, record)
+	})
+}
+
+// InsertIndexGenerationWithRoots atomically publishes a disposable
+// generation and the exact namespace roots included by its build. Root IDs
+// are resolved in the same transaction; a missing, cross-workspace,
+// duplicate, or source/root-inconsistent root aborts the whole write.
+func (s *Store) InsertIndexGenerationWithRoots(ctx context.Context, record *IndexGeneration, rootIDs []string) error {
+	return s.Update(ctx, func(tx *Tx) error {
+		if err := insertIndexGenerationTx(ctx, tx, record); err != nil {
+			return err
 		}
-		for name, value := range map[string]string{
-			"generation id":     record.ID,
-			"workspace id":      record.WorkspaceID,
-			"namespace root id": record.NamespaceRootID,
-		} {
-			if err := requireID(name, value); err != nil {
+		if len(rootIDs) == 0 {
+			return errors.New("index generation roots are required")
+		}
+		seen := make(map[string]struct{}, len(rootIDs))
+		containsPrimaryRoot := false
+		for _, rootID := range rootIDs {
+			if err := requireID("namespace root id", rootID); err != nil {
 				return err
 			}
-		}
-		for name, value := range map[string]string{
-			"snapshot ref": record.SnapshotRef,
-			"db path":      record.DBPath,
-		} {
-			if err := requireText(name, value); err != nil {
-				return err
+			if _, ok := seen[rootID]; ok {
+				return fmt.Errorf("duplicate namespace root id %q", rootID)
+			}
+			seen[rootID] = struct{}{}
+			if rootID == record.NamespaceRootID {
+				containsPrimaryRoot = true
+			}
+			var sourceID string
+			err := tx.tx.QueryRowContext(ctx, `
+SELECT source_id FROM namespace_roots
+WHERE workspace_id = ? AND namespace_root_id = ?`, record.WorkspaceID, rootID).Scan(&sourceID)
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: namespace root %q is not in workspace %q", ErrNotFound, rootID, record.WorkspaceID)
+			}
+			if err != nil {
+				return fmt.Errorf("resolve namespace root %q: %w", rootID, err)
+			}
+			if err := insertOne(ctx, tx.tx, `
+INSERT INTO index_generation_roots(generation_id, workspace_id, source_id, namespace_root_id)
+VALUES (?, ?, ?, ?)`, record.ID, record.WorkspaceID, sourceID, rootID); err != nil {
+				return fmt.Errorf("insert index generation root %q: %w", rootID, err)
 			}
 		}
-		if strings.TrimSpace(record.Dimension) == "" {
-			record.Dimension = "lexical-metadata-fts"
+		if !containsPrimaryRoot {
+			return fmt.Errorf("index generation root set does not include primary namespace root %q", record.NamespaceRootID)
 		}
-		record.CreatedAt = recordTime(record.CreatedAt, tx.now)
-		return insertOne(ctx, tx.tx, `
+		return nil
+	})
+}
+
+func insertIndexGenerationTx(ctx context.Context, tx *Tx, record *IndexGeneration) error {
+	if record == nil {
+		return errors.New("index generation is required")
+	}
+	for name, value := range map[string]string{
+		"generation id":     record.ID,
+		"workspace id":      record.WorkspaceID,
+		"namespace root id": record.NamespaceRootID,
+	} {
+		if err := requireID(name, value); err != nil {
+			return err
+		}
+	}
+	for name, value := range map[string]string{
+		"snapshot ref": record.SnapshotRef,
+		"db path":      record.DBPath,
+	} {
+		if err := requireText(name, value); err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(record.Dimension) == "" {
+		record.Dimension = "lexical-metadata-fts"
+	}
+	record.CreatedAt = recordTime(record.CreatedAt, tx.now)
+	return insertOne(ctx, tx.tx, `
 INSERT INTO index_generations(
     generation_id, workspace_id, snapshot_ref, namespace_root_id, db_path, dimension,
     config_digest, provider_profile_digest, semantic_space, created_at_ns
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`,
-			record.ID, record.WorkspaceID, record.SnapshotRef, record.NamespaceRootID,
-			record.DBPath, record.Dimension, record.ConfigDigest,
-			record.ProviderProfileDigest, record.SemanticSpace, record.CreatedAt.UnixNano())
-	})
+		record.ID, record.WorkspaceID, record.SnapshotRef, record.NamespaceRootID,
+		record.DBPath, record.Dimension, record.ConfigDigest,
+		record.ProviderProfileDigest, record.SemanticSpace, record.CreatedAt.UnixNano())
+}
+
+// ListIndexGenerationRoots returns the exact namespace roots recorded for a
+// generation. Legacy generations remain readable and return an empty slice.
+func (s *Store) ListIndexGenerationRoots(ctx context.Context, workspaceID, generationID string) ([]NamespaceRoot, error) {
+	if err := requireID("workspace id", workspaceID); err != nil {
+		return nil, err
+	}
+	if err := requireID("generation id", generationID); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT r.namespace_root_id, r.workspace_id, r.source_id, r.scan_generation_id,
+       r.snapshot_ref, r.name, r.root_path_key, r.filesystem_semantics,
+       r.authority_digest, r.metadata_json, r.created_at_ns
+FROM index_generation_roots AS m
+JOIN namespace_roots AS r
+  ON r.workspace_id = m.workspace_id
+ AND r.namespace_root_id = m.namespace_root_id
+WHERE m.workspace_id = ? AND m.generation_id = ?
+ORDER BY m.source_id, m.namespace_root_id`, workspaceID, generationID)
+	if err != nil {
+		return nil, fmt.Errorf("list index generation roots: %w", err)
+	}
+	defer rows.Close()
+	roots := make([]NamespaceRoot, 0)
+	for rows.Next() {
+		root, scanErr := scanNamespaceRoot(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		roots = append(roots, root)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate index generation roots: %w", err)
+	}
+	if len(roots) == 0 {
+		var exists int
+		err := s.db.QueryRowContext(ctx, `
+SELECT 1 FROM index_generations WHERE workspace_id = ? AND generation_id = ?`, workspaceID, generationID).Scan(&exists)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		if err != nil {
+			return nil, fmt.Errorf("check index generation: %w", err)
+		}
+	}
+	return roots, nil
 }
 
 func (s *Store) GetIndexGeneration(ctx context.Context, generationID string) (IndexGeneration, error) {

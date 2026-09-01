@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ailiheizi/restoreweave/client/command"
@@ -26,24 +27,28 @@ import (
 // It only reads the rebuildable SQLite projection; it never fabricates success
 // for operations that have no implementation in this build.
 type Dispatcher struct {
-	store             *sqlite.Store
-	catalogPath       string
-	socketPath        string
-	configDigest      string
-	indexBinding      search.IndexBinding
-	vectorPath        string
-	semanticBinding   semanticIndexerBinding
-	semanticBundle    command.Capability
-	now               func() time.Time
-	exact             *exact.Service
-	search            *search.Indexer
-	fixtureDimensions bool
-	sessions          *contentSessions
-	access            *access.Service
-	recoveryReader    *recoveryReaderState
-	operatorConfig    *operatorConfigState
-	implemented       map[string]bool
-	unimplemented     []string
+	store                    *sqlite.Store
+	catalogPath              string
+	socketPath               string
+	configDigest             string
+	indexBinding             search.IndexBinding
+	vectorPath               string
+	semanticBinding          semanticIndexerBinding
+	semanticBundle           command.Capability
+	semanticBundleMu         sync.RWMutex
+	semanticBundleInstallMu  sync.Mutex
+	semanticBundleModelsRoot string
+	semanticBundleInstaller  SemanticBundleInstaller
+	now                      func() time.Time
+	exact                    *exact.Service
+	search                   *search.Indexer
+	fixtureDimensions        bool
+	sessions                 *contentSessions
+	access                   *access.Service
+	recoveryReader           *recoveryReaderState
+	operatorConfig           *operatorConfigState
+	implemented              map[string]bool
+	unimplemented            []string
 }
 
 const modelBundleCapabilityKind = "model-bundle"
@@ -58,6 +63,20 @@ type semanticIndexerBinding struct {
 	libraryDigest string
 	manifest      search.EmbeddingGenerationManifest
 }
+
+// SemanticBundleInstallReceipt is the narrow control-plane receipt returned by
+// the host-owned fixed bundle installer. Admission remains owned by the
+// search package; the control plane only publishes its result as a capability.
+type SemanticBundleInstallReceipt struct {
+	Admission   search.SemanticBundleAdmission
+	Destination string
+	Changed     bool
+}
+
+// SemanticBundleInstaller is deliberately not a general model manager. The
+// daemon supplies the persisted paths.models root and the callback may only
+// install the pinned local BGE/ONNX+zvec profile there.
+type SemanticBundleInstaller func(context.Context, string) (SemanticBundleInstallReceipt, error)
 
 // DispatcherOption configures optional exact-lane handlers.
 type DispatcherOption func(*Dispatcher)
@@ -134,6 +153,17 @@ func WithSemanticBundleCapability(capability command.Capability) DispatcherOptio
 	}
 }
 
+// WithSemanticBundleInstaller enables the explicit semantic.bundle.install
+// operation for one persisted models root. A nil callback leaves the
+// operation visible but unavailable, which keeps override and test harness
+// configurations honest.
+func WithSemanticBundleInstaller(modelsRoot string, installer SemanticBundleInstaller) DispatcherOption {
+	return func(d *Dispatcher) {
+		d.semanticBundleModelsRoot = strings.TrimSpace(modelsRoot)
+		d.semanticBundleInstaller = installer
+	}
+}
+
 // WithExact enables capture-qualified ingest, snapshot list/diff/verify,
 // recovery.export, and catalog-free restore when a repository-backed exact
 // service is available.
@@ -184,6 +214,7 @@ func NewDispatcher(store *sqlite.Store, catalogPath, socketPath string, opts ...
 		command.OpDoctorCheck:        true,
 		command.OpCapabilityList:     true,
 		command.OpNamespaceList:      true,
+		command.OpSourceList:         true,
 		command.OpContentList:        true,
 		command.OpNamespaceResolve:   true,
 		command.OpNamespaceStat:      true,
@@ -217,6 +248,9 @@ func NewDispatcher(store *sqlite.Store, catalogPath, socketPath string, opts ...
 			opt(dispatcher)
 		}
 	}
+	if dispatcher.semanticBundleInstaller != nil && strings.TrimSpace(dispatcher.semanticBundleModelsRoot) != "" {
+		implemented[command.OpSemanticBundleInstall] = true
+	}
 	if dispatcher.exact != nil {
 		implemented[command.OpPlanIngest] = true
 		implemented[command.OpPlanRestore] = true
@@ -230,6 +264,7 @@ func NewDispatcher(store *sqlite.Store, catalogPath, socketPath string, opts ...
 		implemented[command.OpExportPlan] = true
 		implemented[command.OpExportApply] = true
 		implemented[command.OpExportVerify] = true
+		implemented[command.OpExportList] = true
 		implemented[command.OpViewSave] = true
 		implemented[command.OpViewGet] = true
 		implemented[command.OpViewEvaluate] = true
@@ -283,6 +318,9 @@ func NewDispatcher(store *sqlite.Store, catalogPath, socketPath string, opts ...
 		}
 		if dispatcher.exact.Indexer == nil {
 			dispatcher.exact.Indexer = dispatcher.search
+		}
+		if dispatcher.search != nil {
+			implemented[command.OpSearchRebuild] = true
 		}
 		if dispatcher.exact.Processor == nil && dispatcher.exact.Repo != nil {
 			dispatcher.exact.Processor = processor.NewHost(store, dispatcher.exact.Repo, processor.Options{
@@ -341,6 +379,8 @@ func (d *Dispatcher) Handle(ctx context.Context, raw command.Envelope) command.R
 		return d.handleConfigUpdate(env, started)
 	case command.OpNamespaceList:
 		return d.handleNamespaceList(ctx, env, started)
+	case command.OpSourceList:
+		return d.handleSourceList(ctx, env, started)
 	case command.OpContentList:
 		return d.handleContentList(ctx, env, started)
 	case command.OpNamespaceResolve:
@@ -395,6 +435,8 @@ func (d *Dispatcher) Handle(ctx context.Context, raw command.Envelope) command.R
 		return d.handleViewEvaluate(ctx, env, started)
 	case command.OpViewList:
 		return d.handleViewList(ctx, env, started)
+	case command.OpExportList:
+		return d.handleExportList(ctx, env, started)
 	case command.OpExportPlan:
 		return d.handleExportPlan(ctx, env, started)
 	case command.OpExportApply:
@@ -413,6 +455,10 @@ func (d *Dispatcher) Handle(ctx context.Context, raw command.Envelope) command.R
 		return d.handleAnnotationImport(ctx, env, started)
 	case command.OpSearchQuery:
 		return d.handleSearchQuery(ctx, env, started)
+	case command.OpSearchRebuild:
+		return d.handleSearchRebuild(ctx, env, started)
+	case command.OpSemanticBundleInstall:
+		return d.handleSemanticBundleInstall(ctx, env, started)
 	case command.OpContentOpen:
 		return d.handleContentOpen(ctx, env, started)
 	case command.OpContentRead:
@@ -545,7 +591,10 @@ func (d *Dispatcher) handleCapabilityList(env command.Envelope, started time.Tim
 			Notes:   "host-owned suffix and magic-byte detector",
 		},
 	)
-	capabilities = append(capabilities, d.semanticBundle)
+	d.semanticBundleMu.RLock()
+	semanticBundle := d.semanticBundle
+	d.semanticBundleMu.RUnlock()
+	capabilities = append(capabilities, semanticBundle)
 	for _, dimension := range search.DeclaredDimensions(search.IndexerReadiness(d.search)) {
 		if dimension.ID == search.DimensionSemantic && dimension.State == command.CapabilityUnavailable && d.search != nil {
 			if failure := strings.TrimSpace(d.search.SemanticFailure()); failure != "" {
@@ -631,7 +680,8 @@ func (d *Dispatcher) handleContentList(ctx context.Context, env command.Envelope
 	items := make([]command.ContentItemData, 0, len(entries))
 	for _, entry := range entries {
 		items = append(items, command.ContentItemData{
-			SubjectRef:  entry.ID,
+			SubjectRef:  entry.SubjectRef,
+			EntryID:     entry.ID,
 			Name:        entry.DisplayName,
 			Path:        d.namespaceDisplayPath(ctx, input.WorkspaceID, entry),
 			EntryType:   string(entry.EntryType),
@@ -858,9 +908,26 @@ func containsNotFound(err error) bool {
 	return errors.Is(err, sqlite.ErrNotFound) || (err != nil && strings.Contains(err.Error(), "not found"))
 }
 
+// resolveSubject accepts both the current stable subject reference and the
+// pre-stable namespace-entry handle. The latter is retained only as a
+// compatibility alias; all callers should use the returned SubjectRef when
+// addressing durable annotations, descriptions, and search results.
+func (d *Dispatcher) resolveSubject(ctx context.Context, workspaceID, ref string) (sqlite.NamespaceEntry, error) {
+	entry, err := d.store.LookupLatestNamespaceEntryBySubjectRef(ctx, workspaceID, ref)
+	if err == nil || !containsNotFound(err) {
+		return entry, err
+	}
+	// Fixture/low-level catalogs may contain an unpublished namespace without
+	// a committed publication from which continuity can be resolved. Preserve
+	// compatibility for those direct rows; published catalogs always take the
+	// stable-subject latest path above.
+	return d.store.GetNamespaceEntry(ctx, workspaceID, ref)
+}
+
 func projectNamespaceEntry(entry sqlite.NamespaceEntry) command.NamespaceEntryData {
 	return command.NamespaceEntryData{
 		ID:                   entry.ID,
+		SubjectRef:           entry.SubjectRef,
 		RootID:               entry.RootID,
 		ParentID:             entry.ParentID,
 		DisplayName:          entry.DisplayName,

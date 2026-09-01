@@ -98,7 +98,11 @@ func replacePortableFactClosureRecord(t *testing.T, service *Service, snapshotRe
 	if err != nil {
 		t.Fatal(err)
 	}
-	replacementPayload, err := CanonicalJSON(PortableFactClosureEnvelope{Schema: PortableFactClosureEnvelopeSchemaV1, Closure: signed, Bundle: envelope.Bundle})
+	envelopeSchema := PortableFactClosureEnvelopeSchemaV1
+	if signed.Schema == PortableFactClosureSchemaV2 {
+		envelopeSchema = PortableFactClosureEnvelopeSchemaV2
+	}
+	replacementPayload, err := CanonicalJSON(PortableFactClosureEnvelope{Schema: envelopeSchema, Closure: signed, Bundle: envelope.Bundle})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +244,7 @@ func TestPortableFactClosureRejectsUnknownBundleSchemaAtSigning(t *testing.T) {
 	if err := decodeStrictRecord(payload, &envelope); err != nil {
 		t.Fatal(err)
 	}
-	envelope.Closure.BundleSchema = "org.restoreweave.portable-fact-bundle.v2"
+	envelope.Closure.BundleSchema = "org.restoreweave.portable-fact-bundle.v3"
 	envelope.Closure.Signature = nil
 	if _, err := SignPortableFactClosure(*fixture.service.SigningIdentity, envelope.Closure); err == nil {
 		t.Fatal("unknown portable fact bundle schema was signed")

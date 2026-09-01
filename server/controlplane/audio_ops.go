@@ -45,7 +45,7 @@ func (d *Dispatcher) handleAudioList(ctx context.Context, env command.Envelope, 
 		}
 		_ = json.Unmarshal([]byte(artifact.Body), &parsed)
 		name := ""
-		if entry, err := d.store.GetNamespaceEntry(ctx, input.WorkspaceID, artifact.SubjectRef); err == nil {
+		if entry, err := d.resolveSubject(ctx, input.WorkspaceID, artifact.SubjectRef); err == nil {
 			name = entry.DisplayName
 		}
 		tracks = append(tracks, command.AudioTrack{

@@ -92,6 +92,45 @@ type SnapshotSummary struct {
 	NamespaceRootID string `json:"namespace_root_id,omitempty"`
 }
 
+// SourceListData is a read-only projection of configured source provenance.
+// Reachability is a transient host probe and must not be confused with the
+// durable source state or used as evidence that a source was retired.
+type SourceListData struct {
+	WorkspaceID string              `json:"workspace_id"`
+	Sources     []SourceSummaryData `json:"sources"`
+}
+
+type SourceSummaryData struct {
+	SourceRef             string          `json:"source_ref"`
+	Kind                  string          `json:"kind"`
+	Locator               string          `json:"locator"`
+	State                 string          `json:"state"`
+	Reachability          string          `json:"reachability"`
+	ReachabilityCheckedAt string          `json:"reachability_checked_at"`
+	ReachabilityMessage   string          `json:"reachability_message,omitempty"`
+	LatestScan            *SourceScanData `json:"latest_scan,omitempty"`
+	LatestSnapshotRef     string          `json:"latest_snapshot_ref,omitempty"`
+	LatestNamespaceRootID string          `json:"latest_namespace_root_id,omitempty"`
+}
+
+type SourceScanData struct {
+	ScanRef           string `json:"scan_ref"`
+	Generation        int64  `json:"generation"`
+	State             string `json:"state"`
+	FullTraversal     bool   `json:"full_traversal"`
+	StartedAt         string `json:"started_at,omitempty"`
+	FinishedAt        string `json:"finished_at,omitempty"`
+	Entries           uint64 `json:"entries"`
+	RegularFiles      uint64 `json:"regular_files"`
+	Directories       uint64 `json:"directories"`
+	Symlinks          uint64 `json:"symlinks"`
+	SpecialFiles      uint64 `json:"special_files"`
+	BytesHashed       int64  `json:"bytes_hashed"`
+	FailedEntries     uint64 `json:"failed_entries"`
+	UnstableEntries   uint64 `json:"unstable_entries"`
+	DetectionFailures uint64 `json:"detection_failures"`
+}
+
 type PlanIngestData struct {
 	WorkspaceID         string                         `json:"workspace_id"`
 	SourceID            string                         `json:"source_id"`
@@ -378,6 +417,7 @@ type ContentRootData struct {
 
 type ContentItemData struct {
 	SubjectRef  string `json:"subject_ref"`
+	EntryID     string `json:"entry_id,omitempty"`
 	Name        string `json:"name"`
 	Path        string `json:"path"`
 	EntryType   string `json:"entry_type"`
@@ -389,6 +429,7 @@ type ContentItemData struct {
 // Raw byte names are never placed here; they appear only in readlink targets.
 type NamespaceEntryData struct {
 	ID                   string `json:"entry_id"`
+	SubjectRef           string `json:"subject_ref"`
 	RootID               string `json:"root_id"`
 	ParentID             string `json:"parent_id,omitempty"`
 	DisplayName          string `json:"display_name"`
@@ -541,6 +582,7 @@ type DescriptionCreateData struct {
 
 type SearchHitData struct {
 	SubjectRef    string              `json:"subject_ref"`
+	EntryID       string              `json:"entry_id,omitempty"`
 	Path          string              `json:"path"`
 	Name          string              `json:"name"`
 	EntryType     string              `json:"entry_type"`
@@ -586,6 +628,45 @@ type SearchQueryData struct {
 	Hits            []SearchHitData       `json:"hits"`
 }
 
+// SearchRebuildData reports the result of rebuilding disposable search
+// projections for the newest published snapshot. Exact content, namespace,
+// and recovery records are not changed by this operation.
+type SearchRebuildData struct {
+	WorkspaceID           string             `json:"workspace_id"`
+	SnapshotRef           string             `json:"snapshot_ref"`
+	NamespaceRootID       string             `json:"namespace_root_id"`
+	LexicalGenerationRef  string             `json:"lexical_generation_ref"`
+	LexicalState          string             `json:"lexical_state"`
+	LexicalCoverage       SearchCoverageData `json:"lexical_coverage"`
+	SemanticGenerationRef string             `json:"semantic_generation_ref,omitempty"`
+	SemanticState         string             `json:"semantic_state"`
+	SemanticFailure       string             `json:"semantic_failure,omitempty"`
+}
+
+// SemanticBundleInstallData reports admission of the fixed local BGE bundle.
+// Installing a model bundle never hot-loads an embedding worker or rebuilds a
+// semantic generation; callers must restart the daemon before those services
+// can use the newly admitted files.
+type SemanticBundleInstallData struct {
+	ProfileID       string `json:"profile_id"`
+	ProfileDigest   string `json:"profile_digest"`
+	Destination     string `json:"destination"`
+	Changed         bool   `json:"changed"`
+	RestartRequired bool   `json:"restart_required"`
+}
+
+// SearchCoverageData is the public projection of measured lexical field
+// coverage. It describes the generation that was actually built; it is not a
+// claim based on the index schema alone.
+type SearchCoverageData struct {
+	Dimension string          `json:"dimension"`
+	Available bool            `json:"available"`
+	Complete  bool            `json:"complete"`
+	Fields    map[string]bool `json:"fields"`
+	Missing   []string        `json:"missing"`
+	Notes     string          `json:"notes,omitempty"`
+}
+
 const (
 	RepresentationClassExact       = "EXACT"
 	RepresentationClassRecorded    = "RECORDED"
@@ -622,6 +703,7 @@ type RepresentationData struct {
 type ContentOpenData struct {
 	Handle      string `json:"handle"`
 	EntryID     string `json:"entry_id"`
+	SubjectRef  string `json:"subject_ref"`
 	ContentID   string `json:"content_id"`
 	LogicalSize int64  `json:"logical_size"`
 	MaxRead     int64  `json:"max_read"`

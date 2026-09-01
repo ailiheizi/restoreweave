@@ -18,16 +18,19 @@
 # Usage:
 #   scripts/savings-report.sh [--corpus-dir DIR] [--work-dir DIR] [--profile raw|zstd|both]
 #
-#   --corpus-dir DIR  where the deterministic corpus is generated (default: a
-#                     temp dir that is removed on exit)
+#   --corpus-dir DIR  an existing, non-empty corpus to read (never modified)
+#                     (default: a deterministic probe in a temp dir)
 #   --work-dir DIR    where fresh repositories are created (default: a temp
 #                     dir that is removed on exit; use --keep to retain it)
 #   --profile P       raw, zstd, or both (default both)
 #   --keep            keep the corpus and work dirs on exit
 #
-# Dependencies: bash, awk, dd, date, find, mkdir, rm, seq, go.
+# Dependencies: bash, awk, cmp, cp, dd, find, mkdir, rm, go.
 #=============================================================================
 set -euo pipefail
+# Keep the generated probe's text and byte-oriented awk output stable across
+# hosts with different user locale settings.
+export LC_ALL=C
 
 # ---- options ---------------------------------------------------------------
 KEEP=0
@@ -68,9 +71,47 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [[ -z "$CORPUS_DIR" ]]; then CORPUS_DIR="$TMP_BASE/corpus"; fi
+GENERATED_CORPUS=0
+if [[ -z "$CORPUS_DIR" ]]; then
+    CORPUS_DIR="$TMP_BASE/corpus"
+    GENERATED_CORPUS=1
+else
+    if [[ ! -d "$CORPUS_DIR" || -L "$CORPUS_DIR" ]]; then
+        echo "error: --corpus-dir must be an existing real directory" >&2
+        exit 1
+    fi
+fi
 if [[ -z "$WORK_DIR" ]]; then WORK_DIR="$TMP_BASE/work"; fi
-mkdir -p "$CORPUS_DIR" "$WORK_DIR"
+if [[ -e "$WORK_DIR" || -L "$WORK_DIR" ]]; then
+    if [[ -L "$WORK_DIR" || ! -d "$WORK_DIR" ]]; then
+        echo "error: --work-dir must be a real directory or a new path" >&2
+        exit 1
+    fi
+    if [[ -n "$(find "$WORK_DIR" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+        echo "error: --work-dir must be empty" >&2
+        exit 1
+    fi
+fi
+if [[ ! -d "$(dirname "$WORK_DIR")" ]]; then
+    echo "error: parent directory for --work-dir must already exist" >&2
+    exit 1
+fi
+if [[ "$GENERATED_CORPUS" -eq 1 ]]; then
+    mkdir -p "$CORPUS_DIR"
+fi
+CORPUS_ABS="$(cd "$CORPUS_DIR" && pwd -P)"
+if [[ -e "$WORK_DIR" ]]; then
+    WORK_ABS="$(cd "$WORK_DIR" && pwd -P)"
+else
+    WORK_PARENT="$(cd "$(dirname "$WORK_DIR")" && pwd -P)"
+    WORK_ABS="$WORK_PARENT/$(basename "$WORK_DIR")"
+fi
+case "$WORK_ABS" in
+    "$CORPUS_ABS"|"$CORPUS_ABS"/*) echo "error: work and corpus directories must be separate and non-nested" >&2; exit 1 ;;
+esac
+case "$CORPUS_ABS" in
+    "$WORK_ABS"|"$WORK_ABS"/*) echo "error: work and corpus directories must be separate and non-nested" >&2; exit 1 ;;
+esac
 
 # ---- deterministic corpus --------------------------------------------------
 # Small fixed corpus with the four behaviors the report must separate:
@@ -78,8 +119,8 @@ mkdir -p "$CORPUS_DIR" "$WORK_DIR"
 #   dupe_0/dupe_1/  identical files under two directories (dedup target)
 #   zeros/  all-zero files (compress target)
 #   rand/   seeded-pseudo-random binaries (incompressible; bounds the claim)
-echo "=== corpus generation ==="
-LINES_PER_FILE=4000
+if [[ "$GENERATED_CORPUS" -eq 1 ]]; then
+echo "=== generating deterministic probe corpus ==="
 mkdir -p "$CORPUS_DIR/texts"
 for f in 0 1 2; do
     {
@@ -88,6 +129,7 @@ for f in 0 1 2; do
         printf '=== end idx=%s ===\n' "$f"
     } >"$CORPUS_DIR/texts/doc_$f.txt"
 done
+LINES_PER_FILE=4000
 for d in 0 1; do
     mkdir -p "$CORPUS_DIR/dupe_$d"
     for f in 0 1 2; do
@@ -106,8 +148,10 @@ for i in 0 1 2; do
         for (j = 0; j < 300000; j++) { s = (16807 * s) % 2147483647; printf "%c", s % 256 }
     }' >"$CORPUS_DIR/rand/rand_$i.bin"
 done
-find "$CORPUS_DIR" -type f | sort >"$WORK_DIR/corpus-file-list.txt"
-CORPUS_FILES=$(wc -l <"$WORK_DIR/corpus-file-list.txt" | tr -d ' ')
+else
+    echo "=== using supplied corpus read-only ==="
+fi
+CORPUS_FILES=$(find "$CORPUS_DIR" -type f | wc -l | tr -d ' ')
 CORPUS_BYTES=$(find "$CORPUS_DIR" -type f -exec cat {} + | wc -c | tr -d ' ')
 echo "files: $CORPUS_FILES"
 echo "bytes: $CORPUS_BYTES ($(awk -v b="$CORPUS_BYTES" 'BEGIN{printf "%.1f MiB", b/1048576}'))"
@@ -115,10 +159,19 @@ echo "bytes: $CORPUS_BYTES ($(awk -v b="$CORPUS_BYTES" 'BEGIN{printf "%.1f MiB",
 # ---- measurement ------------------------------------------------------------
 run_profile() { # profile dirname
     local profile="$1" dir="$2"
+    local manifest_path="$WORK_DIR/$profile.corpus.manifest.json"
     echo ""
     echo "=== savings report: $profile ==="
     go run -tags=savingsreport "$RUNNER" -profile "$profile" \
-        -repo "$WORK_DIR/$dir" -corpus "$CORPUS_DIR"
+        -repo "$WORK_DIR/$dir" -corpus "$CORPUS_DIR" \
+        -manifest-out "$manifest_path" \
+        -evidence-out "$WORK_DIR/$profile.candidate-evidence.json"
+    if [[ -f "$WORK_DIR/corpus.manifest.json" ]] &&
+        ! cmp -s "$WORK_DIR/corpus.manifest.json" "$manifest_path"; then
+        echo "error: corpus manifest changed between repository profiles" >&2
+        return 1
+    fi
+    cp "$manifest_path" "$WORK_DIR/corpus.manifest.json"
 }
 
 case "$PROFILE" in
@@ -130,6 +183,8 @@ case "$PROFILE" in
         ;;
 esac
 
+mkdir -p "$WORK_DIR"
+find "$CORPUS_DIR" -type f | sort >"$WORK_DIR/corpus-file-list.txt"
 echo ""
 echo "done: corpus file list at $WORK_DIR/corpus-file-list.txt"
 if [[ "$KEEP" -ne 1 ]]; then

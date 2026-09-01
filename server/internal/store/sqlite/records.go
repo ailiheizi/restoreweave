@@ -143,6 +143,78 @@ SELECT source_id, workspace_id, stable_key, kind, locator, identity_fingerprint,
 FROM sources WHERE workspace_id = ? AND source_id = ?`, workspaceID, sourceID))
 }
 
+// ListSources returns the durable source records for one workspace. It is a
+// read-only provenance query; callers must obtain reachability separately and
+// must not turn a failed probe into a SourceState transition.
+func (s *Store) ListSources(ctx context.Context, workspaceID string) ([]Source, error) {
+	if err := requireID("workspace id", workspaceID); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT source_id, workspace_id, stable_key, kind, locator, identity_fingerprint,
+       state, metadata_json, revision, created_at_ns, updated_at_ns
+FROM sources WHERE workspace_id = ? ORDER BY created_at_ns ASC, source_id ASC`, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("list sources: %w", err)
+	}
+	defer rows.Close()
+	var records []Source
+	for rows.Next() {
+		record, err := scanSource(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate sources: %w", err)
+	}
+	return records, nil
+}
+
+// LatestScanGeneration returns the newest scan attempt for one source,
+// including incomplete or failed attempts so operators can see why a source
+// has not produced a newer publication.
+func (s *Store) LatestScanGeneration(ctx context.Context, workspaceID, sourceID string) (ScanGeneration, error) {
+	if err := requireID("workspace id", workspaceID); err != nil {
+		return ScanGeneration{}, err
+	}
+	if err := requireID("source id", sourceID); err != nil {
+		return ScanGeneration{}, err
+	}
+	return scanScanGeneration(s.db.QueryRowContext(ctx, `
+SELECT scan_generation_id, workspace_id, source_id, generation,
+       parent_scan_generation_id, capture_set_id, capture_set_digest, state,
+       full_traversal, summary_json, started_at_ns, finished_at_ns
+FROM scan_generations
+WHERE workspace_id = ? AND source_id = ?
+ORDER BY generation DESC, started_at_ns DESC, scan_generation_id DESC
+LIMIT 1`, workspaceID, sourceID))
+}
+
+// LatestPublicationForSource returns the newest committed snapshot for a
+// source. The scan generation is used as the primary ordering key so a newer
+// completed scan cannot be hidden by an older publication's timestamp.
+func (s *Store) LatestPublicationForSource(ctx context.Context, workspaceID, sourceID string) (Publication, error) {
+	if err := requireID("workspace id", workspaceID); err != nil {
+		return Publication{}, err
+	}
+	if err := requireID("source id", sourceID); err != nil {
+		return Publication{}, err
+	}
+	return scanPublication(s.db.QueryRowContext(ctx, `
+SELECT p.publication_id, p.workspace_id, p.snapshot_ref, p.scan_generation_id,
+       p.binding_id, p.namespace_root_id, p.manifest_digest, p.committed_at_ns,
+       p.metadata_json, p.plan_digest
+FROM publications AS p
+JOIN scan_generations AS sg
+  ON sg.workspace_id = p.workspace_id
+ AND sg.scan_generation_id = p.scan_generation_id
+WHERE p.workspace_id = ? AND sg.source_id = ?
+ORDER BY sg.generation DESC, p.committed_at_ns DESC, p.snapshot_ref DESC
+LIMIT 1`, workspaceID, sourceID))
+}
+
 func scanSource(scanner rowScanner) (Source, error) {
 	var record Source
 	var metadata string

@@ -97,8 +97,15 @@ func (tx *Tx) InsertNamespaceEntry(ctx context.Context, record *NamespaceEntry) 
 	if record == nil {
 		return errors.New("namespace entry is required")
 	}
+	if record.SubjectRef == "" {
+		// Direct legacy callers predate stable subjects. Keep those rows
+		// addressable with their immutable entry ID; exact ingest supplies a
+		// generated subj_* reference explicitly for new observations.
+		record.SubjectRef = record.ID
+	}
 	for name, value := range map[string]string{
 		"namespace entry id": record.ID,
+		"subject ref":        record.SubjectRef,
 		"workspace id":       record.WorkspaceID,
 		"namespace root id":  record.RootID,
 	} {
@@ -157,8 +164,8 @@ INSERT INTO namespace_entries(
     observation_id, raw_name, display_name, full_path_key, entry_type,
     metadata_json, content_id, file_version_id, symlink_target_raw,
     symlink_target_display, hardlink_group_id, logical_size,
-    allocated_size, created_at_ns
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    allocated_size, created_at_ns, subject_ref
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT DO NOTHING`,
 		record.ID, record.WorkspaceID, record.RootID, nullableString(record.ParentID),
 		nullableString(record.ObservationID), record.RawName, record.DisplayName,
@@ -166,11 +173,129 @@ ON CONFLICT DO NOTHING`,
 		nullableString(record.FileVersionID), nullableBytes(record.SymlinkTargetRaw),
 		record.SymlinkTargetDisplay, record.HardlinkGroupID,
 		nullableInt64(record.LogicalSize), nullableInt64(record.AllocatedSize),
-		record.CreatedAt.UnixNano())
+		record.CreatedAt.UnixNano(), record.SubjectRef)
 	if err != nil {
 		return fmt.Errorf("insert namespace entry: %w", err)
 	}
 	return nil
+}
+
+// ResolveNamespaceSubjectRef returns the stable subject from the newest
+// committed publication for one source/path/type key. The query deliberately
+// excludes running, failed, and orphaned scans by joining publications; a
+// source path is never merged by content ID, display name, or embedding.
+// Callers may invoke it from the same write transaction that inserts the new
+// namespace entry, which makes first-observation allocation and publication
+// serialization atomic with the catalog mutation.
+func (tx *Tx) ResolveNamespaceSubjectRef(
+	ctx context.Context,
+	workspaceID, sourceID string,
+	fullPathKey []byte,
+	entryType NamespaceEntryType,
+) (string, error) {
+	if err := requireID("workspace id", workspaceID); err != nil {
+		return "", err
+	}
+	if err := requireID("source id", sourceID); err != nil {
+		return "", err
+	}
+	if fullPathKey == nil {
+		return "", errors.New("namespace full path key must be present")
+	}
+	if !validEntryType(entryType) {
+		return "", fmt.Errorf("invalid namespace entry type %q", entryType)
+	}
+	var subjectRef string
+	// First select the one immediately latest committed root for this source.
+	// Looking through all historical publications would incorrectly resurrect a
+	// subject after a path disappeared from the latest complete snapshot.
+	err := tx.tx.QueryRowContext(ctx, `
+WITH latest_root AS (
+    SELECT p.namespace_root_id
+    FROM publications AS p
+    JOIN scan_generations AS sg
+      ON sg.workspace_id = p.workspace_id
+     AND sg.scan_generation_id = p.scan_generation_id
+    JOIN namespace_roots AS r
+      ON r.workspace_id = p.workspace_id
+     AND r.namespace_root_id = p.namespace_root_id
+    WHERE p.workspace_id = ?
+      AND r.source_id = ?
+    ORDER BY sg.generation DESC, p.committed_at_ns DESC,
+             p.snapshot_ref DESC, p.publication_id DESC
+    LIMIT 1
+)
+SELECT e.subject_ref
+FROM namespace_entries AS e
+JOIN latest_root AS latest
+  ON latest.namespace_root_id = e.namespace_root_id
+WHERE e.workspace_id = ?
+  AND e.full_path_key = ?
+  AND e.entry_type = ?
+  AND e.subject_ref <> ''
+ORDER BY e.namespace_entry_id DESC
+LIMIT 1`, workspaceID, sourceID, workspaceID, fullPathKey, entryType).Scan(&subjectRef)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("resolve namespace subject ref: %w", err)
+	}
+	if err := requireID("resolved subject ref", subjectRef); err != nil {
+		return "", err
+	}
+	return subjectRef, nil
+}
+
+// LookupLatestNamespaceEntryBySubjectRef resolves a stable subject to its
+// newest committed namespace observation. Historical entry IDs remain
+// addressable through GetNamespaceEntry.
+func (s *Store) LookupLatestNamespaceEntryBySubjectRef(
+	ctx context.Context,
+	workspaceID, subjectRef string,
+) (NamespaceEntry, error) {
+	if err := requireID("workspace id", workspaceID); err != nil {
+		return NamespaceEntry{}, err
+	}
+	if err := requireID("subject ref", subjectRef); err != nil {
+		return NamespaceEntry{}, err
+	}
+	// Older callers used the snapshot-local nse_* entry ID as the subject.
+	// Accept that identifier as an alias, but resolve the returned row by its
+	// durable stable subject so the caller receives the newest publication.
+	resolvedSubjectRef := subjectRef
+	var aliasSubjectRef string
+	err := s.db.QueryRowContext(ctx, `
+SELECT subject_ref
+FROM namespace_entries
+WHERE workspace_id = ? AND namespace_entry_id = ?`, workspaceID, subjectRef).Scan(&aliasSubjectRef)
+	if err == nil {
+		resolvedSubjectRef = aliasSubjectRef
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return NamespaceEntry{}, fmt.Errorf("resolve namespace subject alias: %w", err)
+	}
+	return scanNamespaceEntry(s.db.QueryRowContext(ctx, `
+SELECT e.namespace_entry_id, e.workspace_id, e.namespace_root_id,
+       e.parent_entry_id, e.observation_id, e.raw_name, e.display_name,
+       e.full_path_key, e.entry_type, e.metadata_json, e.content_id,
+       e.file_version_id, e.symlink_target_raw, e.symlink_target_display,
+       e.hardlink_group_id, e.logical_size, e.allocated_size, e.created_at_ns,
+       e.subject_ref
+FROM namespace_entries AS e
+JOIN namespace_roots AS r
+  ON r.workspace_id = e.workspace_id
+ AND r.namespace_root_id = e.namespace_root_id
+JOIN publications AS p
+  ON p.workspace_id = r.workspace_id
+ AND p.namespace_root_id = r.namespace_root_id
+JOIN scan_generations AS sg
+  ON sg.workspace_id = p.workspace_id
+ AND sg.scan_generation_id = p.scan_generation_id
+WHERE e.workspace_id = ?
+  AND e.subject_ref = ?
+ORDER BY sg.generation DESC, p.committed_at_ns DESC,
+         p.snapshot_ref DESC, e.namespace_entry_id DESC
+	 LIMIT 1`, workspaceID, resolvedSubjectRef))
 }
 
 func (s *Store) LookupNamespaceEntry(
@@ -277,6 +402,7 @@ SELECT e.namespace_entry_id, e.workspace_id, e.namespace_root_id,
        e.full_path_key, e.entry_type, e.metadata_json, e.content_id,
        e.file_version_id, e.symlink_target_raw, e.symlink_target_display,
        e.hardlink_group_id, e.logical_size, e.allocated_size, e.created_at_ns,
+       e.subject_ref,
        tree.depth
 FROM tree
 JOIN namespace_entries AS e ON e.namespace_entry_id = tree.namespace_entry_id
@@ -375,7 +501,8 @@ SELECT e.namespace_entry_id, e.workspace_id, e.namespace_root_id,
        e.parent_entry_id, e.observation_id, e.raw_name, e.display_name,
        e.full_path_key, e.entry_type, e.metadata_json, e.content_id,
        e.file_version_id, e.symlink_target_raw, e.symlink_target_display,
-       e.hardlink_group_id, e.logical_size, e.allocated_size, e.created_at_ns
+       e.hardlink_group_id, e.logical_size, e.allocated_size, e.created_at_ns,
+       e.subject_ref
 FROM namespace_entries AS e
 JOIN latest_publications AS latest
   ON latest.namespace_root_id = e.namespace_root_id
@@ -498,7 +625,8 @@ SELECT e.namespace_entry_id, e.workspace_id, e.namespace_root_id,
        e.parent_entry_id, e.observation_id, e.raw_name, e.display_name,
        e.full_path_key, e.entry_type, e.metadata_json, e.content_id,
        e.file_version_id, e.symlink_target_raw, e.symlink_target_display,
-       e.hardlink_group_id, e.logical_size, e.allocated_size, e.created_at_ns
+       e.hardlink_group_id, e.logical_size, e.allocated_size, e.created_at_ns,
+       e.subject_ref
 FROM namespace_entries AS e
 JOIN latest_publications AS latest
   ON latest.namespace_root_id = e.namespace_root_id
@@ -527,7 +655,7 @@ SELECT namespace_entry_id, workspace_id, namespace_root_id, parent_entry_id,
        observation_id, raw_name, display_name, full_path_key, entry_type,
        metadata_json, content_id, file_version_id, symlink_target_raw,
        symlink_target_display, hardlink_group_id, logical_size,
-       allocated_size, created_at_ns
+       allocated_size, created_at_ns, subject_ref
 FROM namespace_entries `
 
 func scanNamespaceEntry(scanner rowScanner) (NamespaceEntry, error) {
@@ -546,13 +674,14 @@ func scanNamespaceEntryFields(scanner rowScanner, withDepth bool) (NamespaceEntr
 	var logical, allocated sql.NullInt64
 	var metadata string
 	var created int64
+	var subjectRef string
 	var depth int64
 	destinations := []any{
 		&record.ID, &record.WorkspaceID, &record.RootID, &parentID,
 		&observationID, &record.RawName, &record.DisplayName, &record.FullPathKey,
 		&record.EntryType, &metadata, &record.ContentID, &fileVersionID,
 		&symlinkTarget, &record.SymlinkTargetDisplay, &record.HardlinkGroupID,
-		&logical, &allocated, &created,
+		&logical, &allocated, &created, &subjectRef,
 	}
 	if withDepth {
 		destinations = append(destinations, &depth)
@@ -570,6 +699,7 @@ func scanNamespaceEntryFields(scanner rowScanner, withDepth bool) (NamespaceEntr
 	record.LogicalSize = int64Pointer(logical)
 	record.AllocatedSize = int64Pointer(allocated)
 	record.CreatedAt = time.Unix(0, created).UTC()
+	record.SubjectRef = subjectRef
 	return record, depth, nil
 }
 

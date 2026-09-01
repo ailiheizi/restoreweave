@@ -11,11 +11,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"strings"
+	"time"
 
 	"github.com/ailiheizi/restoreweave/server/internal/repository"
 )
@@ -23,16 +25,34 @@ import (
 func main() {
 	profile := flag.String("profile", "", "repository profile: raw or zstd")
 	repoPath := flag.String("repo", "", "repository path to create")
-	corpus := flag.String("corpus", "", "corpus directory to place")
+	corpus := flag.String("corpus", "", "existing corpus directory to read")
+	manifestOut := flag.String("manifest-out", "", "optional canonical corpus manifest JSON path")
+	evidenceOut := flag.String("evidence-out", "", "optional candidate evidence JSON path")
 	flag.Parse()
 	if *profile == "" || *repoPath == "" || *corpus == "" {
-		fmt.Fprintln(os.Stderr, "usage: savings-report-runner -profile raw|zstd -repo DIR -corpus DIR")
+		fmt.Fprintln(os.Stderr, "usage: savings-report-runner -profile raw|zstd -repo DIR -corpus DIR [-manifest-out FILE] [-evidence-out FILE]")
 		os.Exit(2)
+	}
+	if err := validateWorkDir(*corpus, *repoPath); err != nil {
+		fmt.Fprintf(os.Stderr, "unsafe work directory: %v\n", err)
+		os.Exit(1)
+	}
+	if err := validateOutputPath(*corpus, *manifestOut); err != nil {
+		fmt.Fprintf(os.Stderr, "unsafe manifest output: %v\n", err)
+		os.Exit(1)
+	}
+	if err := validateOutputPath(*corpus, *evidenceOut); err != nil {
+		fmt.Fprintf(os.Stderr, "unsafe evidence output: %v\n", err)
+		os.Exit(1)
+	}
+	manifest, err := BuildCorpusManifest(*corpus)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "scan corpus: %v\n", err)
+		os.Exit(1)
 	}
 
 	ctx := context.Background()
 	var driver repository.Driver
-	var err error
 	switch *profile {
 	case "raw":
 		driver, err = repository.OpenDir(*repoPath)
@@ -47,19 +67,25 @@ func main() {
 		os.Exit(1)
 	}
 
-	paths, err := corpusFiles(*corpus)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "list corpus: %v\n", err)
-		os.Exit(1)
-	}
-	placements := make([]repository.Receipt, 0, len(paths))
-	for _, path := range paths {
-		body, err := os.Open(path)
+	started := time.Now()
+	placements := make([]repository.Receipt, 0, len(manifest.Entries))
+	for _, entry := range manifest.Entries {
+		path := filepath.Join(*corpus, filepath.FromSlash(entry.Path))
+		info, statErr := os.Lstat(path)
+		if statErr != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			if statErr == nil {
+				statErr = fmt.Errorf("path is no longer a regular file")
+			}
+			fmt.Fprintf(os.Stderr, "open %s: corpus changed: %v\n", entry.Path, statErr)
+			os.Exit(1)
+		}
+		body, err := openCorpusFile(*corpus, path)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "open %s: %v\n", path, err)
 			os.Exit(1)
 		}
-		receipt, placeErr := driver.Place(ctx, body)
+		expectedContentID := repository.AlgorithmSHA256 + ":" + entry.SHA256
+		receipt, placeErr := driver.PlaceExact(ctx, expectedContentID, body)
 		closeErr := body.Close()
 		if placeErr != nil {
 			fmt.Fprintf(os.Stderr, "place %s: %v\n", path, placeErr)
@@ -69,7 +95,20 @@ func main() {
 			fmt.Fprintf(os.Stderr, "close %s: %v\n", path, closeErr)
 			os.Exit(1)
 		}
+		if receipt.ContentID != expectedContentID || receipt.Bytes != entry.Bytes {
+			fmt.Fprintf(os.Stderr, "place %s: receipt differs from corpus manifest\n", entry.Path)
+			os.Exit(1)
+		}
 		placements = append(placements, receipt)
+	}
+	after, err := BuildCorpusManifest(*corpus)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "rescan corpus: %v\n", err)
+		os.Exit(1)
+	}
+	if !manifestEqual(manifest, after) {
+		fmt.Fprintln(os.Stderr, "corpus changed during placement: manifest before and after differ")
+		os.Exit(1)
 	}
 
 	report, err := repository.MeasureSavings(ctx, driver, placements)
@@ -78,6 +117,14 @@ func main() {
 		os.Exit(1)
 	}
 	desc := repository.DescribeProfile(driver)
+	if err := writeJSONFile(*manifestOut, manifest); err != nil {
+		fmt.Fprintf(os.Stderr, "write corpus manifest: %v\n", err)
+		os.Exit(1)
+	}
+	if err := writeJSONFile(*evidenceOut, candidateEvidence(manifest, driver, desc, report, started)); err != nil {
+		fmt.Fprintf(os.Stderr, "write candidate evidence: %v\n", err)
+		os.Exit(1)
+	}
 	fmt.Printf("profile:                   %s / %s\n", desc.Repository, desc.Compression)
 	fmt.Printf("logical bytes:             %d\n", report.LogicalBytes)
 	fmt.Printf("duplicate files:           %d\n", report.DuplicateFiles)
@@ -104,24 +151,18 @@ func printOverheadCategory(name string, category repository.SavingsOverheadCateg
 	fmt.Printf("%-27s %d\n", name+":", category.Bytes)
 }
 
-// corpusFiles returns the sorted regular files under the corpus directory.
-func corpusFiles(root string) ([]string, error) {
-	var paths []string
-	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() || !entry.Type().IsRegular() {
-			return nil
-		}
-		paths = append(paths, path)
+func validateOutputPath(corpus, output string) error {
+	if strings.TrimSpace(output) == "" {
 		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
-	sort.Strings(paths)
-	return paths, nil
+	overlap, err := pathsOverlap(corpus, output)
+	if err != nil {
+		return err
+	}
+	if overlap {
+		return errors.New("output must not be written inside the read-only corpus")
+	}
+	return nil
 }
 
 func ratio(n, d int64) float64 {

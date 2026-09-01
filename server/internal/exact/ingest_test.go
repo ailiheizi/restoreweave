@@ -191,6 +191,147 @@ func TestIngestReportsMeasuredZeroSavingsForEmptyAndUnavailableForInvalidReceipt
 	}
 }
 
+func TestIngestRescanRetainsStableSubjectForProtectionAndExactIdentity(t *testing.T) {
+	ctx := context.Background()
+	source := t.TempDir()
+	payload := []byte("stable subject protection")
+	if err := os.WriteFile(filepath.Join(source, "stable.txt"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "catalog.sqlite"), sqlite.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	repo, err := repository.OpenDir(filepath.Join(t.TempDir(), "repository"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &Service{Store: store, Repo: repo}
+
+	first, err := service.Ingest(ctx, source)
+	if err != nil {
+		t.Fatalf("first ingest: %v", err)
+	}
+	firstEntries, err := store.ListNamespaceContent(ctx, first.WorkspaceID, first.RootID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(firstEntries) != 1 || firstEntries[0].EntryType != sqlite.EntryFile {
+		t.Fatalf("first namespace content = %+v", firstEntries)
+	}
+	firstEntry := firstEntries[0]
+	if firstEntry.SubjectRef == "" || firstEntry.SubjectRef == firstEntry.ID {
+		t.Fatalf("first entry did not receive a stable subject: %+v", firstEntry)
+	}
+	firstProtection, err := store.GetProtectionRecordBySubject(ctx, first.WorkspaceID, firstEntry.SubjectRef)
+	if err != nil {
+		t.Fatalf("first protection: %v", err)
+	}
+	if firstProtection.SubjectRef != firstEntry.SubjectRef || firstProtection.ExpectedContentID != firstEntry.ContentID {
+		t.Fatalf("first protection = %+v, entry = %+v", firstProtection, firstEntry)
+	}
+
+	second, err := service.Ingest(ctx, source)
+	if err != nil {
+		t.Fatalf("second ingest: %v", err)
+	}
+	if second.WorkspaceID != first.WorkspaceID || second.SourceID != first.SourceID {
+		t.Fatalf("rescan changed catalog source identity: first=%+v second=%+v", first, second)
+	}
+	secondEntries, err := store.ListNamespaceContent(ctx, second.WorkspaceID, second.RootID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(secondEntries) != 1 || secondEntries[0].EntryType != sqlite.EntryFile {
+		t.Fatalf("second namespace content = %+v", secondEntries)
+	}
+	secondEntry := secondEntries[0]
+	if secondEntry.ID == firstEntry.ID {
+		t.Fatalf("rescan reused snapshot-local namespace entry ID %q", secondEntry.ID)
+	}
+	if secondEntry.SubjectRef != firstEntry.SubjectRef {
+		t.Fatalf("rescan changed stable subject: first=%q second=%q", firstEntry.SubjectRef, secondEntry.SubjectRef)
+	}
+	if secondEntry.ContentID != firstEntry.ContentID || secondEntry.ContentID == "" {
+		t.Fatalf("rescan changed exact identity: first=%q second=%q", firstEntry.ContentID, secondEntry.ContentID)
+	}
+	if second.NewBytes != 0 {
+		t.Fatalf("rescan did not preserve whole-file deduplication: %+v", second)
+	}
+	secondProtection, err := store.GetProtectionRecordBySubject(ctx, second.WorkspaceID, secondEntry.SubjectRef)
+	if err != nil {
+		t.Fatalf("second protection: %v", err)
+	}
+	if secondProtection.SubjectRef != firstEntry.SubjectRef || secondProtection.ID != firstProtection.ID {
+		t.Fatalf("protection subject continuity lost: first=%+v second=%+v", firstProtection, secondProtection)
+	}
+	if secondProtection.Revision <= firstProtection.Revision {
+		t.Fatalf("rescan did not revise current protection projection: first=%d second=%d", firstProtection.Revision, secondProtection.Revision)
+	}
+	references, err := store.ListRecoveryReferencesBySubject(ctx, second.WorkspaceID, secondEntry.SubjectRef)
+	if err != nil || len(references) != 2 {
+		t.Fatalf("stable recovery references = %+v, err=%v", references, err)
+	}
+	for _, reference := range references {
+		if reference.SubjectRef != secondEntry.SubjectRef || reference.ProtectionRecordID != secondProtection.ID {
+			t.Fatalf("recovery reference lost stable protection binding: %+v", reference)
+		}
+	}
+	if _, err := store.GetNamespaceEntry(ctx, first.WorkspaceID, firstEntry.ID); err != nil {
+		t.Fatalf("legacy namespace observation no longer readable: %v", err)
+	}
+}
+
+func TestIngestSameSHAPathsRemainDistinctSubjects(t *testing.T) {
+	ctx := context.Background()
+	source := t.TempDir()
+	payload := []byte("same bytes, different provenance")
+	for _, name := range []string{"one.txt", "two.txt"} {
+		if err := os.WriteFile(filepath.Join(source, name), payload, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "catalog.sqlite"), sqlite.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	repo, err := repository.OpenDir(filepath.Join(t.TempDir(), "repository"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&Service{Store: store, Repo: repo}).Ingest(ctx, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := store.ListNamespaceContent(ctx, result.WorkspaceID, result.RootID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("namespace content = %+v", entries)
+	}
+	if entries[0].ContentID == "" || entries[0].ContentID != entries[1].ContentID {
+		t.Fatalf("same-SHA content identities = %q / %q", entries[0].ContentID, entries[1].ContentID)
+	}
+	if entries[0].SubjectRef == "" || entries[0].SubjectRef == entries[1].SubjectRef {
+		t.Fatalf("different paths were merged into one subject: %+v", entries)
+	}
+	if result.NewBytes != int64(len(payload)) {
+		t.Fatalf("whole-file deduplication accounting = %+v", result)
+	}
+	for _, entry := range entries {
+		protection, err := store.GetProtectionRecordBySubject(ctx, result.WorkspaceID, entry.SubjectRef)
+		if err != nil {
+			t.Fatalf("protection for %q: %v", entry.DisplayName, err)
+		}
+		if protection.SubjectRef != entry.SubjectRef || protection.ExpectedContentID != entry.ContentID {
+			t.Fatalf("protection for %q = %+v", entry.DisplayName, protection)
+		}
+	}
+}
+
 func TestIngestRejectsContradictoryPreverifiedReceiptSavings(t *testing.T) {
 	ctx := context.Background()
 	payload := []byte("receipt disagrees with pre-verification")

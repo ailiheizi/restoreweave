@@ -7,6 +7,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/ailiheizi/restoreweave/server/internal/store/sqlite"
 	_ "modernc.org/sqlite"
@@ -14,6 +15,20 @@ import (
 
 type semanticCoverageProbe interface {
 	Coverage(context.Context, ZvecGenerationSpec) ([]string, error)
+}
+
+// semanticCoveragePairsProbe is the subject-bound coverage contract. The
+// older ID-only probe remains recognized below for replaceable backends, but
+// it can never establish complete coverage because it cannot bind rows back
+// to their durable subject.
+type semanticCoveragePairsProbe interface {
+	CoveragePairs(context.Context, ZvecGenerationSpec) ([]ZvecCoverageIdentity, error)
+}
+
+// semanticCoveragePairMethodProbe permits backends that adopted the pair
+// return shape directly on Coverage while keeping the legacy shape accepted.
+type semanticCoveragePairMethodProbe interface {
+	Coverage(context.Context, ZvecGenerationSpec) ([]ZvecCoverageIdentity, error)
 }
 
 type SemanticCoverageStatement struct {
@@ -62,18 +77,40 @@ func (idx *Indexer) SemanticCoverage(ctx context.Context, workspaceID string) (S
 		statement.Notes = "semantic generation binding mismatch"
 		return statement, nil
 	}
+	entries, err := semanticNamespaceEntries(ctx, idx.Store, generation)
+	if err != nil {
+		statement.Notes = "semantic namespace provenance is unavailable"
+		return statement, nil
+	}
+	expected := map[string]string{}
+	activeSubjects := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		activeSubjects[semanticEntrySubject(entry)] = struct{}{}
+		if strings.TrimSpace(entry.DisplayName) != "" {
+			expected[entry.ID] = semanticEntrySubject(entry)
+		}
+	}
 	docs, err := idx.Store.ListDescriptionDocuments(ctx, workspaceID, "")
 	if err != nil {
 		return statement, err
 	}
-	expected := map[string]struct{}{}
+	activeDescriptions := activeDescriptionLeaves(docs)
 	for _, doc := range docs {
+		if _, ok := activeDescriptions[doc.ID]; !ok {
+			continue
+		}
+		if _, ok := activeSubjects[semanticCanonicalSubject(entries, doc.SubjectRef)]; !ok {
+			continue
+		}
 		segments, listErr := idx.Store.ListSemanticSegments(ctx, workspaceID, doc.ID)
 		if listErr != nil {
 			return statement, listErr
 		}
 		for _, segment := range segments {
-			expected[segment.ID] = struct{}{}
+			subject := semanticCanonicalSubject(entries, segment.SubjectRef)
+			if _, ok := activeSubjects[subject]; ok {
+				expected[segment.ID] = subject
+			}
 		}
 	}
 	annotations, err := idx.Store.ListAnnotations(ctx, workspaceID, "", false)
@@ -82,17 +119,45 @@ func (idx *Indexer) SemanticCoverage(ctx context.Context, workspaceID string) (S
 	}
 	for _, annotation := range annotations {
 		if annotation.Kind == sqlite.AnnotationNote {
-			expected[annotation.ID] = struct{}{}
+			if _, ok := activeSubjects[semanticCanonicalSubject(entries, annotation.SubjectRef)]; !ok {
+				continue
+			}
+			expected[annotation.ID] = semanticCanonicalSubject(entries, annotation.SubjectRef)
 		}
 	}
+	artifacts, err := idx.Store.ListAdmittedArtifacts(ctx, workspaceID, "")
+	if err != nil {
+		return statement, err
+	}
+	for _, artifact := range artifacts {
+		if artifact.Stage != "EXTRACT" || strings.TrimSpace(artifact.Body) == "" || !utf8.ValidString(artifact.Body) {
+			continue
+		}
+		if _, ok := semanticEntryForSubject(ctx, idx.Store, entries, semanticCanonicalSubject(entries, artifact.SubjectRef), artifact.SnapshotRef, generation); !ok {
+			continue
+		}
+		expected[artifact.ID] = semanticCanonicalSubject(entries, artifact.SubjectRef)
+	}
 	statement.Expected = len(expected)
-	probe, ok := idx.SemanticZvec.(semanticCoverageProbe)
-	if !ok {
+	spec := ZvecGenerationSpec{Path: generation.DBPath, LibraryPath: idx.SemanticLibraryPath, LibraryDigest: idx.SemanticLibraryDigest, ProfileDigest: idx.SemanticManifest.CanonicalDigest(), Manifest: idx.SemanticManifest}
+	var pairs []ZvecCoverageIdentity
+	pairBound := true
+	switch probe := idx.SemanticZvec.(type) {
+	case semanticCoveragePairsProbe:
+		pairs, err = probe.CoveragePairs(ctx, spec)
+	case semanticCoveragePairMethodProbe:
+		pairs, err = probe.Coverage(ctx, spec)
+	case semanticCoverageProbe:
+		var ids []string
+		ids, err = probe.Coverage(ctx, spec)
+		pairBound = false
+		for _, id := range ids {
+			pairs = append(pairs, ZvecCoverageIdentity{SegmentID: id})
+		}
+	default:
 		statement.Notes = "semantic backend does not provide segment coverage evidence"
 		return statement, nil
 	}
-	spec := ZvecGenerationSpec{Path: generation.DBPath, LibraryPath: idx.SemanticLibraryPath, LibraryDigest: idx.SemanticLibraryDigest, ProfileDigest: idx.SemanticManifest.CanonicalDigest(), Manifest: idx.SemanticManifest}
-	indexed, err := probe.Coverage(ctx, spec)
 	if err != nil {
 		statement.Notes = "semantic coverage probe unavailable"
 		return statement, nil
@@ -100,12 +165,19 @@ func (idx *Indexer) SemanticCoverage(ctx context.Context, workspaceID string) (S
 	seen := map[string]struct{}{}
 	unknown := false
 	duplicate := false
-	for _, id := range indexed {
-		if _, ok := expected[id]; ok {
+	identityMismatch := false
+	for _, pair := range pairs {
+		id := strings.TrimSpace(pair.SegmentID)
+		subject := strings.TrimSpace(pair.SubjectID)
+		wantSubject, known := expected[id]
+		if known {
 			if _, exists := seen[id]; exists {
 				duplicate = true
 			}
 			seen[id] = struct{}{}
+			if pairBound && subject != wantSubject {
+				identityMismatch = true
+			}
 		} else {
 			unknown = true
 		}
@@ -118,8 +190,12 @@ func (idx *Indexer) SemanticCoverage(ctx context.Context, workspaceID string) (S
 		}
 	}
 	sort.Strings(statement.Missing)
-	statement.Complete = len(statement.Missing) == 0 && statement.Indexed == statement.Expected && !unknown && !duplicate
+	statement.Complete = pairBound && len(statement.Missing) == 0 && statement.Indexed == statement.Expected && !unknown && !duplicate && !identityMismatch
 	switch {
+	case !pairBound:
+		statement.Notes = "semantic backend coverage is ID-only; subject/segment identity evidence is unavailable"
+	case identityMismatch:
+		statement.Notes = "semantic generation contains subject/segment identity mismatch"
 	case unknown:
 		statement.Notes = "semantic generation contains unknown segment identities"
 	case duplicate:
@@ -150,7 +226,32 @@ func (idx *Indexer) Coverage(ctx context.Context, workspaceID string) (CoverageS
 		}
 		return statement, err
 	}
-	if _, err := os.Stat(generation.DBPath); err != nil {
+	return idx.CoverageGeneration(ctx, workspaceID, generation)
+}
+
+// CoverageGeneration measures the exact lexical generation supplied by the
+// caller. It intentionally does not consult the catalog's latest pointer, so
+// a rebuild response cannot pair one generation ID with another generation's
+// coverage when a concurrent rebuild publishes a newer file.
+func (idx *Indexer) CoverageGeneration(ctx context.Context, workspaceID string, generation sqlite.IndexGeneration) (CoverageStatement, error) {
+	var statement CoverageStatement
+	if idx == nil || idx.Engine == nil {
+		return LexicalCoverage(false, nil), nil
+	}
+	if strings.TrimSpace(workspaceID) == "" || strings.TrimSpace(generation.WorkspaceID) == "" ||
+		generation.WorkspaceID != workspaceID ||
+		strings.TrimSpace(generation.Dimension) != DimensionLexical ||
+		strings.TrimSpace(generation.DBPath) == "" {
+		return LexicalCoverage(false, nil), nil
+	}
+	info, err := os.Stat(generation.DBPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return LexicalCoverage(false, nil), nil
+		}
+		return CoverageStatement{}, err
+	}
+	if !info.Mode().IsRegular() {
 		return LexicalCoverage(false, nil), nil
 	}
 	perField, err := measureFieldCoverage(ctx, generation.DBPath)

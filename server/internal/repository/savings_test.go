@@ -481,6 +481,35 @@ func TestMeasureSavingsRejectsUnaccountedRepositoryFile(t *testing.T) {
 	}
 }
 
+// TestMeasureSavingsFailsClosedOnCorruptRecoveryRecord ensures recovery
+// records cannot be counted as ordinary overhead after their bytes change.
+func TestMeasureSavingsFailsClosedOnCorruptRecoveryRecord(t *testing.T) {
+	ctx := context.Background()
+	repo, err := OpenDir(filepath.Join(t.TempDir(), "repo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	placement, err := repo.Place(ctx, bytes.NewBufferString("tracked object"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := repo.PlaceRecord(ctx, RecordPublicationCommit, bytes.NewBufferString("published recovery record"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := parseContentID(record.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(repo.Root(), recoveryDirName, recordRoleDir(record.Role), AlgorithmSHA256, digest[:hexPrefixLen], digest)
+	if err := os.WriteFile(path, []byte("corrupted recovery record"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if report, err := MeasureSavings(ctx, repo, []Receipt{placement}); err == nil {
+		t.Fatalf("measurement succeeded on a corrupt recovery record: %+v", report)
+	}
+}
+
 // TestMeasureSavingsFailsClosedOnAbsentRepository asserts that measuring a
 // non-existent repository path returns an explicit error rather than zeros.
 func TestMeasureSavingsFailsClosedOnAbsentRepository(t *testing.T) {

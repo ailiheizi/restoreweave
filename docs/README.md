@@ -2,7 +2,7 @@
 
 All project documentation is written in English.
 
-> **Documentation status — `v0.1.0-prealpha.1` core preview.** The current tree runs and tests the local inspect/protect/search/verify/restore workflow, including a provisioned BGE/ONNX + zvec profile and optional browser client. It does not yet provide a supported installer, bundled model download, qualified production repository, or release-qualified workflow/profile.
+> **Documentation status — `v0.1.0-prealpha.1` core preview.** The current tree runs and tests the local inspect/protect/search/verify/restore workflow, including an explicit development-time installer for the fixed BGE/ONNX + zvec bundle and an optional browser client. The installer downloads pinned artifacts, verifies their digests, publishes the bundle atomically, and exposes the required restart and index-rebuild steps. RestoreWeave does not yet provide release-packaged model distribution, a qualified production repository, or a release-qualified workflow/profile.
 
 RestoreWeave is a self-hosted, content-first managed data layer. Its first product profile combines conservative exact-storage minimization, a recoverable original-path projection, local multi-dimensional discovery, durable user annotations, saved views, reproducible exports, and safely replaceable processing, repository, and search implementations. `RW-MVP-1` is a read-only managed archive and discovery system; later NAS and enterprise profiles must qualify their additional writable and distributed semantics separately. RestoreWeave is not defined by a particular operating system, NAS vendor, repository engine, search engine, or AI runtime.
 

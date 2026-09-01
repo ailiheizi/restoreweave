@@ -2,7 +2,12 @@ package search
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/ailiheizi/restoreweave/server/internal/store/sqlite"
+	"github.com/ailiheizi/restoreweave/server/testutil"
 )
 
 // TestLexicalCoverageReportsAbsenceHonestly proves that a coverage statement
@@ -72,6 +77,63 @@ func TestIndexerCoverageOnBuiltGeneration(t *testing.T) {
 	}
 	if statement.Fields[AxisDescriptions] || statement.Fields[AxisSize] || statement.Fields[AxisMtime] {
 		t.Fatalf("absent facets reported present: %+v", statement.Fields)
+	}
+}
+
+func TestIndexerCoverageGenerationUsesProvidedGeneration(t *testing.T) {
+	ctx := context.Background()
+	store := testutil.OpenStore(t, filepath.Join(t.TempDir(), "catalog.sqlite"))
+	seed := testutil.SeedNamespace(t, store)
+	engine := &Engine{Dir: t.TempDir()}
+	oldID := mustSearchID(t, sqlite.IDPrefixIndexGeneration)
+	oldPath, err := engine.Build(ctx, oldID, []Document{{
+		SubjectID: seed.FileEntryID, Path: "old.txt", Name: "old.txt", Suffix: "txt",
+		EntryType: "REGULAR_FILE", Descriptions: "description present only in old generation",
+	}})
+	if err != nil {
+		t.Fatalf("build old generation: %v", err)
+	}
+	newID := mustSearchID(t, sqlite.IDPrefixIndexGeneration)
+	newPath, err := engine.Build(ctx, newID, []Document{{
+		SubjectID: seed.FileEntryID, Path: "new.txt", Name: "new.txt", Suffix: "txt",
+		EntryType: "REGULAR_FILE",
+	}})
+	if err != nil {
+		t.Fatalf("build new generation: %v", err)
+	}
+	oldGeneration := sqlite.IndexGeneration{
+		ID: oldID, WorkspaceID: seed.WorkspaceID, SnapshotRef: "snapshot:old",
+		NamespaceRootID: seed.RootID, DBPath: oldPath, Dimension: DimensionLexical,
+		CreatedAt: time.Now().Add(-time.Hour),
+	}
+	newGeneration := sqlite.IndexGeneration{
+		ID: newID, WorkspaceID: seed.WorkspaceID, SnapshotRef: "snapshot:new",
+		NamespaceRootID: seed.RootID, DBPath: newPath, Dimension: DimensionLexical,
+		CreatedAt: time.Now(),
+	}
+	if err := store.InsertIndexGeneration(ctx, &oldGeneration); err != nil {
+		t.Fatalf("insert old generation: %v", err)
+	}
+	if err := store.InsertIndexGeneration(ctx, &newGeneration); err != nil {
+		t.Fatalf("insert new generation: %v", err)
+	}
+	indexer := &Indexer{Store: store, Engine: engine}
+	latest, err := indexer.Coverage(ctx, seed.WorkspaceID)
+	if err != nil {
+		t.Fatalf("latest coverage: %v", err)
+	}
+	if latest.Fields[AxisDescriptions] {
+		t.Fatalf("latest coverage read old generation: %+v", latest)
+	}
+	pinned, err := indexer.CoverageGeneration(ctx, seed.WorkspaceID, oldGeneration)
+	if err != nil {
+		t.Fatalf("pinned coverage: %v", err)
+	}
+	if !pinned.Fields[AxisDescriptions] || pinned.Complete {
+		t.Fatalf("pinned coverage did not measure supplied old generation: %+v", pinned)
+	}
+	if pinned.Fields[AxisPath] != latest.Fields[AxisPath] {
+		t.Fatalf("pinned/latest path coverage mismatch: pinned=%+v latest=%+v", pinned, latest)
 	}
 }
 

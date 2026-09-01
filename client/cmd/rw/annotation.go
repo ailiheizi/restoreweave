@@ -15,7 +15,7 @@ func newSearchCommand(env *clientEnv) *cobra.Command {
 	var filterValues []string
 	var language, suffix, entryType, contentID, duplicateGroup, protectionMode string
 	var sizeMin, sizeMax, mtimeAfter, mtimeBefore int64
-	commandNode := newExitCommand(env, "search <query>", "Query the bundled lexical index",
+	commandNode := newExitCommand(env, "search <query>", "Query the default lexical+structured+semantic broker",
 		func(cmd *cobra.Command, env *clientEnv, args []string) int {
 			if len(args) != 1 {
 				fmt.Fprintf(cmd.ErrOrStderr(), "usage: rw search <query> [--workspace <id>] [--filter key=value]\n")
@@ -76,7 +76,7 @@ func newSearchCommand(env *clientEnv) *cobra.Command {
 		})
 	commandNode.Flags().String("workspace", "", "catalog workspace stable id")
 	commandNode.Flags().String("generation", "", "index generation stable id")
-	commandNode.Flags().String("dimension", "", "declared index dimension (default lexical-metadata-fts)")
+	commandNode.Flags().String("dimension", "", "declared index dimension (omit for the default lexical+structured+semantic broker)")
 	commandNode.Flags().StringSlice("axis", nil, "restrict lexical construct axes (path,name,suffix,tags,notes,extracted)")
 	commandNode.Flags().StringSlice("fuse", nil, "host-owned fusion of two or more declared dimensions")
 	commandNode.Flags().StringArrayVar(&filterValues, "filter", nil, "typed filter as key=value; repeat for entry_type, content_id, duplicate_group, protection_mode, language, suffix, size_min, size_max, mtime_after, or mtime_before")

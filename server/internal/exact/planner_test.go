@@ -407,7 +407,7 @@ func TestResolvedMetadataOnlyEntryPublishesExplicitCoverageGap(t *testing.T) {
 	if err != nil || observation.ReadState != string(scanner.EntryFailed) || observation.ContentID != "" || observation.FileVersionID != "" {
 		t.Fatalf("metadata-only observation = %+v, err=%v", observation, err)
 	}
-	protection, err := store.GetProtectionRecordBySubject(ctx, result.WorkspaceID, node.ID)
+	protection, err := store.GetProtectionRecordBySubject(ctx, result.WorkspaceID, node.SubjectRef)
 	if err != nil {
 		t.Fatalf("get protection: %v", err)
 	}
@@ -418,7 +418,14 @@ func TestResolvedMetadataOnlyEntryPublishesExplicitCoverageGap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read manifest: %v", err)
 	}
-	if len(manifest.Entries) != 2 || manifest.Entries[1].Protection.Outcome != string(sqlite.ProtectionExplicitlyUnprotected) || manifest.Entries[1].ContentID != "" {
+	var metadataOnlyManifest *ManifestEntry
+	for index := range manifest.Entries {
+		if manifest.Entries[index].RelativePath == "unreadable.bin" {
+			metadataOnlyManifest = &manifest.Entries[index]
+			break
+		}
+	}
+	if metadataOnlyManifest == nil || metadataOnlyManifest.Protection.Outcome != string(sqlite.ProtectionExplicitlyUnprotected) || metadataOnlyManifest.ContentID != "" {
 		t.Fatalf("metadata-only manifest = %+v", manifest.Entries)
 	}
 	if _, err := service.VerifyMode(ctx, result.SnapshotRef, VerifyAuthenticatedMetadata, ""); err == nil {

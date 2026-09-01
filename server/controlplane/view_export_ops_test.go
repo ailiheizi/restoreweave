@@ -29,6 +29,8 @@ func handleViewExport(d *Dispatcher, env command.Envelope) command.Result {
 		return d.handleViewEvaluate(context.Background(), env, started)
 	case command.OpViewList:
 		return d.handleViewList(context.Background(), env, started)
+	case command.OpExportList:
+		return d.handleExportList(context.Background(), env, started)
 	case command.OpExportPlan:
 		return d.handleExportPlan(context.Background(), env, started)
 	case command.OpExportApply:
@@ -40,12 +42,50 @@ func handleViewExport(d *Dispatcher, env command.Envelope) command.Result {
 	}
 }
 
+func TestExportListReturnsFrozenManifestData(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "payload.bin"), []byte("export list bytes"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	h := newViewExportHarness(t, root)
+
+	planned := h.dispatcher.Handle(context.Background(), mustEnvelope(t, command.OpExportPlan, map[string]any{
+		"subjects": []string{h.subjectRef},
+	}))
+	if planned.Status != command.StatusSucceeded {
+		t.Fatalf("export.plan = %q: %+v", planned.Status, planned.Reasons)
+	}
+	var manifest command.ExportManifestData
+	if err := json.Unmarshal(planned.Data, &manifest); err != nil {
+		t.Fatalf("decode export.plan: %v", err)
+	}
+
+	listed := h.dispatcher.Handle(context.Background(), mustEnvelope(t, command.OpExportList, nil))
+	if listed.Status != command.StatusSucceeded {
+		t.Fatalf("export.list = %q: %+v", listed.Status, listed.Reasons)
+	}
+	var manifests []command.ExportManifestData
+	if err := json.Unmarshal(listed.Data, &manifests); err != nil {
+		t.Fatalf("decode export.list: %v", err)
+	}
+	if len(manifests) != 1 {
+		t.Fatalf("export.list manifests = %+v", manifests)
+	}
+	got := manifests[0]
+	if got.ManifestID != manifest.ManifestID || got.ManifestDigest != manifest.ManifestDigest ||
+		got.SubjectCount != manifest.SubjectCount || got.Representation != manifest.Representation ||
+		len(got.Items) != len(manifest.Items) || got.Items[0] != manifest.Items[0] {
+		t.Fatalf("export.list manifest = %+v, planned = %+v", got, manifest)
+	}
+}
+
 // viewExportHarness wires a dispatcher with the exact lane and a published
 // ingest fixture so view.evaluate and export.* can operate on real subjects.
 type viewExportHarness struct {
 	dispatcher  *Dispatcher
 	ingest      command.PlanIngestData
 	subjectRef  string
+	entryID     string
 	contentID   string
 	subjectName string
 }
@@ -80,7 +120,7 @@ func newViewExportHarness(t *testing.T, root string) viewExportHarness {
 	entry := listData.Entries[0]
 	return viewExportHarness{
 		dispatcher: dispatcher, ingest: ingest,
-		subjectRef: entry.ID, contentID: entry.ContentID,
+		subjectRef: entry.SubjectRef, entryID: entry.ID, contentID: entry.ContentID,
 		subjectName: entry.DisplayName,
 	}
 }
@@ -220,8 +260,8 @@ func TestExportPlanApplyVerifyEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode manifest items: %v", err)
 	}
-	if len(frozen) != 1 || frozen[0].SubjectRef != h.subjectRef || frozen[0].OutputName != h.subjectName {
-		t.Fatalf("manifest items = %+v", frozen)
+	if len(frozen) != 1 || frozen[0].SubjectRef != h.entryID || frozen[0].OutputName != h.subjectName {
+		t.Fatalf("manifest items = %+v, want frozen entry_id %s", frozen, h.entryID)
 	}
 
 	destination := filepath.Join(t.TempDir(), "out")
@@ -260,6 +300,56 @@ func TestExportPlanApplyVerifyEndToEnd(t *testing.T) {
 	}
 	if !verifyData.Verified || verifyData.ManifestID != manifest.ManifestID || verifyData.Bytes <= 0 {
 		t.Fatalf("verify data = %+v", verifyData)
+	}
+}
+
+func TestFrozenExportManifestSurvivesRescanAndCurrentSubjectChange(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := filepath.Join(root, "payload.bin")
+	original := []byte("original export bytes")
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	h := newViewExportHarness(t, root)
+
+	planned := handleViewExport(h.dispatcher, mustEnvelope(t, command.OpExportPlan, map[string]any{
+		"subjects": []string{h.subjectRef}, "output_name": h.subjectName,
+	}))
+	if planned.Status != command.StatusSucceeded {
+		t.Fatalf("export.plan = %q: %+v", planned.Status, planned.Reasons)
+	}
+	var manifest command.ExportManifestData
+	if err := json.Unmarshal(planned.Data, &manifest); err != nil {
+		t.Fatalf("decode export.plan: %v", err)
+	}
+	frozen, err := exportItemsFromStrings(manifest.Items)
+	if err != nil || len(frozen) != 1 || frozen[0].SubjectRef != h.entryID || frozen[0].ContentID == "" || !frozen[0].Exact {
+		t.Fatalf("frozen manifest = %+v, err=%v", frozen, err)
+	}
+
+	changed := []byte("new bytes at the same path")
+	if err := os.WriteFile(path, changed, 0o600); err != nil {
+		t.Fatalf("rewrite fixture: %v", err)
+	}
+	if got := mustAppliedIngest(t, ctx, h.dispatcher, map[string]any{"root": root}); got.SnapshotRef == h.ingest.SnapshotRef {
+		t.Fatal("rescan did not publish a new snapshot")
+	}
+
+	destination := filepath.Join(t.TempDir(), "out")
+	applied := handleViewExport(h.dispatcher, mustEnvelope(t, command.OpExportApply, map[string]any{
+		"manifest_id": manifest.ManifestID, "manifest_digest": manifest.ManifestDigest,
+		"destination": destination,
+	}))
+	if applied.Status != command.StatusSucceeded {
+		t.Fatalf("apply frozen manifest after rescan = %q: %+v", applied.Status, applied.Reasons)
+	}
+	got, err := os.ReadFile(filepath.Join(destination, h.subjectName))
+	if err != nil {
+		t.Fatalf("read frozen export: %v", err)
+	}
+	if string(got) != string(original) {
+		t.Fatalf("frozen export bytes = %q, want %q", got, original)
 	}
 }
 

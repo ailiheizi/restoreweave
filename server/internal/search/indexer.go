@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unicode/utf8"
 
 	"github.com/ailiheizi/restoreweave/server/internal/store/sqlite"
 )
@@ -180,7 +182,12 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 		nodes []sqlite.NamespaceNode
 	)
 	var entries []sqlite.NamespaceEntry
+	var scopeRoots []sqlite.NamespaceRoot
 	if useLatestSources {
+		scopeRoots, err = idx.Store.ListLatestNamespaceRoots(ctx, workspaceID)
+		if err != nil {
+			return generation, err
+		}
 		entries, err = idx.Store.ListLatestNamespaceEntries(ctx, workspaceID)
 		if err != nil {
 			return generation, err
@@ -190,29 +197,72 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 			nodes = append(nodes, sqlite.NamespaceNode{Entry: entry})
 		}
 	} else {
+		root, rootErr := idx.Store.GetNamespaceRoot(ctx, workspaceID, namespaceRootID)
+		if rootErr != nil {
+			return generation, rootErr
+		}
+		scopeRoots = []sqlite.NamespaceRoot{root}
 		nodes, err = idx.Store.ListNamespaceSubtree(ctx, workspaceID, namespaceRootID, "")
 		if err != nil {
 			return generation, err
 		}
 	}
 	currentSubjects := make(map[string]struct{}, len(nodes))
-	for _, node := range nodes {
-		currentSubjects[node.Entry.ID] = struct{}{}
+	byID := make(map[string]sqlite.NamespaceEntry, len(nodes))
+	// rootsByID is the immutable namespace scope captured by this generation.
+	// Do not resolve provenance through the current latest projection: a pinned
+	// generation must remain readable after a later publication replaces one of
+	// these roots.
+	rootsByID := make(map[string]sqlite.NamespaceRoot, len(scopeRoots))
+	rootIDs := make([]string, 0, len(scopeRoots))
+	for _, root := range scopeRoots {
+		if root.WorkspaceID != workspaceID || strings.TrimSpace(root.ID) == "" || strings.TrimSpace(root.SnapshotRef) == "" {
+			return generation, fmt.Errorf("namespace root %q is not valid for workspace %q", root.ID, workspaceID)
+		}
+		if _, duplicate := rootsByID[root.ID]; duplicate {
+			return generation, fmt.Errorf("duplicate namespace root %q in generation scope", root.ID)
+		}
+		rootsByID[root.ID] = root
+		rootIDs = append(rootIDs, root.ID)
+	}
+	sort.Strings(rootIDs)
+	if len(rootIDs) == 0 {
+		return generation, errors.New("namespace root scope is empty")
+	}
+	if _, ok := rootsByID[namespaceRootID]; !ok {
+		return generation, fmt.Errorf("primary namespace root %q is outside generation scope", namespaceRootID)
+	}
+	for index := range nodes {
+		entry := nodes[index].Entry
+		if strings.TrimSpace(entry.SubjectRef) == "" {
+			entry.SubjectRef = entry.ID
+		}
+		byID[entry.ID] = entry
+		currentSubjects[entry.SubjectRef] = struct{}{}
+		if _, ok := rootsByID[entry.RootID]; !ok {
+			return generation, fmt.Errorf("namespace entry %q is outside generation root scope", entry.ID)
+		}
+		nodes[index].Entry = entry
+	}
+	canonicalSubject := func(ref string) string {
+		if entry, ok := byID[ref]; ok {
+			return entry.SubjectRef
+		}
+		return ref
 	}
 	annotations, err := idx.Store.ListAnnotations(ctx, workspaceID, "", false)
 	if err != nil {
 		return generation, err
 	}
-	artifactSnapshotRef := snapshotRef
-	if useLatestSources {
-		// Derived facts are durable per subject. Loading all records here lets
-		// the current-subject filter below retain facts from older sources while
-		// excluding superseded roots.
-		artifactSnapshotRef = ""
-	}
-	artifacts, err := idx.Store.ListAdmittedArtifacts(ctx, workspaceID, artifactSnapshotRef)
+	// Derived facts are durable per subject and are admitted below only when
+	// their own snapshot resolves into this exact root scope. Filtering by the
+	// generation trigger snapshot would discard valid cross-source artifacts.
+	artifacts, err := idx.Store.ListAdmittedArtifacts(ctx, workspaceID, "")
 	if err != nil {
 		return generation, err
+	}
+	for index := range artifacts {
+		artifacts[index].SubjectRef = canonicalSubject(artifacts[index].SubjectRef)
 	}
 	metadataFacts, err := idx.Store.ListMetadataFacts(ctx, workspaceID, "")
 	if err != nil {
@@ -242,6 +292,9 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 	if err != nil {
 		return generation, err
 	}
+	for index := range annotations {
+		annotations[index].SubjectRef = canonicalSubject(annotations[index].SubjectRef)
+	}
 	tagsBySubject := map[string][]string{}
 	notesBySubject := map[string][]string{}
 	extractedBySubject := map[string][]string{}
@@ -250,48 +303,77 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 	processingBySubject := map[string][]string{}
 	representationsByContent := map[string][]string{}
 	descriptionsBySubject := map[string][]string{}
+	// segmentsBySubject is the lexical provenance projection and intentionally
+	// retains every durable description revision. Semantic segments are a
+	// narrower active-leaf projection built in parallel below.
 	segmentsBySubject := map[string][]SegmentRef{}
+	semanticSegmentsBySubject := map[string][]SegmentRef{}
 	locatorsBySubject := map[string][]string{}
 	recoveryBySubject := map[string][]string{}
 	duplicateGroupBySubject := map[string]string{}
 	for _, record := range annotations {
-		if _, ok := currentSubjects[record.SubjectRef]; !ok {
+		subjectRef := canonicalSubject(record.SubjectRef)
+		if _, ok := currentSubjects[subjectRef]; !ok {
 			continue
 		}
 		switch record.Kind {
 		case sqlite.AnnotationTag:
-			tagsBySubject[record.SubjectRef] = append(tagsBySubject[record.SubjectRef], record.Body)
+			tagsBySubject[subjectRef] = append(tagsBySubject[subjectRef], record.Body)
 		case sqlite.AnnotationNote:
-			notesBySubject[record.SubjectRef] = append(notesBySubject[record.SubjectRef], record.Body)
-			segmentsBySubject[record.SubjectRef] = append(segmentsBySubject[record.SubjectRef], SegmentRef{
+			notesBySubject[subjectRef] = append(notesBySubject[subjectRef], record.Body)
+			segment := SegmentRef{
 				SourceType: "ANNOTATION", SourceID: record.ID,
 				SegmentID: record.ID, MatchedText: record.Body,
 				Kind: string(sqlite.AnnotationNote), Producer: "USER", Accepted: true, Language: "und",
-			})
+			}
+			segmentsBySubject[subjectRef] = append(segmentsBySubject[subjectRef], segment)
+			semanticSegmentsBySubject[subjectRef] = append(semanticSegmentsBySubject[subjectRef], segment)
 		}
 	}
 	for _, artifact := range artifacts {
-		if artifact.Stage == "EXTRACT" && artifact.Body != "" {
-			extractedBySubject[artifact.SubjectRef] = append(extractedBySubject[artifact.SubjectRef], artifact.Body)
+		subjectRef := canonicalSubject(artifact.SubjectRef)
+		if _, ok := currentSubjects[subjectRef]; !ok {
+			continue
+		}
+		if _, ok := semanticArtifactEntryInRoots(artifact, subjectRef, byID, rootsByID); !ok {
+			continue
+		}
+		if artifact.Stage == "EXTRACT" && strings.TrimSpace(artifact.Body) != "" {
+			extractedBySubject[subjectRef] = append(extractedBySubject[subjectRef], artifact.Body)
+			if artifact.State == sqlite.ArtifactAdmitted && utf8.ValidString(artifact.Body) {
+				segment := SegmentRef{
+					SourceType: "ARTIFACT", SourceID: artifact.ID,
+					SegmentID: artifact.ID, MatchedText: artifact.Body,
+					Kind: artifact.Stage, Producer: artifact.ProducerDigest,
+					Accepted: true, Language: "und",
+				}
+				segmentsBySubject[subjectRef] = append(segmentsBySubject[subjectRef], segment)
+				semanticSegmentsBySubject[subjectRef] = append(semanticSegmentsBySubject[subjectRef], segment)
+			}
 		}
 	}
 	for _, fact := range metadataFacts {
-		metadataBySubject[fact.SubjectRef] = append(metadataBySubject[fact.SubjectRef],
+		subjectRef := canonicalSubject(fact.SubjectRef)
+		metadataBySubject[subjectRef] = append(metadataBySubject[subjectRef],
 			fact.Namespace, fact.Key, string(fact.Value), fact.ValueType)
 	}
 	for _, protection := range protections {
-		protectionBySubject[protection.SubjectRef] = append(protectionBySubject[protection.SubjectRef],
+		subjectRef := canonicalSubject(protection.SubjectRef)
+		protectionBySubject[subjectRef] = append(protectionBySubject[subjectRef],
 			string(protection.Mode), string(protection.Outcome), protection.ExpectedContentID)
 	}
 	for _, attempt := range attempts {
-		processingBySubject[attempt.SubjectRef] = append(processingBySubject[attempt.SubjectRef],
+		subjectRef := canonicalSubject(attempt.SubjectRef)
+		processingBySubject[subjectRef] = append(processingBySubject[subjectRef],
 			attempt.Stage, attempt.CapabilityID, attempt.Status, attempt.ReasonCode)
 	}
+	activeDescriptions := activeDescriptionLeaves(descriptions)
 	for _, description := range descriptions {
-		if _, ok := currentSubjects[description.SubjectRef]; !ok {
+		subjectRef := canonicalSubject(description.SubjectRef)
+		if _, ok := currentSubjects[subjectRef]; !ok {
 			continue
 		}
-		descriptionsBySubject[description.SubjectRef] = append(descriptionsBySubject[description.SubjectRef],
+		descriptionsBySubject[subjectRef] = append(descriptionsBySubject[subjectRef],
 			description.Title, description.Language, description.Body, string(description.Kind), description.SourceRef)
 		if description.ID == "" {
 			continue
@@ -301,7 +383,7 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 			return generation, listErr
 		}
 		for _, segment := range segments {
-			segmentsBySubject[description.SubjectRef] = append(segmentsBySubject[description.SubjectRef], SegmentRef{
+			ref := SegmentRef{
 				DescriptionDocumentID: description.ID,
 				SourceType:            "DESCRIPTION",
 				SourceID:              description.ID,
@@ -312,29 +394,49 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 				Producer:              description.ProducerProfile,
 				Accepted:              description.Accepted,
 				Language:              description.Language,
-			})
+			}
+			segmentsBySubject[subjectRef] = append(segmentsBySubject[subjectRef], ref)
+			// Durable segments from rejected/superseded revisions remain lexical
+			// provenance. Only accepted leaves enter a new semantic generation.
+			if _, ok := activeDescriptions[description.ID]; ok {
+				semanticSegmentsBySubject[subjectRef] = append(semanticSegmentsBySubject[subjectRef], ref)
+			}
 		}
 	}
 	for _, binding := range bindings {
-		locatorsBySubject[binding.SubjectRef] = append(locatorsBySubject[binding.SubjectRef],
+		subjectRef := canonicalSubject(binding.SubjectRef)
+		locatorsBySubject[subjectRef] = append(locatorsBySubject[subjectRef],
 			binding.ProviderKind, binding.StableIdentity)
 		locators, listErr := idx.Store.ListExternalLocators(ctx, workspaceID, binding.ID)
 		if listErr != nil {
 			return generation, listErr
 		}
 		for _, locator := range locators {
-			locatorsBySubject[binding.SubjectRef] = append(locatorsBySubject[binding.SubjectRef],
+			locatorsBySubject[subjectRef] = append(locatorsBySubject[subjectRef],
 				locator.Kind, locator.DisplayLocator, locator.ExpectedContentID,
 				locator.Availability, locator.ValidationStatus)
 		}
 	}
 	for _, reference := range recoveryRefs {
-		recoveryBySubject[reference.SubjectRef] = append(recoveryBySubject[reference.SubjectRef],
+		subjectRef := canonicalSubject(reference.SubjectRef)
+		recoveryBySubject[subjectRef] = append(recoveryBySubject[subjectRef],
 			string(reference.Kind), string(reference.Claim), reference.Status)
 	}
-	byID := make(map[string]sqlite.NamespaceEntry, len(nodes))
-	for _, node := range nodes {
-		byID[node.Entry.ID] = node.Entry
+	// Filenames are durable namespace facts, not ephemeral index labels. Feed
+	// the display filename as a segment while retaining the snapshot-local
+	// EntryID as both source and segment identity. The stable SubjectRef is
+	// carried separately in the semantic vector row.
+	for _, entry := range byID {
+		if strings.TrimSpace(entry.DisplayName) == "" {
+			continue
+		}
+		segment := SegmentRef{
+			SourceType: "FILENAME", SourceID: entry.ID,
+			SegmentID: entry.ID, MatchedText: entry.DisplayName,
+			Kind: "FILENAME", Producer: "CATALOG", Accepted: true, Language: "und",
+		}
+		segmentsBySubject[entry.SubjectRef] = append(segmentsBySubject[entry.SubjectRef], segment)
+		semanticSegmentsBySubject[entry.SubjectRef] = append(semanticSegmentsBySubject[entry.SubjectRef], segment)
 	}
 	contentCounts := make(map[string]int)
 	for _, node := range nodes {
@@ -344,7 +446,7 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 	}
 	for _, node := range nodes {
 		if node.Entry.ContentID != "" && contentCounts[node.Entry.ContentID] > 1 {
-			duplicateGroupBySubject[node.Entry.ID] = node.Entry.ContentID
+			duplicateGroupBySubject[node.Entry.SubjectRef] = node.Entry.ContentID
 		}
 	}
 	for contentID := range contentCounts {
@@ -361,12 +463,12 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 	docs := make([]Document, 0, len(nodes))
 	for _, node := range nodes {
 		entry := node.Entry
-		metadata := append([]string{string(entry.Metadata)}, metadataBySubject[entry.ID]...)
+		metadata := append([]string{string(entry.Metadata)}, metadataBySubject[entry.SubjectRef]...)
 		duplicate := ""
 		if count := contentCounts[entry.ContentID]; entry.ContentID != "" && count > 1 {
 			duplicate = fmt.Sprintf("duplicate duplicates same-content count %d %s", count, entry.ContentID)
 		}
-		segments := segmentsBySubject[entry.ID]
+		segments := segmentsBySubject[entry.SubjectRef]
 		if len(segments) == 0 {
 			segments = nil
 		}
@@ -386,7 +488,7 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 			}
 		}
 		doc := Document{
-			SubjectID:       entry.ID,
+			SubjectID:       entry.SubjectRef,
 			Path:            displayPath(byID, entry),
 			Name:            entry.DisplayName,
 			Suffix:          suffixOf(entry.DisplayName),
@@ -394,17 +496,17 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 			ContentID:       entry.ContentID,
 			Metadata:        strings.Join(metadata, " "),
 			Duplicates:      duplicate,
-			DuplicateGroup:  duplicateGroupBySubject[entry.ID],
-			Protection:      strings.Join(append(append([]string{}, protectionBySubject[entry.ID]...), recoveryBySubject[entry.ID]...), " "),
-			Locators:        strings.Join(locatorsBySubject[entry.ID], " "),
-			Tags:            strings.Join(tagsBySubject[entry.ID], " "),
-			Notes:           strings.Join(notesBySubject[entry.ID], " "),
-			Descriptions:    strings.Join(descriptionsBySubject[entry.ID], " "),
-			Extracted:       strings.Join(extractedBySubject[entry.ID], " "),
+			DuplicateGroup:  duplicateGroupBySubject[entry.SubjectRef],
+			Protection:      strings.Join(append(append([]string{}, protectionBySubject[entry.SubjectRef]...), recoveryBySubject[entry.SubjectRef]...), " "),
+			Locators:        strings.Join(locatorsBySubject[entry.SubjectRef], " "),
+			Tags:            strings.Join(tagsBySubject[entry.SubjectRef], " "),
+			Notes:           strings.Join(notesBySubject[entry.SubjectRef], " "),
+			Descriptions:    strings.Join(descriptionsBySubject[entry.SubjectRef], " "),
+			Extracted:       strings.Join(extractedBySubject[entry.SubjectRef], " "),
 			Detection:       detection,
-			Processing:      strings.Join(processingBySubject[entry.ID], " "),
+			Processing:      strings.Join(processingBySubject[entry.SubjectRef], " "),
 			Representations: strings.Join(representationsByContent[entry.ContentID], " "),
-			Language:        subjectLanguage(descriptionsBySubject[entry.ID]),
+			Language:        subjectLanguage(descriptionsBySubject[entry.SubjectRef]),
 			Segments:        segmentsJSON,
 		}
 		if entry.LogicalSize != nil {
@@ -435,7 +537,7 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 		ConfigDigest:          idx.ConfigDigest,
 		ProviderProfileDigest: idx.profileDigest(DimensionLexical),
 	}
-	if err := idx.Store.InsertIndexGeneration(ctx, &generation); err != nil {
+	if err := idx.Store.InsertIndexGenerationWithRoots(ctx, &generation, rootIDs); err != nil {
 		_ = idx.Engine.RemoveFile(dbPath)
 		return sqlite.IndexGeneration{}, err
 	}
@@ -445,7 +547,7 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 		_, _ = idx.rebuildTokens(ctx, workspaceID, snapshotRef, namespaceRootID, byID, artifacts, DimensionMultimodal, "ENRICH", "embed.clip.fixture.v1")
 	}
 	if idx.SemanticProvider != nil && idx.SemanticZvec != nil && idx.SemanticManifest != (EmbeddingGenerationManifest{}) {
-		if _, semanticErr := idx.rebuildSemantic(ctx, workspaceID, snapshotRef, namespaceRootID, segmentsBySubject); semanticErr != nil {
+		if _, semanticErr := idx.rebuildSemantic(ctx, workspaceID, snapshotRef, namespaceRootID, rootIDs, semanticSegmentsBySubject); semanticErr != nil {
 			// Semantic indexing is disposable derived work. Preserve the lexical
 			// generation and let capability/status report the unavailable branch.
 			idx.semanticUnavailable.Store(true)
@@ -493,6 +595,13 @@ func (idx *Indexer) WarmSemanticGeneration(ctx context.Context, workspaceID stri
 	if !generationBindingMatches(idx, generation, DimensionSemantic) {
 		return fmt.Errorf("%w: semantic generation binding mismatch", ErrUnavailable)
 	}
+	if _, err := semanticNamespaceEntries(ctx, idx.Store, generation); err != nil {
+		return fmt.Errorf("%w: semantic generation root mapping: %v", ErrUnavailable, err)
+	}
+	membershipVerifier, ok := idx.SemanticZvec.(ZvecGenerationMembershipVerifier)
+	if !ok {
+		return fmt.Errorf("%w: semantic backend does not provide generation membership verification", ErrUnavailable)
+	}
 	spec := ZvecGenerationSpec{
 		Path: generation.DBPath, LibraryPath: idx.SemanticLibraryPath,
 		LibraryDigest: idx.SemanticLibraryDigest,
@@ -505,10 +614,42 @@ func (idx *Indexer) WarmSemanticGeneration(ctx context.Context, workspaceID stri
 	if err := opened.Close(); err != nil {
 		return fmt.Errorf("%w: close semantic generation: %v", ErrUnavailable, err)
 	}
+	var pairs []ZvecCoverageIdentity
+	switch probe := idx.SemanticZvec.(type) {
+	case interface {
+		CoveragePairs(context.Context, ZvecGenerationSpec) ([]ZvecCoverageIdentity, error)
+	}:
+		pairs, err = probe.CoveragePairs(ctx, spec)
+	case semanticCoveragePairMethodProbe:
+		pairs, err = probe.Coverage(ctx, spec)
+	default:
+		return fmt.Errorf("%w: semantic backend does not provide generation identity coverage", ErrUnavailable)
+	}
+	if err != nil || len(pairs) == 0 {
+		if err == nil {
+			err = errors.New("generation identity coverage is empty")
+		}
+		return fmt.Errorf("%w: semantic generation identity coverage: %v", ErrUnavailable, err)
+	}
+	if err := membershipVerifier.VerifyMembership(ctx, spec, pairs); err != nil {
+		return fmt.Errorf("%w: semantic generation membership: %v", ErrUnavailable, err)
+	}
 	idx.semanticUnavailable.Store(false)
 	idx.semanticFailure.Store("")
 	idx.semanticIndexReady.Store(true)
 	return nil
+}
+
+func namespaceEntryByRef(byID map[string]sqlite.NamespaceEntry, ref string) (sqlite.NamespaceEntry, bool) {
+	if entry, ok := byID[ref]; ok {
+		return entry, true
+	}
+	for _, entry := range byID {
+		if entry.SubjectRef == ref {
+			return entry, true
+		}
+	}
+	return sqlite.NamespaceEntry{}, false
 }
 
 func (idx *Indexer) rebuildGraph(ctx context.Context, workspaceID, snapshotRef, namespaceRootID string, byID map[string]sqlite.NamespaceEntry, annotations []sqlite.Annotation, artifacts []sqlite.ProcessorArtifact) (sqlite.IndexGeneration, error) {
@@ -520,10 +661,14 @@ func (idx *Indexer) rebuildGraph(ctx context.Context, workspaceID, snapshotRef, 
 	for _, entry := range byID {
 		path := displayPath(byID, entry)
 		if entry.ParentID != "" {
+			parentRef := entry.ParentID
+			if parent, ok := byID[entry.ParentID]; ok {
+				parentRef = parent.SubjectRef
+			}
 			edges = append(edges, GraphEdge{
-				SubjectID: entry.ID,
+				SubjectID: entry.SubjectRef,
 				Relation:  RelContains,
-				Value:     entry.ParentID,
+				Value:     parentRef,
 				Path:      path,
 				Name:      entry.DisplayName,
 				EntryType: string(entry.EntryType),
@@ -532,7 +677,7 @@ func (idx *Indexer) rebuildGraph(ctx context.Context, workspaceID, snapshotRef, 
 		}
 		if entry.ContentID != "" && entry.EntryType == sqlite.EntryFile {
 			edges = append(edges, GraphEdge{
-				SubjectID: entry.ID,
+				SubjectID: entry.SubjectRef,
 				Relation:  RelSameContent,
 				Value:     entry.ContentID,
 				Path:      path,
@@ -546,12 +691,12 @@ func (idx *Indexer) rebuildGraph(ctx context.Context, workspaceID, snapshotRef, 
 		if record.Kind != sqlite.AnnotationTag || record.Tombstoned || record.Body == "" {
 			continue
 		}
-		entry, ok := byID[record.SubjectRef]
+		entry, ok := namespaceEntryByRef(byID, record.SubjectRef)
 		if !ok {
 			continue
 		}
 		edges = append(edges, GraphEdge{
-			SubjectID: entry.ID,
+			SubjectID: entry.SubjectRef,
 			Relation:  RelTagged,
 			Value:     record.Body,
 			Path:      displayPath(byID, entry),
@@ -561,7 +706,7 @@ func (idx *Indexer) rebuildGraph(ctx context.Context, workspaceID, snapshotRef, 
 		})
 	}
 	for _, artifact := range artifacts {
-		entry, ok := byID[artifact.SubjectRef]
+		entry, ok := namespaceEntryByRef(byID, artifact.SubjectRef)
 		if !ok {
 			continue
 		}
@@ -571,20 +716,20 @@ func (idx *Indexer) rebuildGraph(ctx context.Context, workspaceID, snapshotRef, 
 			artist, album := parseAudioLabels(artifact.Body)
 			if artist != "" {
 				edges = append(edges, GraphEdge{
-					SubjectID: entry.ID, Relation: RelArtist, Value: artist,
+					SubjectID: entry.SubjectRef, Relation: RelArtist, Value: artist,
 					Path: path, Name: entry.DisplayName, EntryType: string(entry.EntryType), ContentID: entry.ContentID,
 				})
 			}
 			if album != "" {
 				edges = append(edges, GraphEdge{
-					SubjectID: entry.ID, Relation: RelAlbum, Value: album,
+					SubjectID: entry.SubjectRef, Relation: RelAlbum, Value: album,
 					Path: path, Name: entry.DisplayName, EntryType: string(entry.EntryType), ContentID: entry.ContentID,
 				})
 			}
 		case "extract.book.meta.v1":
 			if author := parseAuthorLabel(artifact.Body); author != "" {
 				edges = append(edges, GraphEdge{
-					SubjectID: entry.ID, Relation: RelAuthor, Value: author,
+					SubjectID: entry.SubjectRef, Relation: RelAuthor, Value: author,
 					Path: path, Name: entry.DisplayName, EntryType: string(entry.EntryType), ContentID: entry.ContentID,
 				})
 			}
@@ -632,12 +777,12 @@ func (idx *Indexer) rebuildTokens(ctx context.Context, workspaceID, snapshotRef,
 		if !ok {
 			continue
 		}
-		entry, ok := byID[artifact.SubjectRef]
+		entry, ok := namespaceEntryByRef(byID, artifact.SubjectRef)
 		if !ok {
 			continue
 		}
 		docs = append(docs, TokenDocument{
-			SubjectID: entry.ID,
+			SubjectID: entry.SubjectRef,
 			Token:     token,
 			Space:     space,
 			Path:      displayPath(byID, entry),
@@ -689,12 +834,12 @@ func (idx *Indexer) rebuildAcoustic(ctx context.Context, workspaceID, snapshotRe
 		if !ok {
 			continue
 		}
-		entry, ok := byID[artifact.SubjectRef]
+		entry, ok := namespaceEntryByRef(byID, artifact.SubjectRef)
 		if !ok {
 			continue
 		}
 		docs = append(docs, AcousticDocument{
-			SubjectID:   entry.ID,
+			SubjectID:   entry.SubjectRef,
 			Fingerprint: fingerprint,
 			Algorithm:   algorithm,
 			Path:        displayPath(byID, entry),
@@ -731,11 +876,15 @@ func (idx *Indexer) rebuildAcoustic(ctx context.Context, workspaceID, snapshotRe
 	return generation, nil
 }
 
-func (idx *Indexer) rebuildSemantic(ctx context.Context, workspaceID, snapshotRef, namespaceRootID string, segmentsBySubject map[string][]SegmentRef) (sqlite.IndexGeneration, error) {
+func (idx *Indexer) rebuildSemantic(ctx context.Context, workspaceID, snapshotRef, namespaceRootID string, rootIDs []string, segmentsBySubject map[string][]SegmentRef) (sqlite.IndexGeneration, error) {
 	var generation sqlite.IndexGeneration
 	idx.semanticIndexReady.Store(false)
 	if idx.SemanticProvider == nil || idx.SemanticZvec == nil {
 		return generation, ErrUnavailable
+	}
+	membershipVerifier, ok := idx.SemanticZvec.(ZvecGenerationMembershipVerifier)
+	if !ok {
+		return generation, fmt.Errorf("%w: semantic backend does not provide generation membership verification", ErrUnavailable)
 	}
 	manifest := idx.SemanticManifest
 	if err := manifest.Validate(); err != nil {
@@ -760,6 +909,12 @@ func (idx *Indexer) rebuildSemantic(ctx context.Context, workspaceID, snapshotRe
 			})
 		}
 	}
+	sort.Slice(inputs, func(i, j int) bool {
+		if inputs[i].SubjectID != inputs[j].SubjectID {
+			return inputs[i].SubjectID < inputs[j].SubjectID
+		}
+		return inputs[i].SegmentID < inputs[j].SegmentID
+	})
 	if len(inputs) == 0 {
 		return generation, ErrUnavailable
 	}
@@ -792,12 +947,20 @@ func (idx *Indexer) rebuildSemantic(ctx context.Context, workspaceID, snapshotRe
 		idx.semanticIndexReady.Store(false)
 		return generation, fmt.Errorf("%w: build generation: %v", ErrUnavailable, err)
 	}
+	candidates := make([]ZvecCoverageIdentity, 0, len(zvecSegments))
+	for _, segment := range zvecSegments {
+		candidates = append(candidates, ZvecCoverageIdentity{SubjectID: segment.SubjectID, SegmentID: segment.SegmentID})
+	}
+	if err := membershipVerifier.VerifyMembership(ctx, spec, candidates); err != nil {
+		idx.semanticIndexReady.Store(false)
+		return generation, fmt.Errorf("%w: semantic generation membership: %v", ErrUnavailable, err)
+	}
 	generation = sqlite.IndexGeneration{
 		ID: generationID, WorkspaceID: workspaceID, SnapshotRef: snapshotRef, NamespaceRootID: namespaceRootID,
 		DBPath: receipt.Path, Dimension: DimensionSemantic, ConfigDigest: manifest.ConfigDigest,
 		ProviderProfileDigest: manifest.CanonicalDigest(), SemanticSpace: manifest.SemanticSpace,
 	}
-	if err := idx.Store.InsertIndexGeneration(ctx, &generation); err != nil {
+	if err := idx.Store.InsertIndexGenerationWithRoots(ctx, &generation, rootIDs); err != nil {
 		idx.semanticIndexReady.Store(false)
 		return sqlite.IndexGeneration{}, err
 	}
@@ -848,13 +1011,31 @@ func (idx *Indexer) querySemantic(ctx context.Context, generation sqlite.IndexGe
 		return nil, fmt.Errorf("%w: open generation: %v", ErrUnavailable, err)
 	}
 	defer opened.Close()
+	membershipVerifier, ok := idx.SemanticZvec.(ZvecGenerationMembershipVerifier)
+	if !ok {
+		return nil, fmt.Errorf("%w: semantic backend does not provide generation membership verification", ErrUnavailable)
+	}
 	hits, err := opened.Query(ctx, results[0].Vector, 100)
 	if err != nil {
 		idx.semanticIndexReady.Store(false)
 		return nil, err
 	}
+	candidates := make([]ZvecCoverageIdentity, 0, len(hits))
+	for _, hit := range hits {
+		if strings.TrimSpace(hit.SubjectID) == "" || strings.TrimSpace(hit.SegmentID) == "" {
+			return nil, fmt.Errorf("%w: semantic hit has incomplete identity", ErrUnavailable)
+		}
+		candidates = append(candidates, ZvecCoverageIdentity{SubjectID: hit.SubjectID, SegmentID: hit.SegmentID})
+	}
+	if err := membershipVerifier.VerifyMembership(ctx, spec, candidates); err != nil {
+		return nil, fmt.Errorf("%w: semantic generation membership: %v", ErrUnavailable, err)
+	}
 	result := make([]Hit, 0, len(hits))
 	bySubject := make(map[string]int, len(hits))
+	entries, err := semanticNamespaceEntries(ctx, idx.Store, generation)
+	if err != nil {
+		return nil, fmt.Errorf("%w: semantic namespace provenance: %v", ErrUnavailable, err)
+	}
 	for _, hit := range hits {
 		if strings.HasPrefix(hit.SegmentID, sqlite.IDPrefixAnnotation+"_") {
 			annotationID := hit.SegmentID
@@ -862,7 +1043,7 @@ func (idx *Indexer) querySemantic(ctx context.Context, generation sqlite.IndexGe
 			if annotationErr != nil {
 				return nil, fmt.Errorf("%w: semantic annotation provenance: %v", ErrUnavailable, annotationErr)
 			}
-			if annotation.SubjectRef != hit.SubjectID || annotation.Kind != sqlite.AnnotationNote || annotation.Tombstoned {
+			if semanticCanonicalSubject(entries, annotation.SubjectRef) != hit.SubjectID || annotation.Kind != sqlite.AnnotationNote || annotation.Tombstoned {
 				return nil, fmt.Errorf("%w: semantic annotation %q subject or lifecycle binding mismatch", ErrUnavailable, annotation.ID)
 			}
 			projectedSegment := SegmentRef{
@@ -877,18 +1058,64 @@ func (idx *Indexer) querySemantic(ctx context.Context, generation sqlite.IndexGe
 			result = append(result, Hit{SubjectID: hit.SubjectID, Segments: []SegmentRef{projectedSegment}})
 			continue
 		}
+		if strings.HasPrefix(hit.SegmentID, sqlite.IDPrefixNamespaceEntry+"_") {
+			entry, entryOK, entryErr := semanticFilenameEntry(ctx, idx.Store, generation, entries, hit.SegmentID, hit.SubjectID)
+			if entryErr != nil {
+				return nil, fmt.Errorf("%w: semantic filename provenance: %v", ErrUnavailable, entryErr)
+			}
+			if !entryOK || strings.TrimSpace(entry.DisplayName) == "" {
+				return nil, fmt.Errorf("%w: semantic filename provenance %q subject binding mismatch", ErrUnavailable, hit.SegmentID)
+			}
+			projectedSegment := SegmentRef{
+				SourceType: "FILENAME", SourceID: entry.ID, SegmentID: entry.ID,
+				MatchedText: entry.DisplayName, Kind: "FILENAME", Producer: "CATALOG", Accepted: true, Language: "und",
+			}
+			if at, ok := bySubject[hit.SubjectID]; ok {
+				result[at].Segments = appendUniqueSegment(result[at].Segments, projectedSegment)
+				continue
+			}
+			bySubject[hit.SubjectID] = len(result)
+			result = append(result, Hit{SubjectID: hit.SubjectID, Segments: []SegmentRef{projectedSegment}})
+			continue
+		}
+		if strings.HasPrefix(hit.SegmentID, sqlite.IDPrefixArtifact+"_") {
+			artifact, artifactErr := idx.Store.GetProcessorArtifact(ctx, generation.WorkspaceID, hit.SegmentID)
+			if artifactErr != nil {
+				return nil, fmt.Errorf("%w: semantic artifact provenance: %v", ErrUnavailable, artifactErr)
+			}
+			artifactSubject := semanticCanonicalSubjectForStore(ctx, idx.Store, entries, generation.WorkspaceID, artifact.SubjectRef)
+			entry, entryOK, entryErr := semanticArtifactEntry(ctx, idx.Store, artifact, generation, entries, artifactSubject, hit.SubjectID)
+			if entryErr != nil {
+				return nil, fmt.Errorf("%w: semantic artifact provenance: %v", ErrUnavailable, entryErr)
+			}
+			if artifact.State != sqlite.ArtifactAdmitted || artifact.Stage != "EXTRACT" || strings.TrimSpace(artifact.Body) == "" || !utf8.ValidString(artifact.Body) || artifact.WorkspaceID != generation.WorkspaceID || artifactSubject != hit.SubjectID || !entryOK || semanticEntrySubject(entry) != hit.SubjectID {
+				return nil, fmt.Errorf("%w: semantic artifact %q state, snapshot, or subject binding mismatch", ErrUnavailable, artifact.ID)
+			}
+			projectedSegment := SegmentRef{
+				SourceType: "ARTIFACT", SourceID: artifact.ID, SegmentID: artifact.ID,
+				MatchedText: artifact.Body, Kind: artifact.Stage, Producer: artifact.ProducerDigest,
+				Accepted: true, Language: "und",
+			}
+			if at, ok := bySubject[hit.SubjectID]; ok {
+				result[at].Segments = appendUniqueSegment(result[at].Segments, projectedSegment)
+				continue
+			}
+			bySubject[hit.SubjectID] = len(result)
+			result = append(result, Hit{SubjectID: hit.SubjectID, Segments: []SegmentRef{projectedSegment}})
+			continue
+		}
 		segment, segmentErr := idx.Store.GetSemanticSegment(ctx, generation.WorkspaceID, hit.SegmentID)
 		if segmentErr != nil {
 			return nil, fmt.Errorf("%w: semantic segment provenance: %v", ErrUnavailable, segmentErr)
 		}
-		if segment.SubjectRef != hit.SubjectID {
+		if semanticCanonicalSubjectForStore(ctx, idx.Store, entries, generation.WorkspaceID, segment.SubjectRef) != hit.SubjectID {
 			return nil, fmt.Errorf("%w: semantic segment %q subject binding mismatch", ErrUnavailable, hit.SegmentID)
 		}
 		document, documentErr := idx.Store.GetDescriptionDocument(ctx, generation.WorkspaceID, segment.DocumentID)
 		if documentErr != nil {
 			return nil, fmt.Errorf("%w: semantic description provenance: %v", ErrUnavailable, documentErr)
 		}
-		if document.SubjectRef != hit.SubjectID {
+		if semanticCanonicalSubjectForStore(ctx, idx.Store, entries, generation.WorkspaceID, document.SubjectRef) != hit.SubjectID {
 			return nil, fmt.Errorf("%w: semantic description %q subject binding mismatch", ErrUnavailable, document.ID)
 		}
 		projectedSegment := SegmentRef{DescriptionDocumentID: document.ID, SourceType: "DESCRIPTION", SourceID: document.ID, SegmentID: segment.ID, Ordinal: segment.Ordinal, MatchedText: segment.Text, Kind: string(document.Kind), Producer: document.ProducerProfile, Accepted: document.Accepted, Language: document.Language}
@@ -901,6 +1128,207 @@ func (idx *Indexer) querySemantic(ctx context.Context, generation sqlite.IndexGe
 	}
 	idx.semanticIndexReady.Store(true)
 	return result, nil
+}
+
+func semanticEntrySubject(entry sqlite.NamespaceEntry) string {
+	if strings.TrimSpace(entry.SubjectRef) != "" {
+		return entry.SubjectRef
+	}
+	return entry.ID
+}
+
+func semanticCanonicalSubject(entries map[string]sqlite.NamespaceEntry, ref string) string {
+	if entry, ok := entries[ref]; ok {
+		return semanticEntrySubject(entry)
+	}
+	return ref
+}
+
+// semanticCanonicalSubjectForStore also resolves historical snapshot-local
+// entry IDs. The active/latest namespace projection is intentionally only a
+// fast path; it cannot be the authority for a pinned generation.
+func semanticCanonicalSubjectForStore(ctx context.Context, store *sqlite.Store, entries map[string]sqlite.NamespaceEntry, workspaceID, ref string) string {
+	if subject := semanticCanonicalSubject(entries, ref); subject != ref {
+		return subject
+	}
+	if store != nil && strings.TrimSpace(ref) != "" {
+		entry, err := store.GetNamespaceEntry(ctx, workspaceID, ref)
+		if err == nil && entry.WorkspaceID == workspaceID {
+			return semanticEntrySubject(entry)
+		}
+	}
+	return ref
+}
+
+func namespaceRootIDs(entries map[string]sqlite.NamespaceEntry) map[string]struct{} {
+	roots := make(map[string]struct{})
+	for _, entry := range entries {
+		if strings.TrimSpace(entry.RootID) != "" {
+			roots[entry.RootID] = struct{}{}
+		}
+	}
+	return roots
+}
+
+// semanticArtifactEntryInRoots checks a derived artifact against the actual
+// snapshot/root represented by the generation feed. It is deliberately based
+// on the artifact snapshot, rather than a stable-subject-to-latest-root map;
+// one subject may have observations in more than one source or generation.
+func semanticArtifactEntryInRoots(artifact sqlite.ProcessorArtifact, subjectRef string, entries map[string]sqlite.NamespaceEntry, roots map[string]sqlite.NamespaceRoot) (sqlite.NamespaceEntry, bool) {
+	if strings.TrimSpace(artifact.WorkspaceID) == "" || strings.TrimSpace(artifact.SnapshotRef) == "" {
+		return sqlite.NamespaceEntry{}, false
+	}
+	for _, entry := range entries {
+		if entry.WorkspaceID != artifact.WorkspaceID || semanticEntrySubject(entry) != subjectRef {
+			continue
+		}
+		root, ok := roots[entry.RootID]
+		if !ok || root.WorkspaceID != artifact.WorkspaceID || root.ID != entry.RootID || root.SnapshotRef != artifact.SnapshotRef {
+			continue
+		}
+		return entry, true
+	}
+	return sqlite.NamespaceEntry{}, false
+}
+
+// semanticFilenameEntry resolves the immutable EntryID embedded in a vector
+// row. It does not consult ListLatestNamespaceEntries, so old generations
+// retain their original filename and stable subject after publication.
+func semanticFilenameEntry(ctx context.Context, store *sqlite.Store, generation sqlite.IndexGeneration, entries map[string]sqlite.NamespaceEntry, entryID, subjectID string) (sqlite.NamespaceEntry, bool, error) {
+	if store == nil {
+		return sqlite.NamespaceEntry{}, false, errors.New("catalog is required")
+	}
+	entry, ok := entries[entryID]
+	if !ok {
+		return sqlite.NamespaceEntry{}, false, nil
+	}
+	if entry.WorkspaceID != generation.WorkspaceID || semanticEntrySubject(entry) != subjectID || strings.TrimSpace(entry.RootID) == "" || strings.TrimSpace(entry.DisplayName) == "" {
+		return entry, false, nil
+	}
+	root, err := store.GetNamespaceRoot(ctx, generation.WorkspaceID, entry.RootID)
+	if err != nil {
+		return sqlite.NamespaceEntry{}, false, err
+	}
+	if root.WorkspaceID != generation.WorkspaceID || root.ID != entry.RootID || strings.TrimSpace(root.SnapshotRef) == "" {
+		return entry, false, nil
+	}
+	return entry, true, nil
+}
+
+// semanticArtifactEntry resolves the root named by an artifact's immutable
+// SnapshotRef and then validates the subject within that root. In particular,
+// artifactSnapshot == generation.SnapshotRef is not a reason to skip this
+// check: snapshot labels alone do not establish namespace membership.
+func semanticArtifactEntry(ctx context.Context, store *sqlite.Store, artifact sqlite.ProcessorArtifact, generation sqlite.IndexGeneration, entries map[string]sqlite.NamespaceEntry, artifactSubject, hitSubject string) (sqlite.NamespaceEntry, bool, error) {
+	if store == nil {
+		return sqlite.NamespaceEntry{}, false, errors.New("catalog is required")
+	}
+	if artifact.WorkspaceID != generation.WorkspaceID || strings.TrimSpace(artifact.SnapshotRef) == "" || artifactSubject != hitSubject {
+		return sqlite.NamespaceEntry{}, false, nil
+	}
+	root, err := store.GetNamespaceRootBySnapshotRef(ctx, artifact.SnapshotRef)
+	if err != nil {
+		return sqlite.NamespaceEntry{}, false, err
+	}
+	if root.WorkspaceID != generation.WorkspaceID || strings.TrimSpace(root.ID) == "" {
+		return sqlite.NamespaceEntry{}, false, nil
+	}
+	if root.SnapshotRef != artifact.SnapshotRef {
+		return sqlite.NamespaceEntry{}, false, nil
+	}
+	for _, entry := range entries {
+		if entry.WorkspaceID == generation.WorkspaceID && entry.RootID == root.ID && semanticEntrySubject(entry) == artifactSubject && semanticEntrySubject(entry) == hitSubject {
+			return entry, true, nil
+		}
+	}
+	return sqlite.NamespaceEntry{}, false, nil
+}
+
+// activeDescriptionLeaves returns only accepted revisions that have not been
+// superseded by a successor. Description history remains durable; this is
+// solely the rebuild-time semantic feed projection.
+func activeDescriptionLeaves(descriptions []sqlite.DescriptionDocument) map[string]struct{} {
+	superseded := make(map[string]struct{}, len(descriptions))
+	for _, description := range descriptions {
+		if predecessor := strings.TrimSpace(description.PredecessorID); predecessor != "" {
+			superseded[predecessor] = struct{}{}
+		}
+	}
+	active := make(map[string]struct{}, len(descriptions))
+	for _, description := range descriptions {
+		if description.Accepted {
+			if _, replaced := superseded[description.ID]; !replaced {
+				active[description.ID] = struct{}{}
+			}
+		}
+	}
+	return active
+}
+
+// semanticNamespaceEntries returns only entries from the roots atomically
+// recorded for this generation. A missing mapping is a damaged/legacy
+// generation and fails closed; the current latest projection is never a
+// fallback for pinned provenance.
+func semanticNamespaceEntries(ctx context.Context, store *sqlite.Store, generation sqlite.IndexGeneration) (map[string]sqlite.NamespaceEntry, error) {
+	if store == nil {
+		return nil, errors.New("catalog is required")
+	}
+	roots, err := store.ListIndexGenerationRoots(ctx, generation.WorkspaceID, generation.ID)
+	if err != nil {
+		return nil, err
+	}
+	if len(roots) == 0 {
+		return nil, errors.New("index generation root mapping is empty")
+	}
+	byID := make(map[string]sqlite.NamespaceEntry)
+	seenRoots := make(map[string]struct{}, len(roots))
+	containsPrimary := false
+	for _, root := range roots {
+		if root.WorkspaceID != generation.WorkspaceID || strings.TrimSpace(root.ID) == "" || strings.TrimSpace(root.SnapshotRef) == "" {
+			return nil, fmt.Errorf("index generation root %q is outside workspace scope", root.ID)
+		}
+		if _, duplicate := seenRoots[root.ID]; duplicate {
+			return nil, fmt.Errorf("duplicate index generation root %q", root.ID)
+		}
+		seenRoots[root.ID] = struct{}{}
+		if root.ID == generation.NamespaceRootID {
+			containsPrimary = true
+		}
+		nodes, listErr := store.ListNamespaceSubtree(ctx, generation.WorkspaceID, root.ID, "")
+		if listErr != nil {
+			return nil, listErr
+		}
+		for _, node := range nodes {
+			entry := node.Entry
+			if entry.WorkspaceID != generation.WorkspaceID || entry.RootID != root.ID {
+				return nil, fmt.Errorf("namespace entry %q is outside generation root scope", entry.ID)
+			}
+			if _, duplicate := byID[entry.ID]; duplicate {
+				return nil, fmt.Errorf("duplicate namespace entry %q in generation roots", entry.ID)
+			}
+			if strings.TrimSpace(entry.SubjectRef) == "" {
+				entry.SubjectRef = entry.ID
+			}
+			byID[entry.ID] = entry
+		}
+	}
+	if !containsPrimary {
+		return nil, fmt.Errorf("index generation root mapping omits primary root %q", generation.NamespaceRootID)
+	}
+	return byID, nil
+}
+
+func semanticEntryForSubject(ctx context.Context, store *sqlite.Store, entries map[string]sqlite.NamespaceEntry, subjectRef, artifactSnapshot string, generation sqlite.IndexGeneration) (sqlite.NamespaceEntry, bool) {
+	for _, entry := range entries {
+		if semanticEntrySubject(entry) != subjectRef {
+			continue
+		}
+		root, err := store.GetNamespaceRoot(ctx, generation.WorkspaceID, entry.RootID)
+		if err == nil && artifactSnapshot != "" && root.SnapshotRef == artifactSnapshot {
+			return entry, true
+		}
+	}
+	return sqlite.NamespaceEntry{}, false
 }
 
 func appendUniqueSegment(segments []SegmentRef, candidate SegmentRef) []SegmentRef {

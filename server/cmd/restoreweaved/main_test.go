@@ -133,7 +133,7 @@ func TestValidateRuntimeStorageProfileRejectsSilentlyIgnoredProfiles(t *testing.
 }
 
 func TestSemanticBundleCapabilityRejectsMissingOrCorruptBundle(t *testing.T) {
-	missing := semanticBundleCapability(filepath.Join(t.TempDir(), "missing"))
+	missing := semanticBundleCapability(filepath.Join(t.TempDir(), "missing"), false)
 	if missing.Kind != "model-bundle" || missing.ID != search.SemanticBundleBGEProfileID || missing.State != command.CapabilityUnavailable {
 		t.Fatalf("missing bundle capability = %+v, want model-bundle unavailable", missing)
 	}
@@ -142,7 +142,7 @@ func TestSemanticBundleCapabilityRejectsMissingOrCorruptBundle(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, search.SemanticBundleManifestName), []byte(`{"schema":"not-a-bundle"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	corrupt := semanticBundleCapability(root)
+	corrupt := semanticBundleCapability(root, false)
 	if corrupt.State != command.CapabilityUnavailable {
 		t.Fatalf("corrupt bundle capability = %+v, want UNAVAILABLE", corrupt)
 	}
@@ -197,9 +197,68 @@ func TestSemanticBundleCapabilityAcceptsAdmittedBundleWithoutIndexReadiness(t *t
 	if _, err := search.PackageSemanticBundle(destination, descriptor, sources); err != nil {
 		t.Fatalf("package test bundle: %v", err)
 	}
-	capability := semanticBundleCapability(destination)
+	capability := semanticBundleCapability(destination, false)
 	if capability.State != command.CapabilityAvailable || capability.Version == "" {
 		t.Fatalf("admitted bundle capability = %+v, want AVAILABLE with profile digest", capability)
+	}
+	override := semanticBundleCapability(destination, true)
+	if override.State != command.CapabilityAvailable || override.Source != "operator-provided" || !strings.Contains(override.Notes, "not the release-pinned default") {
+		t.Fatalf("override capability = %+v, want explicit operator provenance", override)
+	}
+}
+
+func TestSemanticBundleInstallerDisabledForOperatorOverride(t *testing.T) {
+	if !semanticBundleInstallerEnabled(daemonOptions{}) {
+		t.Fatal("default daemon options unexpectedly disable installer")
+	}
+	if semanticBundleInstallerEnabled(daemonOptions{semanticBundle: "/tmp/operator-bundle"}) {
+		t.Fatal("operator bundle unexpectedly enables fixed default installer")
+	}
+	if semanticBundleInstallerEnabled(daemonOptions{semanticBundleOverride: true}) {
+		t.Fatal("explicit override unexpectedly enables fixed default installer")
+	}
+}
+
+// TestNormalDaemonRequiresPersistedConfig ensures a missing profile fails
+// before normal startup resolves or creates any runtime state.  The recovery
+// reader deliberately has a separate, catalog-free startup path and is
+// covered by the clean-install tests below.
+func TestNormalDaemonRequiresPersistedConfig(t *testing.T) {
+	workspaceRoot := testWorkspaceRoot(t)
+	binDir := t.TempDir()
+	daemonBin := buildTestBinary(t, workspaceRoot, "./server/cmd/restoreweaved", filepath.Join(binDir, "restoreweaved"))
+
+	root := t.TempDir()
+	missingConfig := filepath.Join(root, "config", "missing.toml")
+	socketPath := filepath.Join(root, "runtime", "restoreweaved.sock")
+	paths := []string{
+		filepath.Join(root, "catalog.sqlite"),
+		filepath.Join(root, "repository"),
+		filepath.Join(root, "vectors"),
+		filepath.Join(root, "models"),
+		filepath.Join(root, "recovery"),
+		socketPath,
+	}
+	cmd := exec.Command(daemonBin, "--config", missingConfig, "--socket", socketPath)
+	cmd.Env = append(os.Environ(),
+		"RESTOREWEAVE_CONFIG="+missingConfig,
+		"RESTOREWEAVE_CATALOG="+paths[0],
+		"RESTOREWEAVE_REPOSITORY="+paths[1],
+		"RESTOREWEAVE_VECTORS="+paths[2],
+		"RESTOREWEAVE_MODELS="+paths[3],
+		"RESTOREWEAVE_RECOVERY_RECORDS="+paths[4],
+	)
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("daemon unexpectedly started without persisted config; output=%s", output)
+	}
+	if !strings.Contains(string(output), "load config") {
+		t.Fatalf("missing-config failure = %q, want load-config error", output)
+	}
+	for _, path := range paths {
+		if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("missing-config startup created %s: %v", path, statErr)
+		}
 	}
 }
 
@@ -290,7 +349,7 @@ func TestRealDaemonAndCLIEndToEndConfiguredIngestAndCleanRecovery(t *testing.T) 
 	if err := os.WriteFile(filepath.Join(source, "nested", "payload.bin"), want, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	configPath := filepath.Join(root, "config", "config.yaml")
+	configPath := filepath.Join(root, "config", "config.toml")
 	cliEnv := append(os.Environ(), "XDG_DATA_HOME="+dataHome)
 	initConfig := exec.Command(rwBin, "config", "init", "--path", configPath)
 	initConfig.Env = cliEnv
@@ -396,14 +455,23 @@ func TestRealDaemonAndCLIEndToEndConfiguredIngestAndCleanRecovery(t *testing.T) 
 		"--title", "Recovery note", "--body", "A flooded city archive is ready for recovery.", "--accepted")
 	var createdData command.DescriptionCreateData
 	decodeProcessResult(t, created, &createdData)
-	if createdData.Document.ID == "" || createdData.Document.SubjectRef != resolvedData.PathRef || len(createdData.Document.Segments) == 0 {
+	if createdData.Document.ID == "" || createdData.Document.SubjectRef != resolvedData.Entry.SubjectRef || len(createdData.Document.Segments) == 0 {
 		t.Fatalf("real CLI description create = %+v", createdData.Document)
 	}
-	searched := runRWProcess(t, rwBin, socketPath, "search", "flooded",
+	searched := runRWProcessAllowDegraded(t, rwBin, socketPath, "search", "flooded",
 		"--workspace", appliedData.WorkspaceID, "--filter", "language=EN", "--filter", "suffix=bin")
 	var searchData command.SearchQueryData
 	decodeProcessResult(t, searched, &searchData)
-	if len(searchData.Hits) != 1 || searchData.Hits[0].SubjectRef != resolvedData.PathRef || len(searchData.Hits[0].Segments) == 0 {
+	if searchData.Provider != search.ProviderBrokerFuse || searchData.Dimension != "" ||
+		!reflect.DeepEqual(searchData.FusedDimensions, []string{search.DimensionLexical, search.DimensionSemantic}) ||
+		len(searchData.Components) != 2 ||
+		searchData.Components[0].Dimension != search.DimensionLexical ||
+		searchData.Components[0].Status != string(command.StatusSucceeded) ||
+		searchData.Components[1].Dimension != search.DimensionSemantic ||
+		searchData.Components[1].Status != string(command.StatusDegraded) {
+		t.Fatalf("real CLI default broker search = %+v", searchData)
+	}
+	if len(searchData.Hits) != 1 || searchData.Hits[0].SubjectRef != resolvedData.Entry.SubjectRef || len(searchData.Hits[0].Segments) == 0 {
 		t.Fatalf("real CLI filtered search = %+v", searchData)
 	}
 	segment := searchData.Hits[0].Segments[0]
@@ -412,7 +480,8 @@ func TestRealDaemonAndCLIEndToEndConfiguredIngestAndCleanRecovery(t *testing.T) 
 		t.Fatalf("real CLI segment provenance = %+v", segment)
 	}
 	wrongLanguage := runRWProcess(t, rwBin, socketPath, "search", "flooded",
-		"--workspace", appliedData.WorkspaceID, "--filter", "language=fr", "--filter", "suffix=bin")
+		"--workspace", appliedData.WorkspaceID, "--dimension", search.DimensionLexical,
+		"--filter", "language=fr", "--filter", "suffix=bin")
 	var wrongLanguageData command.SearchQueryData
 	decodeProcessResult(t, wrongLanguage, &wrongLanguageData)
 	if len(wrongLanguageData.Hits) != 0 {
@@ -423,7 +492,7 @@ func TestRealDaemonAndCLIEndToEndConfiguredIngestAndCleanRecovery(t *testing.T) 
 	var taggedData command.AnnotationUpsertData
 	decodeProcessResult(t, tagged, &taggedData)
 	if taggedData.Annotation.ID == "" || taggedData.Annotation.Kind != "TAG" ||
-		taggedData.Annotation.Body != "curated" || taggedData.Annotation.SubjectRef != resolvedData.PathRef {
+		taggedData.Annotation.Body != "curated" || taggedData.Annotation.SubjectRef != resolvedData.Entry.SubjectRef {
 		t.Fatalf("real CLI tag add = %+v", taggedData.Annotation)
 	}
 	noted := runRWProcess(t, rwBin, socketPath, "note", "set", resolvedData.PathRef,
@@ -431,14 +500,14 @@ func TestRealDaemonAndCLIEndToEndConfiguredIngestAndCleanRecovery(t *testing.T) 
 	var notedData command.AnnotationUpsertData
 	decodeProcessResult(t, noted, &notedData)
 	if notedData.Annotation.ID == "" || notedData.Annotation.Kind != "NOTE" ||
-		notedData.Annotation.Body != "retain exact bytes" || notedData.Annotation.SubjectRef != resolvedData.PathRef {
+		notedData.Annotation.Body != "retain exact bytes" || notedData.Annotation.SubjectRef != resolvedData.Entry.SubjectRef {
 		t.Fatalf("real CLI note set = %+v", notedData.Annotation)
 	}
 	annotationSearch := runRWProcess(t, rwBin, socketPath, "search", "curated",
-		"--workspace", appliedData.WorkspaceID, "--axis", "tags")
+		"--workspace", appliedData.WorkspaceID, "--dimension", search.DimensionLexical, "--axis", "tags")
 	var annotationSearchData command.SearchQueryData
 	decodeProcessResult(t, annotationSearch, &annotationSearchData)
-	if len(annotationSearchData.Hits) != 1 || annotationSearchData.Hits[0].SubjectRef != resolvedData.PathRef {
+	if len(annotationSearchData.Hits) != 1 || annotationSearchData.Hits[0].SubjectRef != resolvedData.Entry.SubjectRef {
 		t.Fatalf("real CLI annotation search = %+v", annotationSearchData.Hits)
 	}
 	viewSaved := runRWProcess(t, rwBin, socketPath, "view", "save", "recoverable", "flooded")
@@ -451,7 +520,7 @@ func TestRealDaemonAndCLIEndToEndConfiguredIngestAndCleanRecovery(t *testing.T) 
 	var viewEvaluateData command.ViewEvaluateData
 	decodeProcessResult(t, viewEvaluated, &viewEvaluateData)
 	if viewEvaluateData.ViewID != viewData.ViewID || len(viewEvaluateData.Hits) != 1 ||
-		viewEvaluateData.Hits[0].SubjectRef != resolvedData.PathRef {
+		viewEvaluateData.Hits[0].SubjectRef != resolvedData.Entry.SubjectRef {
 		t.Fatalf("real CLI view evaluate = %+v", viewEvaluateData)
 	}
 	manifestPlanned := runRWProcess(t, rwBin, socketPath, "export", "plan", "--view", "recoverable")
@@ -556,8 +625,14 @@ func TestRealDaemonAndCLIEndToEndConfiguredIngestAndCleanRecovery(t *testing.T) 
 	if err := os.Remove(cfg.Paths.Catalog); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.RemoveAll(cfg.Paths.Vectors); err != nil {
+		t.Fatalf("remove disposable vector index projection: %v", err)
+	}
 	if err := os.RemoveAll(cfg.Paths.RecoveryRecords); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := os.Stat(cfg.Paths.Vectors); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("vector index projection still exists before clean-install reader: %v", err)
 	}
 
 	cleanSocket := fmt.Sprintf("/tmp/rw-e2e-clean-%d-%d.sock", os.Getpid(), time.Now().UnixNano())
@@ -602,6 +677,9 @@ func TestRealDaemonAndCLIEndToEndConfiguredIngestAndCleanRecovery(t *testing.T) 
 	}
 	if _, err := os.Stat(cfg.Paths.Catalog); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("clean-install reader created catalog: %v", err)
+	}
+	if _, err := os.Stat(cfg.Paths.Vectors); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("clean-install reader created vector indexes: %v", err)
 	}
 	if repositoryAfter := recoveryProcessTree(t, cfg.Paths.Repository); !reflect.DeepEqual(repositoryAfter, repositoryBefore) {
 		t.Fatalf("clean-install reader changed repository tree\nbefore=%v\nafter=%v", repositoryBefore, repositoryAfter)
@@ -1196,6 +1274,27 @@ func runRWProcess(t *testing.T, rwBin, socketPath string, args ...string) comman
 	}
 	if result.Status != command.StatusSucceeded {
 		t.Fatalf("rw %s status = %s, reasons=%+v", strings.Join(args, " "), result.Status, result.Reasons)
+	}
+	return result
+}
+
+// runRWProcessAllowDegraded accepts the CLI's intentional degraded-search
+// contract while keeping unexpected failures fatal. The broker returns useful
+// lexical data when semantic search is unavailable and exits with code 5.
+func runRWProcessAllowDegraded(t *testing.T, rwBin, socketPath string, args ...string) command.Result {
+	t.Helper()
+	fullArgs := append([]string{"--socket", socketPath, "--json"}, args...)
+	output, processErr := exec.Command(rwBin, fullArgs...).CombinedOutput()
+	var result command.Result
+	if decodeErr := json.Unmarshal(output, &result); decodeErr != nil {
+		t.Fatalf("decode rw %s result: %v (process error %v)\n%s", strings.Join(args, " "), decodeErr, processErr, output)
+	}
+	if result.Status != command.StatusDegraded {
+		t.Fatalf("rw %s status = %s, want DEGRADED; reasons=%+v", strings.Join(args, " "), result.Status, result.Reasons)
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(processErr, &exitErr) || exitErr.ExitCode() != 5 {
+		t.Fatalf("rw %s process error = %v, want exit status 5", strings.Join(args, " "), processErr)
 	}
 	return result
 }

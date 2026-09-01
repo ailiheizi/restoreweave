@@ -11,6 +11,7 @@ import (
 	"github.com/ailiheizi/restoreweave/client/command"
 	"github.com/ailiheizi/restoreweave/server/internal/exact"
 	"github.com/ailiheizi/restoreweave/server/internal/repository"
+	"github.com/ailiheizi/restoreweave/server/internal/search"
 	"github.com/ailiheizi/restoreweave/server/testutil"
 )
 
@@ -75,6 +76,7 @@ func TestAudioListAfterIngest(t *testing.T) {
 
 	found := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
+		"dimension":    search.DimensionLexical,
 		"query":        "Nightfall",
 	}))
 	if found.Status != command.StatusSucceeded {
@@ -146,7 +148,7 @@ func TestAudioSubjectRangeRead(t *testing.T) {
 
 	opened := dispatcher.Handle(ctx, mustEnvelope(t, command.OpContentOpen, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
-		"entry_id":     tracks.Tracks[0].SubjectRef,
+		"subject_ref":  tracks.Tracks[0].SubjectRef,
 	}))
 	if opened.Status != command.StatusSucceeded {
 		t.Fatalf("content.open = %q: %+v", opened.Status, opened.Reasons)

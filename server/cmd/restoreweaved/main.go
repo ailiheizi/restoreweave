@@ -52,13 +52,14 @@ func run() error {
 		repositoryPath = flag.String("repository", "",
 			"Exact-lane repository path (overrides persisted config and RESTOREWEAVE_REPOSITORY)")
 		semanticBundle = flag.String("semantic-bundle", os.Getenv("RESTOREWEAVE_SEMANTIC_BUNDLE"),
-			"local semantic bundle root (overrides configured paths.models profile)")
+			"operator-provided custom semantic bundle root (overrides configured paths.models profile; not the release-pinned default; disables fixed bundle installation)")
 		apiListen               = flag.String("api-listen", "", "HTTP /api/v1 listen address (overrides api.listen; empty uses config)")
 		apiToken                = flag.String("api-token", os.Getenv("RESTOREWEAVE_API_TOKEN"), "Bearer token for HTTP /api/v1")
 		onnxWorkerProcessBundle = flag.String("onnx-worker-process", "",
 			"private host-supervisor ONNX worker bundle root")
 	)
 	flag.Parse()
+	semanticBundleOverride := strings.TrimSpace(*semanticBundle) != ""
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -66,30 +67,32 @@ func run() error {
 		return processor.RunONNXWorkerProcess(ctx, *onnxWorkerProcessBundle)
 	}
 	return runWithOptions(ctx, daemonOptions{
-		socketPath:        *socketPath,
-		recoveryReader:    *recoveryReader,
-		recoveryReference: *recoveryReference,
-		trustAnchorPath:   *trustAnchorPath,
-		configPath:        *configPath,
-		catalogPath:       *catalogPath,
-		repositoryPath:    *repositoryPath,
-		semanticBundle:    *semanticBundle,
-		apiListen:         *apiListen,
-		apiToken:          *apiToken,
+		socketPath:             *socketPath,
+		recoveryReader:         *recoveryReader,
+		recoveryReference:      *recoveryReference,
+		trustAnchorPath:        *trustAnchorPath,
+		configPath:             *configPath,
+		catalogPath:            *catalogPath,
+		repositoryPath:         *repositoryPath,
+		semanticBundle:         *semanticBundle,
+		semanticBundleOverride: semanticBundleOverride,
+		apiListen:              *apiListen,
+		apiToken:               *apiToken,
 	})
 }
 
 type daemonOptions struct {
-	socketPath        string
-	recoveryReader    bool
-	recoveryReference string
-	trustAnchorPath   string
-	configPath        string
-	catalogPath       string
-	repositoryPath    string
-	semanticBundle    string
-	apiListen         string
-	apiToken          string
+	socketPath             string
+	recoveryReader         bool
+	recoveryReference      string
+	trustAnchorPath        string
+	configPath             string
+	catalogPath            string
+	repositoryPath         string
+	semanticBundle         string
+	semanticBundleOverride bool
+	apiListen              string
+	apiToken               string
 }
 
 func configureSemanticBinding(ctx context.Context, resolved rwconfig.ResolvedConfig, store *sqlite.Store, bundleRoot string) (controlplane.DispatcherOption, func() error, error) {
@@ -168,14 +171,20 @@ func configureSemanticBinding(ctx context.Context, resolved rwconfig.ResolvedCon
 	return controlplane.WithSemanticIndexerBinding(factory, search.NewZvecGenerationDriver(libraryPath), libraryPath, libraryDigest, manifest), release, nil
 }
 
-func semanticBundleCapability(bundleRoot string) command.Capability {
+func semanticBundleCapability(bundleRoot string, operatorOverride bool) command.Capability {
+	source := "BAAI/bge-small-zh-v1.5"
+	notes := "local semantic bundle is not installed or has not passed integrity admission"
+	if operatorOverride {
+		source = "operator-provided"
+		notes = "operator-provided semantic bundle override; not the release-pinned default"
+	}
 	capability := command.Capability{
 		Kind:    "model-bundle",
 		ID:      search.SemanticBundleBGEProfileID,
 		State:   command.CapabilityUnavailable,
 		Version: "1",
-		Source:  "BAAI/bge-small-zh-v1.5",
-		Notes:   "local semantic bundle is not installed or has not passed integrity admission",
+		Source:  source,
+		Notes:   notes,
 	}
 	bundle, err := search.LoadSemanticBundle(strings.TrimSpace(bundleRoot))
 	if err != nil {
@@ -183,8 +192,16 @@ func semanticBundleCapability(bundleRoot string) command.Capability {
 	}
 	capability.State = command.CapabilityAvailable
 	capability.Version = bundle.ProfileDigest
-	capability.Notes = "bundle is installed and locally verified; semantic index readiness is reported separately"
+	if operatorOverride {
+		capability.Notes = "operator-provided semantic bundle override is installed and locally verified; not the release-pinned default; semantic index readiness is reported separately"
+	} else {
+		capability.Notes = "bundle is installed and locally verified; semantic index readiness is reported separately"
+	}
 	return capability
+}
+
+func semanticBundleInstallerEnabled(options daemonOptions) bool {
+	return !options.semanticBundleOverride && strings.TrimSpace(options.semanticBundle) == ""
 }
 
 func keepSemanticLeaseAlive(ctx context.Context, interval time.Duration, renew func(context.Context) error, invalidate func(error), done chan<- struct{}) {
@@ -234,8 +251,14 @@ func runWithOptions(ctx context.Context, options daemonOptions) error {
 	}
 
 	resolved, err := rwconfig.LoadEffective(rwconfig.LoadOptions{
-		Path:         options.configPath,
-		AllowMissing: true,
+		Path: options.configPath,
+		// Normal daemon mode must be anchored to an operator-created persisted
+		// profile.  Falling back to platform defaults here can create a new
+		// catalog/repository (and signing state) in an unexpected location when
+		// a config path is misspelled or has not been initialized yet.
+		// Recovery-reader mode intentionally returns above and remains
+		// catalog/config-free.
+		AllowMissing: false,
 		ResolveOptions: rwconfig.ResolveOptions{
 			Overrides: rwconfig.PathOverrides{Catalog: options.catalogPath, Repository: options.repositoryPath},
 		},
@@ -289,7 +312,7 @@ func runWithOptions(ctx context.Context, options daemonOptions) error {
 	if bundleRoot == "" {
 		bundleRoot = filepath.Join(resolved.Config.Paths.Models, search.SemanticBundleBGEProfileID, runtime.GOOS+"-"+runtime.GOARCH)
 	}
-	bundleCapability := semanticBundleCapability(bundleRoot)
+	bundleCapability := semanticBundleCapability(bundleRoot, options.semanticBundleOverride)
 	semanticOption, semanticCleanup, semanticErr := configureSemanticBinding(ctx, resolved, store, bundleRoot)
 	if semanticErr != nil {
 		log.Printf("semantic capability unavailable: %v", semanticErr)
@@ -311,6 +334,25 @@ func runWithOptions(ctx context.Context, options daemonOptions) error {
 		controlplane.WithOperatorConfig(resolved),
 		controlplane.WithSemanticBundleCapability(bundleCapability),
 		controlplane.WithVectorPath(resolved.Config.Paths.Vectors), controlplane.WithExact(exactLane),
+	}
+	if semanticBundleInstallerEnabled(options) {
+		modelsRoot := resolved.Config.Paths.Models
+		dispatcherOptions = append(dispatcherOptions, controlplane.WithSemanticBundleInstaller(modelsRoot,
+			func(installCtx context.Context, root string) (controlplane.SemanticBundleInstallReceipt, error) {
+				beforeRoot := filepath.Join(root, search.SemanticBundleBGEProfileID, runtime.GOOS+"-"+runtime.GOARCH)
+				before, beforeErr := search.LoadSemanticBundle(beforeRoot)
+				admission, installErr := search.InstallDefaultSemanticBundle(installCtx, root)
+				if installErr != nil {
+					return controlplane.SemanticBundleInstallReceipt{}, installErr
+				}
+				changed := beforeErr != nil || before.ProfileDigest != admission.ProfileDigest
+				return controlplane.SemanticBundleInstallReceipt{
+					Admission:   admission,
+					Destination: filepath.Join(root, search.SemanticBundleBGEProfileID, runtime.GOOS+"-"+runtime.GOARCH),
+					Changed:     changed,
+				}, nil
+			},
+		))
 	}
 	if semanticOption != nil {
 		dispatcherOptions = append(dispatcherOptions, semanticOption)

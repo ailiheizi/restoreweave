@@ -23,6 +23,7 @@ const (
 	IDPrefixAuditEvent        = "aud"
 	IDPrefixNamespaceRoot     = "nsr"
 	IDPrefixNamespaceEntry    = "nse"
+	IDPrefixSubject           = "subj"
 	IDPrefixFileVersion       = "fvr"
 	IDPrefixRepresentation    = "rep"
 	IDPrefixContentExtent     = "ext"
@@ -330,7 +331,10 @@ const (
 // FullPathKey is an opaque, filesystem-profile-defined lookup key; it is not a
 // slash-joined UTF-8 path and may safely contain arbitrary bytes.
 type NamespaceEntry struct {
-	ID                   string
+	ID string
+	// SubjectRef is the stable user-facing identity for this observation.
+	// ID remains the immutable, snapshot-local namespace entry identity.
+	SubjectRef           string
 	WorkspaceID          string
 	RootID               string
 	ParentID             string

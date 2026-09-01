@@ -65,11 +65,11 @@ func protectionPolicyRef(item prepared) string {
 	return ref
 }
 
-func insertPreparedProtection(ctx context.Context, tx *sqlite.Tx, workspaceID string, item prepared) error {
+func insertPreparedProtection(ctx context.Context, tx *sqlite.Tx, workspaceID string, item prepared) (string, error) {
 	protection := sqlite.ProtectionRecord{
 		ID:                  item.protectionID,
 		WorkspaceID:         workspaceID,
-		SubjectRef:          item.namespaceID,
+		SubjectRef:          item.subjectRef,
 		Mode:                sqlite.ProtectionMetadataOnly,
 		Outcome:             sqlite.ProtectionUnavailable,
 		PolicyDecisionRef:   "policy:metadata-only-non-file",
@@ -101,15 +101,20 @@ func insertPreparedProtection(ctx context.Context, tx *sqlite.Tx, workspaceID st
 			protection.PolicyDecisionRef = protectionPolicyRef(item)
 		}
 	}
-	if err := tx.InsertProtectionRecord(ctx, &protection); err != nil {
-		return err
+	storedProtection, err := tx.UpsertProtectionRecord(ctx, &protection)
+	if err != nil {
+		return "", err
 	}
+	// Protection is a current-state projection keyed by stable subject. A
+	// rescan may revise that row while immutable recovery references retain
+	// the actual protection record ID returned by the upsert.
+	protection = storedProtection
 	if item.entryType != sqlite.EntryFile {
-		return nil
+		return protection.ID, nil
 	}
 
 	if item.entry.Content == nil {
-		return nil
+		return protection.ID, nil
 	}
 	size := item.entry.Content.BytesRead
 	if item.recoveryID != "" {
@@ -117,13 +122,13 @@ func insertPreparedProtection(ctx context.Context, tx *sqlite.Tx, workspaceID st
 			item.entry.Content.ContentID, size, item.representation,
 		)
 		if err != nil {
-			return err
+			return "", err
 		}
 		if err := tx.InsertRecoveryReference(ctx, &sqlite.RecoveryReference{
 			ID:                    item.recoveryID,
 			WorkspaceID:           workspaceID,
-			ProtectionRecordID:    item.protectionID,
-			SubjectRef:            item.namespaceID,
+			ProtectionRecordID:    protection.ID,
+			SubjectRef:            item.subjectRef,
 			Kind:                  sqlite.RecoveryExactRepresentation,
 			Priority:              0,
 			Claim:                 sqlite.RecoveryClaimRestoreVerified,
@@ -137,16 +142,16 @@ func insertPreparedProtection(ctx context.Context, tx *sqlite.Tx, workspaceID st
 			PolicyRef:             protectionPolicyRef(item),
 			RecordDigest:          item.entry.Content.ContentID,
 		}); err != nil {
-			return err
+			return "", err
 		}
 	}
 	if item.externalBindingID == "" {
-		return nil
+		return protection.ID, nil
 	}
 
 	digest, err := locatorBindingDigest(item.entry.Content.ContentID, ingestLocators(item.externalLocators))
 	if err != nil {
-		return err
+		return "", err
 	}
 	bindingMetadata, _ := json.Marshal(map[string]any{
 		"capture_relative_path": item.entry.RelativePath,
@@ -155,13 +160,13 @@ func insertPreparedProtection(ctx context.Context, tx *sqlite.Tx, workspaceID st
 	if err := tx.InsertExternalBinding(ctx, &sqlite.ExternalBinding{
 		ID:             item.externalBindingID,
 		WorkspaceID:    workspaceID,
-		SubjectRef:     item.namespaceID,
+		SubjectRef:     item.subjectRef,
 		ProviderKind:   "OPERATOR_SUPPLIED_LOCATORS",
 		StableIdentity: "content:" + item.entry.Content.ContentID,
 		BindingDigest:  digest,
 		Metadata:       bindingMetadata,
 	}); err != nil {
-		return err
+		return "", err
 	}
 	for _, prepared := range item.externalLocators {
 		locator := prepared.locator
@@ -181,22 +186,22 @@ func insertPreparedProtection(ctx context.Context, tx *sqlite.Tx, workspaceID st
 			ValidationStatus:      "UNVALIDATED",
 			Metadata:              json.RawMessage(`{"operator_supplied":true}`),
 		}); err != nil {
-			return err
+			return "", err
 		}
 	}
 	recipe, verification, err := externalRecoveryRecords(item, digest)
 	if err != nil {
-		return err
+		return "", err
 	}
 	priority := int64(0)
 	if item.recoveryID != "" {
 		priority = 1
 	}
-	return tx.InsertRecoveryReference(ctx, &sqlite.RecoveryReference{
+	if err := tx.InsertRecoveryReference(ctx, &sqlite.RecoveryReference{
 		ID:                    item.externalRecoveryID,
 		WorkspaceID:           workspaceID,
-		ProtectionRecordID:    item.protectionID,
-		SubjectRef:            item.namespaceID,
+		ProtectionRecordID:    protection.ID,
+		SubjectRef:            item.subjectRef,
 		Kind:                  sqlite.RecoveryExternalLocator,
 		Priority:              priority,
 		Claim:                 sqlite.RecoveryClaimLinkOnlyUnprotected,
@@ -209,7 +214,10 @@ func insertPreparedProtection(ctx context.Context, tx *sqlite.Tx, workspaceID st
 		PolicyRef:             protectionPolicyRef(item),
 		OperatorDecisionRef:   "operator:ingest",
 		RecordDigest:          digest,
-	})
+	}); err != nil {
+		return "", err
+	}
+	return protection.ID, nil
 }
 
 func ingestLocators(items []preparedLocator) []IngestLocator {

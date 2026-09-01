@@ -137,6 +137,9 @@ func (d *puregoZvecGenerationDriver) Build(ctx context.Context, spec ZvecGenerat
 	if err := validateZvecSegments(segments, spec.Manifest.Dimension); err != nil {
 		return ZvecGenerationReceipt{}, err
 	}
+	if err := validateZvecSegmentVectors(segments, spec.Manifest); err != nil {
+		return ZvecGenerationReceipt{}, err
+	}
 	if err := d.prepare(spec); err != nil {
 		return ZvecGenerationReceipt{}, err
 	}
@@ -244,11 +247,14 @@ func (d *puregoZvecGenerationDriver) buildNative(spec ZvecGenerationSpec, segmen
 	}
 	closed = true
 	segmentIDs := make([]string, 0, len(segments))
+	identities := make([]ZvecCoverageIdentity, 0, len(segments))
 	for _, segment := range segments {
 		segmentIDs = append(segmentIDs, segment.SegmentID)
+		identities = append(identities, ZvecCoverageIdentity{SubjectID: segment.SubjectID, SegmentID: segment.SegmentID})
 	}
 	sort.Strings(segmentIDs)
-	metadata := zvecGenerationMetadata{Schema: zvecGenerationMetadataSchema, Path: spec.Path, LibraryDigest: spec.LibraryDigest, ProfileDigest: spec.ProfileDigest, Manifest: spec.Manifest, SegmentIDs: segmentIDs}
+	sort.Slice(identities, func(i, j int) bool { return identities[i].SegmentID < identities[j].SegmentID })
+	metadata := zvecGenerationMetadata{Schema: zvecGenerationMetadataSchema, Path: spec.Path, LibraryDigest: spec.LibraryDigest, ProfileDigest: spec.ProfileDigest, Manifest: spec.Manifest, SegmentIDs: segmentIDs, Identities: identities}
 	if err := writeZvecGenerationMetadata(spec.Path, metadata); err != nil {
 		return ZvecGenerationReceipt{}, fmt.Errorf("%w: write generation metadata: %v", ErrZvecUnavailable, err)
 	}
@@ -260,6 +266,21 @@ func (d *puregoZvecGenerationDriver) buildNative(spec ZvecGenerationSpec, segmen
 // callers still intersect them with durable segments before claiming full
 // coverage.
 func (d *puregoZvecGenerationDriver) Coverage(ctx context.Context, spec ZvecGenerationSpec) ([]string, error) {
+	identities, err := d.CoveragePairs(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(identities))
+	for _, identity := range identities {
+		ids = append(ids, identity.SegmentID)
+	}
+	return ids, nil
+}
+
+// CoveragePairs returns subject-bound identities from the immutable metadata
+// written alongside the generation. Generations carrying only the legacy
+// segment_ids field remain queryable, but cannot claim complete coverage.
+func (d *puregoZvecGenerationDriver) CoveragePairs(ctx context.Context, spec ZvecGenerationSpec) ([]ZvecCoverageIdentity, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -269,9 +290,12 @@ func (d *puregoZvecGenerationDriver) Coverage(ctx context.Context, spec ZvecGene
 	if err != nil {
 		return nil, err
 	}
-	if err := opened.Close(); err != nil {
-		return nil, fmt.Errorf("%w: close generation for coverage: %v", ErrZvecUnavailable, err)
+	generation, ok := opened.(*puregoZvecGeneration)
+	if !ok || generation == nil || generation.collection == nil {
+		_ = opened.Close()
+		return nil, fmt.Errorf("%w: generation does not expose collection coverage", ErrZvecUnavailable)
 	}
+	defer func() { _ = opened.Close() }()
 	metadata, err := readZvecGenerationMetadata(spec.Path)
 	if err != nil {
 		return nil, err
@@ -279,7 +303,126 @@ func (d *puregoZvecGenerationDriver) Coverage(ctx context.Context, spec ZvecGene
 	if metadata.Path != spec.Path || metadata.LibraryDigest != spec.LibraryDigest || metadata.ProfileDigest != spec.ProfileDigest {
 		return nil, fmt.Errorf("%w: generation metadata does not match coverage spec", ErrZvecUnavailable)
 	}
-	return append([]string(nil), metadata.SegmentIDs...), nil
+	if len(metadata.Identities) == 0 {
+		return nil, fmt.Errorf("%w: generation metadata lacks subject/segment identity pairs", ErrZvecUnavailable)
+	}
+	stats, err := generation.collection.GetStats()
+	if err != nil || stats == nil {
+		return nil, fmt.Errorf("%w: read generation document count: %v", ErrZvecUnavailable, err)
+	}
+	if stats.DocCount != uint64(len(metadata.Identities)) {
+		return nil, fmt.Errorf("%w: generation document count %d does not match metadata identity count %d", ErrZvecUnavailable, stats.DocCount, len(metadata.Identities))
+	}
+
+	if err := validateZvecCollectionRows(generation.collection, metadata.Identities); err != nil {
+		return nil, err
+	}
+	return append([]ZvecCoverageIdentity(nil), metadata.Identities...), nil
+}
+
+// VerifyMembership checks only the supplied query candidates against the
+// generation's bound identity metadata and actual collection rows. It is
+// intentionally bounded by the caller's result set and never loads vectors.
+func (d *puregoZvecGenerationDriver) VerifyMembership(ctx context.Context, spec ZvecGenerationSpec, candidates []ZvecCoverageIdentity) error {
+	if len(candidates) == 0 {
+		return nil
+	}
+	opened, err := d.Open(ctx, spec)
+	if err != nil {
+		return err
+	}
+	generation, ok := opened.(*puregoZvecGeneration)
+	if !ok || generation == nil || generation.collection == nil {
+		_ = opened.Close()
+		return fmt.Errorf("%w: generation does not expose collection membership", ErrZvecUnavailable)
+	}
+	defer func() { _ = opened.Close() }()
+	metadata, err := readZvecGenerationMetadata(spec.Path)
+	if err != nil {
+		return err
+	}
+	if len(metadata.Identities) == 0 {
+		return fmt.Errorf("%w: generation metadata lacks subject/segment identity pairs", ErrZvecUnavailable)
+	}
+	bound := make(map[string]ZvecCoverageIdentity, len(metadata.Identities))
+	for _, identity := range metadata.Identities {
+		bound[identity.SegmentID] = identity
+	}
+	for _, candidate := range candidates {
+		identity, exists := bound[candidate.SegmentID]
+		if !exists || identity.SubjectID != candidate.SubjectID {
+			return fmt.Errorf("%w: query candidate subject/segment is not bound to generation", ErrZvecUnavailable)
+		}
+	}
+	return validateZvecCollectionRows(generation.collection, candidates)
+}
+
+const zvecCoverageFetchBatchSize = 256
+
+// validateZvecCollectionCoverage verifies the metadata identities against
+// the actual immutable collection rows. The vector field is intentionally
+// omitted from Fetch: coverage proves row identity, not vector contents.
+func validateZvecCollectionRows(collection *zvec.Collection, identities []ZvecCoverageIdentity) error {
+	if collection == nil {
+		return fmt.Errorf("%w: collection is nil", ErrZvecUnavailable)
+	}
+	if err := validateZvecCoverageIdentities(identities); err != nil {
+		return err
+	}
+	want := make(map[string]ZvecCoverageIdentity, len(identities))
+	primaryKeys := make([]string, 0, len(identities))
+	for _, identity := range identities {
+		want[identity.SegmentID] = identity
+		primaryKeys = append(primaryKeys, identity.SegmentID)
+	}
+	seen := make(map[string]struct{}, len(identities))
+	for start := 0; start < len(primaryKeys); start += zvecCoverageFetchBatchSize {
+		end := start + zvecCoverageFetchBatchSize
+		if end > len(primaryKeys) {
+			end = len(primaryKeys)
+		}
+		docs, err := collection.Fetch(primaryKeys[start:end], &zvec.FetchOptions{OutputFields: []string{ZvecSubjectField, ZvecSegmentField}})
+		if err != nil {
+			zvec.FreeDocs(docs)
+			return fmt.Errorf("%w: fetch generation identity rows: %v", ErrZvecUnavailable, err)
+		}
+		if len(docs) != end-start {
+			zvec.FreeDocs(docs)
+			return fmt.Errorf("%w: fetched %d identity rows, want %d", ErrZvecUnavailable, len(docs), end-start)
+		}
+		for _, doc := range docs {
+			if doc == nil {
+				zvec.FreeDocs(docs)
+				return fmt.Errorf("%w: collection returned a nil identity row", ErrZvecUnavailable)
+			}
+			primary := doc.GetPK()
+			subject, subjectErr := doc.GetStringField(ZvecSubjectField)
+			segment, segmentErr := doc.GetStringField(ZvecSegmentField)
+			if subjectErr != nil || segmentErr != nil || strings.TrimSpace(primary) == "" || strings.TrimSpace(subject) == "" || strings.TrimSpace(segment) == "" {
+				zvec.FreeDocs(docs)
+				return fmt.Errorf("%w: collection identity row is incomplete", ErrZvecUnavailable)
+			}
+			if primary != segment {
+				zvec.FreeDocs(docs)
+				return fmt.Errorf("%w: collection primary key %q differs from segment field %q", ErrZvecUnavailable, primary, segment)
+			}
+			identity, known := want[segment]
+			if !known || identity.SubjectID != subject {
+				zvec.FreeDocs(docs)
+				return fmt.Errorf("%w: collection subject/segment identity mismatch for %q", ErrZvecUnavailable, segment)
+			}
+			if _, duplicate := seen[segment]; duplicate {
+				zvec.FreeDocs(docs)
+				return fmt.Errorf("%w: collection returned duplicate segment identity %q", ErrZvecUnavailable, segment)
+			}
+			seen[segment] = struct{}{}
+		}
+		zvec.FreeDocs(docs)
+	}
+	if len(seen) != len(want) {
+		return fmt.Errorf("%w: collection identity rows are incomplete", ErrZvecUnavailable)
+	}
+	return nil
 }
 
 func (d *puregoZvecGenerationDriver) Open(ctx context.Context, spec ZvecGenerationSpec) (ZvecGeneration, error) {

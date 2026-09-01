@@ -24,15 +24,36 @@ func (d *Dispatcher) handleRepresentationList(ctx context.Context, env command.E
 	if err := requireStableID("workspace_id", input.WorkspaceID); err != nil {
 		return invalidInputResult(env, started, err)
 	}
-	subjectRef := firstNonEmpty(input.SubjectRef, input.EntryID)
+	if input.SubjectRef != "" && input.EntryID != "" {
+		return invalidInputResult(env, started, errString("subject_ref and entry_id are mutually exclusive"))
+	}
+	subjectRef := input.SubjectRef
+	if subjectRef == "" {
+		subjectRef = input.EntryID
+	}
 	fileVersionID := strings.TrimSpace(input.FileVersionID)
 	if subjectRef == "" && fileVersionID == "" {
 		return invalidInputResult(env, started, errString("subject_ref, entry_id, or file_version_id is required"))
 	}
-	if subjectRef != "" {
+	if input.SubjectRef != "" {
 		if err := requireStableID("subject_ref", subjectRef); err != nil {
 			return invalidInputResult(env, started, err)
 		}
+		entry, err := d.resolveSubject(ctx, input.WorkspaceID, subjectRef)
+		if err != nil {
+			return namespaceLookupResult(env, started, err)
+		}
+		subjectRef = entry.SubjectRef
+	}
+	if input.EntryID != "" && input.SubjectRef == "" {
+		if err := requireStableID("entry_id", input.EntryID); err != nil {
+			return invalidInputResult(env, started, err)
+		}
+		entry, err := d.store.GetNamespaceEntry(ctx, input.WorkspaceID, input.EntryID)
+		if err != nil {
+			return namespaceLookupResult(env, started, err)
+		}
+		subjectRef = entry.SubjectRef
 	}
 	if fileVersionID != "" {
 		if err := requireStableID("file_version_id", fileVersionID); err != nil {
@@ -42,8 +63,14 @@ func (d *Dispatcher) handleRepresentationList(ctx context.Context, env command.E
 
 	var contentID string
 	var authoritativeID string
+	var err error
 	if subjectRef != "" {
-		entry, err := d.store.GetNamespaceEntry(ctx, input.WorkspaceID, subjectRef)
+		var entry sqlite.NamespaceEntry
+		if input.SubjectRef != "" {
+			entry, err = d.resolveSubject(ctx, input.WorkspaceID, subjectRef)
+		} else {
+			entry, err = d.store.GetNamespaceEntry(ctx, input.WorkspaceID, input.EntryID)
+		}
 		if err != nil {
 			return namespaceLookupResult(env, started, err)
 		}
@@ -80,7 +107,6 @@ func (d *Dispatcher) handleRepresentationList(ctx context.Context, env command.E
 	}
 
 	var records []sqlite.Representation
-	var err error
 	if fileVersionID != "" {
 		records, err = d.representationsForFileVersion(ctx, input.WorkspaceID, fileVersionID, authoritativeID)
 	} else {

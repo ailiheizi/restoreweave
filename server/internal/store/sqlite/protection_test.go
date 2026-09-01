@@ -136,6 +136,74 @@ func TestProtectionRecoveryAndExternalBindingRoundTrip(t *testing.T) {
 	}
 }
 
+func TestUpsertProtectionRecordRetainsIdentityAndAdvancesRevision(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t, filepath.Join(t.TempDir(), "upsert.sqlite"))
+	defer store.Close()
+	workspace := Workspace{ID: testID(t, IDPrefixWorkspace), Name: "Protection upsert workspace"}
+	if err := store.Update(ctx, func(tx *Tx) error { return tx.InsertWorkspace(ctx, &workspace) }); err != nil {
+		t.Fatal(err)
+	}
+	firstRepresentation := &Representation{
+		ID: testID(t, IDPrefixRepresentation), WorkspaceID: workspace.ID,
+		ContentID: "sha256:first", DecodedLength: 5,
+		OwnershipMode: OwnershipRestoreWeavePacks, CodecProfileRef: "raw-v1",
+		AccessMode: AccessWholeObjectOnly, RecordDigest: "sha256:rep-first",
+	}
+	secondRepresentation := &Representation{
+		ID: testID(t, IDPrefixRepresentation), WorkspaceID: workspace.ID,
+		ContentID: "sha256:second", DecodedLength: 6,
+		OwnershipMode: OwnershipRestoreWeavePacks, CodecProfileRef: "raw-v1",
+		AccessMode: AccessWholeObjectOnly, RecordDigest: "sha256:rep-second",
+	}
+	if err := store.Update(ctx, func(tx *Tx) error {
+		if err := tx.InsertRepresentation(ctx, firstRepresentation); err != nil {
+			return err
+		}
+		return tx.InsertRepresentation(ctx, secondRepresentation)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	subject := testID(t, IDPrefixSubject)
+	first := &ProtectionRecord{
+		ID: testID(t, IDPrefixProtectionRecord), WorkspaceID: workspace.ID, SubjectRef: subject,
+		Mode: ProtectionStoreExact, Outcome: ProtectionExactProtected,
+		ExpectedContentID: firstRepresentation.ContentID, ExpectedLogicalLength: int64Ptr(5),
+		LocalRepresentationID: firstRepresentation.ID, PolicyDecisionRef: "policy:first",
+		LastVerificationRef: "verify:first", Metadata: json.RawMessage(`{"round":1}`),
+	}
+	stored, err := store.UpsertProtectionRecord(ctx, first)
+	if err != nil {
+		t.Fatalf("first upsert: %v", err)
+	}
+	if stored.ID != first.ID || stored.Revision != 1 {
+		t.Fatalf("first upsert = %+v", stored)
+	}
+	createdAt := stored.CreatedAt
+	second := &ProtectionRecord{
+		ID: testID(t, IDPrefixProtectionRecord), WorkspaceID: workspace.ID, SubjectRef: subject,
+		Mode: ProtectionStoreExact, Outcome: ProtectionExactProtected,
+		ExpectedContentID: secondRepresentation.ContentID, ExpectedLogicalLength: int64Ptr(6),
+		LocalRepresentationID: secondRepresentation.ID, PolicyDecisionRef: "policy:second",
+		LastVerificationRef: "verify:second", Metadata: json.RawMessage(`{"round":2}`),
+	}
+	updated, err := store.UpsertProtectionRecord(ctx, second)
+	if err != nil {
+		t.Fatalf("second upsert: %v", err)
+	}
+	if updated.ID != first.ID || updated.Revision != 2 || !updated.CreatedAt.Equal(createdAt) {
+		t.Fatalf("updated protection identity = %+v, want id %q revision 2", updated, first.ID)
+	}
+	got, err := store.GetProtectionRecordBySubject(ctx, workspace.ID, subject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.LocalRepresentationID != secondRepresentation.ID || got.ExpectedContentID != secondRepresentation.ContentID ||
+		got.Revision != 2 || string(got.Metadata) != `{"round":2}` {
+		t.Fatalf("current protection projection = %+v", got)
+	}
+}
+
 func TestLinkOnlyProtectionRequiresVisibleNonExactOutcome(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t, ":memory:")

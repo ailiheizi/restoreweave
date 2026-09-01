@@ -490,6 +490,61 @@ func TestPackageSemanticBundleRejectsUntrustedSourcesAndDestination(t *testing.T
 	}
 }
 
+func TestPackageSemanticBundleRejectsAssetPathBeforeStageWrite(t *testing.T) {
+	paths := []string{"../escape", "/tmp/escape", "nested/../escape", "nested//escape", "./escape", "semantic-bundle.json"}
+	for _, path := range paths {
+		t.Run(strings.ReplaceAll(path, "/", "_"), func(t *testing.T) {
+			sourceRoot, descriptor := testSemanticBundle(t)
+			sources := make(map[string]string, len(descriptor.assets()))
+			for _, entry := range descriptor.assets() {
+				sources[entry.Name] = filepath.Join(sourceRoot, filepath.FromSlash(entry.Asset.Path))
+			}
+			descriptor.Model.Path = path
+			destinationParent := t.TempDir()
+			destination := filepath.Join(destinationParent, "installed", "semantic")
+			if _, err := PackageSemanticBundle(destination, descriptor, sources); err == nil {
+				t.Fatalf("asset path %q was accepted", path)
+			}
+			if _, err := os.Stat(filepath.Join(destinationParent, "escape")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("escaped asset was written for %q: %v", path, err)
+			}
+		})
+	}
+}
+
+func TestValidateSemanticBundleInstallDestinationRejectsSymlinkEscape(t *testing.T) {
+	modelsRoot := filepath.Join(t.TempDir(), "models")
+	if err := os.MkdirAll(modelsRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	link := filepath.Join(modelsRoot, "link")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(link, "bundle")
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateSemanticBundleInstallDestination(modelsRoot, destination); err == nil {
+		t.Fatal("destination through an escaping symlink was accepted")
+	}
+}
+
+func TestValidateSemanticBundleInstallDestinationAllowsResolvedAliasBoundary(t *testing.T) {
+	root := t.TempDir()
+	destination := filepath.Join(root, "bundle")
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateSemanticBundleInstallDestination(root, destination); err != nil {
+		t.Fatalf("valid destination rejected: %v", err)
+	}
+}
+
 func testSemanticBundle(t *testing.T) (string, SemanticBundleDescriptor) {
 	t.Helper()
 	root := t.TempDir()

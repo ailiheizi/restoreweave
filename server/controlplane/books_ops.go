@@ -36,7 +36,7 @@ func (d *Dispatcher) handleBooksList(ctx context.Context, env command.Envelope, 
 	works := make([]command.BookWork, 0)
 	for _, artifact := range artifacts {
 		name := ""
-		if entry, err := d.store.GetNamespaceEntry(ctx, input.WorkspaceID, artifact.SubjectRef); err == nil {
+		if entry, err := d.resolveSubject(ctx, input.WorkspaceID, artifact.SubjectRef); err == nil {
 			name = entry.DisplayName
 		}
 		switch artifact.CapabilityID {

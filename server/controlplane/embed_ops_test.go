@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ailiheizi/restoreweave/client/command"
@@ -61,6 +62,72 @@ func TestSemanticMultimodalFuse(t *testing.T) {
 		t.Fatalf("semantic payload = %+v", semanticData)
 	}
 	textRef := semanticData.Hits[0].SubjectRef
+
+	// Fixture dimensions prove only the broker/component contract. Real BGE
+	// readiness and inference remain covered by the provisioned integration
+	// tests and are not inferred from this deterministic fixture.
+	defaultFused := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
+		"workspace_id": ingestData.WorkspaceID,
+		"query":        "quarterly",
+	}))
+	if defaultFused.Status != command.StatusSucceeded {
+		t.Fatalf("default broker with fixture semantic = %q: %+v", defaultFused.Status, defaultFused.Reasons)
+	}
+	var defaultData command.SearchQueryData
+	if err := json.Unmarshal(defaultFused.Data, &defaultData); err != nil {
+		t.Fatalf("decode default broker: %v", err)
+	}
+	if defaultData.Provider != search.ProviderBrokerFuse || defaultData.Dimension != "" ||
+		len(defaultData.Components) != 2 ||
+		defaultData.Components[0].Dimension != search.DimensionLexical ||
+		defaultData.Components[0].Status != string(command.StatusSucceeded) ||
+		defaultData.Components[1].Dimension != search.DimensionSemantic ||
+		defaultData.Components[1].Status != string(command.StatusSucceeded) {
+		t.Fatalf("default broker components = %+v", defaultData)
+	}
+	foundDefaultText := false
+	for _, hit := range defaultData.Hits {
+		if hit.SubjectRef == textRef {
+			foundDefaultText = true
+			if len(hit.Dimensions) == 0 {
+				t.Fatalf("default fused hit missing provenance: %+v", hit)
+			}
+		}
+	}
+	if !foundDefaultText {
+		t.Fatalf("default broker hits missing text subject: %+v", defaultData.Hits)
+	}
+
+	lexicalGeneration, err := store.LatestIndexGeneration(ctx, ingestData.WorkspaceID, search.DimensionLexical)
+	if err != nil {
+		t.Fatalf("latest lexical generation: %v", err)
+	}
+	if err := os.Remove(lexicalGeneration.DBPath); err != nil {
+		t.Fatalf("remove lexical generation: %v", err)
+	}
+	lexicalMissing := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
+		"workspace_id": ingestData.WorkspaceID,
+		"query":        "quarterly experiment report",
+	}))
+	if lexicalMissing.Status != command.StatusDegraded || !hasReasonCode(lexicalMissing, ReasonCodeUnavailable) {
+		t.Fatalf("default broker without lexical = %q: %+v", lexicalMissing.Status, lexicalMissing.Reasons)
+	}
+	var lexicalMissingData command.SearchQueryData
+	if err := json.Unmarshal(lexicalMissing.Data, &lexicalMissingData); err != nil {
+		t.Fatalf("decode default broker without lexical: %v", err)
+	}
+	if len(lexicalMissingData.Components) != 2 ||
+		lexicalMissingData.Components[0].Status != string(command.StatusDegraded) ||
+		lexicalMissingData.Components[1].Status != string(command.StatusSucceeded) ||
+		len(lexicalMissingData.Hits) != 1 || lexicalMissingData.Hits[0].SubjectRef != textRef {
+		t.Fatalf("default broker without lexical payload = %+v", lexicalMissingData)
+	}
+	if len(lexicalMissing.Reasons) != 1 || strings.Contains(strings.ToLower(lexicalMissing.Reasons[0].Message), "semantic search is unavailable") {
+		t.Fatalf("default broker reported the wrong unavailable component: %+v", lexicalMissing.Reasons)
+	}
+	if _, err := dispatcher.search.Rebuild(ctx, ingestData.WorkspaceID, ingestData.SnapshotRef, ingestData.RootID); err != nil {
+		t.Fatalf("rebuild search after lexical-loss check: %v", err)
+	}
 
 	clipQuery := processor.ClipQueryText("Nightfall", "Example Artist")
 	multimodal := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
