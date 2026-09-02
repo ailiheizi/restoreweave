@@ -17,7 +17,7 @@ configure storage locations
 -> inspect a source to add to the content library
 -> approve a storage plan
 -> retain exact content and recoverable metadata
--> add Notes or Descriptions
+-> add Notes (including descriptive information)
 -> find content with ordinary filters and semantic search
 -> save a view and freeze an export manifest
 -> verify, export, or restore the original bytes
@@ -26,7 +26,7 @@ configure storage locations
 Three invariants define the core:
 
 1. **Identical bytes need only one stored object.** Exact identity is the full-content SHA-256 plus logical length. A filename, path, similarity score, embedding, or model output can never declare two files identical.
-2. **Search data is rebuildable.** Lexical and embedding indexes are projections. Removing them temporarily degrades search; it does not remove files, Notes, Descriptions, or recovery authority.
+2. **Search data is rebuildable.** Lexical and embedding indexes are projections. Removing them temporarily degrades search; it does not remove files, Notes, provenance records, or recovery authority.
 3. **Recovery does not depend on AI.** Even if the model, vector index, and live SQLite catalog are unavailable, a clean reader can authenticate and restore exact bytes when the repository, authenticated recovery records, and independently retained trust anchor remain intact.
 
 ## What works now
@@ -62,28 +62,29 @@ The list below is organized around user-visible work. Except where marked as a c
 - Protection preview separates logical bytes from bytes that actually need new repository placement.
 - Exact whole-file deduplication is the current default. Chunk deduplication is not presented as an existing feature or a core-completion requirement.
 
-### Notes, tags, Descriptions, and extraction
+### Notes, tags, and extracted information
 
-- Multiple editable, revisioned Notes for one file.
+- Multiple editable, revisioned Notes can be attached to one file.
 - Notes feed both ordinary and semantic search directly, without copying them into a hidden second record.
 - A content item may have multiple durable tags. The WebUI can create, reuse, and remove tags, with suggestions drawn from tag values already used in the workspace.
 - Format and type appear as deterministic system tags/facets rather than pretending to be user tags. Future AI classification must be previewed and confirmed and cannot silently replace manual tags.
 - The default library is content-first. Original directories remain provenance and a recovery projection under the secondary source-path browser, not the primary organization.
-- Versioned Descriptions retain source, language, producer, predecessor revision, and semantic segments.
-- User, imported, extracted, and model-attributed Descriptions can be retained. No Description generator is built in, and ingest never generates one automatically.
+- User-authored, imported, extracted, and model-produced text appears in the same Notes surface, with source, producer, or editability labels where relevant.
+- The backend still retains revisioned description records with source, language, producer, predecessor revision, and semantic segments for search, recovery, and audit; this is not a second user-facing concept.
+- AI description generation is never implicit: it runs only when explicitly requested, and ingest does not generate it automatically.
 - Basic built-in extraction covers UTF-8 text, ID3/FLAC/OGG audio tags, and EPUB OPF metadata.
 - Processor results carry provenance. Failure, timeout, or unavailability never grants content-identity or recovery authority.
 
 ### Lexical, structured, and semantic search
 
-- Search filename, original path, suffix, type, tags, Notes, Descriptions, and extracted text.
+- Search filename, original path, suffix, type, tags, Notes (including sourced text), and extracted text.
 - Filter by entry type, size, mtime, SHA-256, duplicate group, `protection_mode`, language, and suffix.
 - Lexical, structured, and semantic results resolve to the same stable subject.
-- Results preserve the matched Description segment or Note content and its source, not just an opaque score.
+- Results preserve the matched Notes content or extracted-text segment and its source, not just an opaque score.
 - With an explicitly provisioned and verified platform bundle, real local semantic vector generation and query using `BAAI/bge-small-zh-v1.5`, ONNX Runtime, and in-process zvec.
 - A real inference probe runs at daemon startup, and a compatible zvec generation can reopen after restart.
 - An unhealthy model, lease, or generation reports semantic search unavailable while lexical/structured search, exact protection, and recovery continue.
-- Every semantic generation is strictly bound to its embedding profile and configuration. Incompatible generations fail closed without rewriting old Notes, Descriptions, or subject identity.
+- Every semantic generation is strictly bound to its embedding profile and configuration. Incompatible generations fail closed without rewriting old durable Notes/description records or subject identity.
 
 ### Browse and bounded exact reads
 
@@ -132,7 +133,7 @@ open Add content
 -> search and add multiple Notes
 -> run a descriptive BGE semantic query
 -> inspect SHA-256 and protection state
--> configure storage paths, local BGE/online replacement profiles, Descriptions, recovery, and service options in Settings
+-> configure storage paths, local BGE/online replacement profiles, Notes, recovery, and service options in Settings
 -> validate and atomically update the same TOML profile, with an explicit restart notice when required
 -> Preview restore
 -> restore to a new empty directory and verify
@@ -170,7 +171,7 @@ RestoreWeave keeps the number of physical entities small, while giving each one 
 | Data | Default shape | Rebuildable? | Purpose |
 | --- | --- | --- | --- |
 | Configuration | `config.toml` | Not inferable from content | Selects every location and profile |
-| Catalog | One SQLite file | Partly recoverable from authenticated records | Subjects, paths, facts, Notes, Descriptions, plans, and state |
+| Catalog | One SQLite file | Partly recoverable from authenticated records | Subjects, paths, facts, Notes and backend description records, plans, and state |
 | Content repository | Configured repository directory | Not rebuildable from indexes | Original exact bytes and authenticated records |
 | Lexical index | Separate SQLite FTS generation | Yes | Text and structured search |
 | Semantic index | zvec generation | Yes | BGE embedding search |
@@ -184,7 +185,7 @@ Catalog, repository, and index are separate logical layers; they do not require 
 
 | Missing data | Result |
 | --- | --- |
-| Lexical/zvec indexes removed | Search degrades; files, Notes, Descriptions, and recovery remain, and indexes can rebuild |
+| Lexical/zvec indexes removed | Search degrades; files, Notes, provenance records, and recovery remain, and indexes can rebuild |
 | BGE/ONNX/zvec bundle unavailable | Semantic search is unavailable; lexical search, protection, verification, and restore continue |
 | SQLite catalog unavailable | Daily search and editing are unavailable; a clean reader can still verify and restore when the repository, exported recovery reference, and independent trust anchor remain |
 | Repository payload missing | Recovery records cannot recreate source bytes from nothing; the affected content is not restorable |
@@ -198,7 +199,7 @@ Catalog, repository, and index are separate logical layers; they do not require 
 | Capability | Status |
 | --- | --- |
 | Config, scan, plans, SHA-256 identity, whole-file dedup, exact protection | Implemented and tested for the development profile |
-| Notes/Descriptions and lexical/structured search | Implemented and tested for the stated field scope |
+| Notes presentation, backend description records, and lexical/structured search | Implemented and tested for the stated field scope |
 | BGE-small-zh + ONNX + zvec | Implemented and tested with an explicitly provisioned real bundle; not packaged yet |
 | Signed recovery, clean reader, tamper rejection, fencing, reconciliation | Implemented and tested for the admitted development profile |
 | SavedView, ExportManifest, materialize/verify | Implemented and tested for local scope; not release-qualified |

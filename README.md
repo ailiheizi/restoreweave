@@ -17,7 +17,7 @@ RestoreWeave 不是网盘文件系统，也不是 OpenList、媒体服务器或�
 -> 检查要加入内容库的来源
 -> 确认存储计划
 -> 保存精确文件内容和可恢复元数据
--> 添加 Note 或 Description
+-> 添加 Notes（包括备注和描述性信息）
 -> 用普通条件和语义搜索找到内容
 -> 保存视图并冻结导出清单
 -> 校验、导出或恢复原始字节
@@ -26,7 +26,7 @@ RestoreWeave 不是网盘文件系统，也不是 OpenList、媒体服务器或�
 它有三个不会改变的核心原则：
 
 1. **相同字节只需要保存一份。** 文件身份由完整内容的 SHA-256 和长度决定；文件名、路径、相似度、embedding 和模型输出都不能把两个文件认定为同一个文件。
-2. **搜索信息可以重建。** 普通索引和 embedding 索引是投影。删除它们会让搜索暂时降级，但不会删除文件、Note、Description 或恢复依据。
+2. **搜索信息可以重建。** 普通索引和 embedding 索引是投影。删除它们会让搜索暂时降级，但不会删除文件、Notes、后台来源记录或恢复依据。
 3. **恢复不依赖 AI。** 即使模型、向量索引和运行中的 SQLite 不可用，只要内容仓库、认证恢复记录和独立保管的 trust anchor 完整，clean reader 仍可验证并恢复精确字节。
 
 ## 现在能做什么
@@ -62,28 +62,29 @@ RestoreWeave 不是网盘文件系统，也不是 OpenList、媒体服务器或�
 - 保护预览会区分逻辑字节和真正需要新增的仓库字节。
 - 当前默认是整文件精确去重；chunk dedup 不是核心完成条件，也没有被伪装成现有能力。
 
-### Note、标签、Description 和提取信息
+### Notes、标签和提取信息
 
-- 为同一个文件保存多个可编辑、带修订号的 Note。
-- Note 直接进入普通搜索和语义搜索，不需要复制成另一个隐藏字段。
+- 为同一个文件保存多个可编辑、带修订号的 Notes。
+- Notes 直接进入普通搜索和语义搜索，不需要复制成另一个隐藏字段。
 - 一个内容项可以拥有多个持久标签；WebUI 可创建、复用和移除标签，并从当前工作区已经使用的标签中给出候选。
 - 格式和类型作为确定性的系统标签/筛选项展示，不冒充用户标签；未来 AI 归类必须先预览并由用户确认，不能静默覆盖手工标签。
 - 默认首页按内容展示；原始目录只是来源证明和恢复投影，可在“按来源路径浏览”中查看，不承担日常组织。
-- 保存版本化 Description，保留来源、语言、producer、前一修订和语义分段。
-- 保存用户、导入、提取或标记为模型来源的 Description；当前不内置 Description 生成器，也不会在 ingest 时自动生成。
+- 用户、导入、提取和模型生成的文字都在同一个 Notes 区域展示，并带有来源、producer 或可编辑状态等提示。
+- 后台仍保留带修订、来源、语言、producer、前一修订和语义分段的描述记录，用于搜索、恢复和审计；它不是第二个用户界面概念。
+- AI 描述生成不是默认流程，只有用户主动请求时才运行；ingest 不会自动生成。
 - 内置基础提取器可处理 UTF-8 文本、ID3/FLAC/OGG 音频标签和 EPUB OPF 元数据。
 - Processor 结果带 provenance；失败、超时和不可用状态不会取得文件身份或恢复权限。
 
 ### 普通、结构化和语义搜索
 
-- 搜索文件名、原路径、后缀、类型、标签、Note、Description 和已提取文本。
+- 搜索文件名、原路径、后缀、类型、标签、Notes（包括来源文字）和已提取文本。
 - 按 entry type、大小、mtime、SHA-256、duplicate group、`protection_mode`、language 和 suffix 过滤。
 - 把 lexical、structured 和 semantic 结果映射回同一个稳定 subject。
-- 返回命中的 Description segment 或 Note 内容及其来源，而不只给一个不透明分数。
+- 返回命中的 Notes 内容或提取文本片段，并保留来源信息，而不只给一个不透明分数。
 - 显式提供并校验平台 bundle 后，使用真实的 `BAAI/bge-small-zh-v1.5`、ONNX Runtime 和进程内 zvec 完成本地语义向量生成和查询。
 - daemon 启动时执行真实推理探测，重启后可重新打开兼容的 zvec generation。
 - 模型、lease 或 generation 不健康时明确报告 semantic unavailable，并继续提供 lexical/structured search、精确保护和恢复。
-- 每个 semantic generation 都严格绑定 embedding profile 和配置；不兼容的 generation 会 fail closed，也不会改写旧 Note、Description 或 subject 身份。
+- 每个 semantic generation 都严格绑定 embedding profile 和配置；不兼容的 generation 会 fail closed，也不会改写旧的持久化 Notes/描述记录或 subject 身份。
 
 ### 浏览和精确读取
 
@@ -114,7 +115,7 @@ RestoreWeave 不是网盘文件系统，也不是 OpenList、媒体服务器或�
 
 ### 接口
 
-- **WebUI：** 查看服务和存储状态、按内容或来源路径浏览、预览/确认存储、搜索、查看路径/SHA/存储状态、维护多个标签和 Note、预览/确认整快照恢复。
+- **WebUI：** 查看服务和存储状态、按内容或来源路径浏览、预览/确认存储、搜索、查看路径/SHA/存储状态、维护多个标签和 Notes、预览/确认整快照恢复。
 - **CLI：** 初始化、诊断、脚本、完整计划/快照/view/export 和紧急恢复入口；不是未来日常使用必须依赖的主界面。
 - **MCP：** 本地 stdio 的只读检查、搜索、namespace、representation、annotation 和元数据入口。
 - **API：** 当前只有 loopback `GET /api/v1/healthz` 与 typed `POST /api/v1/command`，复用同一 dispatcher，可选 bearer token；它不是可直接暴露公网的完整 REST 平台。
@@ -129,10 +130,10 @@ RestoreWeave 不是网盘文件系统，也不是 OpenList、媒体服务器或�
 -> Preview protection
 -> 查看文件数、逻辑大小、新增空间和阻塞项
 -> Confirm protection
--> 搜索文件并添加多个 Note
+-> 搜索文件并添加多个 Notes
 -> 用描述性语句进行 BGE 语义搜索
 -> 查看 SHA-256 与保护状态
--> 在 Settings 中配置存储路径、本地 BGE/在线替换 profile、Description、恢复与服务选项
+-> 在 Settings 中配置存储路径、本地 BGE/在线替换 profile、Notes、恢复与服务选项
 -> 保存时校验并原子更新同一份 TOML；需要时明确提示重启
 -> Preview restore
 -> 恢复到新的空目录并校验
@@ -170,7 +171,7 @@ RestoreWeave 保持较少的物理实体，但它们职责不同：
 | 数据 | 默认位置/形态 | 是否可重建 | 用途 |
 | --- | --- | --- | --- |
 | 配置 | `config.toml` | 不能从内容自动推断 | 选择所有路径与 profile |
-| Catalog | 一个 SQLite 文件 | 部分可从认证记录恢复 | subject、路径、事实、Note、Description、计划与状态 |
+| Catalog | 一个 SQLite 文件 | 部分可从认证记录恢复 | subject、路径、事实、Notes 及后台描述记录、计划与状态 |
 | 内容仓库 | 配置的 repository 目录 | 不能从索引重建 | 原始精确字节和认证记录 |
 | Lexical index | 独立 SQLite FTS generation | 可以 | 普通文本和结构化搜索 |
 | Semantic index | zvec generation | 可以 | BGE embedding 搜索 |
@@ -184,7 +185,7 @@ RestoreWeave 保持较少的物理实体，但它们职责不同：
 
 | 丢失内容 | 结果 |
 | --- | --- |
-| 删除 lexical/zvec 索引 | 搜索降级；文件、Note、Description 和恢复能力仍在，可重建索引 |
+| 删除 lexical/zvec 索引 | 搜索降级；文件、Notes、后台描述记录和恢复能力仍在，可重建索引 |
 | BGE/ONNX/zvec bundle 不可用 | 语义搜索不可用；普通搜索、保护、校验和恢复继续工作 |
 | SQLite catalog 不可用 | 日常搜索和编辑不可用；保留 repository、导出的 recovery reference 与独立 trust anchor 时，clean reader 仍可验证和恢复 |
 | repository payload 丢失 | 恢复记录不能凭空重建原始字节；相应内容无法恢复 |
@@ -198,7 +199,7 @@ RestoreWeave 保持较少的物理实体，但它们职责不同：
 | 能力 | 状态 |
 | --- | --- |
 | 配置、扫描、计划、SHA-256 身份、整文件去重、精确保护 | 已在当前开发配置实现并测试 |
-| Note/Description、lexical/structured search | 已在当前字段范围实现并测试 |
+| Notes 展示、后台描述记录与 lexical/structured search | 已在当前字段范围实现并测试 |
 | BGE-small-zh + ONNX + zvec | 在显式 provision 的真实 bundle 上实现并测试；尚未随安装包提供 |
 | 签名恢复、clean reader、篡改拒绝、fencing、reconciliation | 已在 admitted development profile 实现并测试 |
 | SavedView、ExportManifest、materialize/verify | 本地范围实现并测试；未完成发行资格 |
