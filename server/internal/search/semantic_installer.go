@@ -24,17 +24,27 @@ import (
 )
 
 const (
-	semanticInstallerModelRevision   = "75c43b069aac4d136ba6bc1122f995fedcfd2781"
-	semanticInstallerBaseRevision    = "7999e1d3359715c523056ef9478215996d62a620"
-	semanticInstallerZvecCommit      = "f5c6c6cb3dca02b14bf406ca33b86e0c134c179f"
-	semanticInstallerBindingCommit   = "b4e0f0b495a4ad1eb8a2f61c0286b6e670771525"
-	semanticInstallerBindingDigest   = "c702ee797dbe5fe07125b2e9f30496ffcb9dff3559ababfe6ba382e4f7307091"
-	semanticInstallerHeaderDigest    = "acc0cf4b3f28d39339c76770d76164bb7a0637dc89f5fde764b4017b632f6743"
-	semanticInstallerModelDigest     = "69a0b846f4f116b5e6aabf9546ea6754d02264f3211a13a1bd69b31b8040749a"
-	semanticInstallerModelSize       = uint64(94851877)
-	semanticInstallerTokenizerDigest = "48cea5d44424912a6fd1ea647bf4fe50b55ab8b1e5879c3275f80e339e8fae26"
-	semanticInstallerTokenizerSize   = uint64(439125)
-	semanticInstallerHeaderSize      = uint64(398209)
+	semanticInstallerModelRevision = "75c43b069aac4d136ba6bc1122f995fedcfd2781"
+	semanticInstallerBaseRevision  = "7999e1d3359715c523056ef9478215996d62a620"
+	semanticInstallerZvecCommit    = "9199195b29dac4bf369bb16954464ddf2d73e932"
+	semanticInstallerZvecGoModule  = "github.com/zvec-ai/zvec-go"
+	// The upstream v0.6.0 tag moved; retain this 0.6.x pseudo-version as the
+	// immutable public proxy+sumdb-authenticated dependency. Do not re-resolve
+	// it with go get @commit or GOPROXY=direct.
+	semanticInstallerZvecGoModuleVersion = "v0.6.1-0.20260721023313-9199195b29da"
+	semanticInstallerBindingCommit       = "b4e0f0b495a4ad1eb8a2f61c0286b6e670771525"
+	semanticInstallerBindingDigest       = "c702ee797dbe5fe07125b2e9f30496ffcb9dff3559ababfe6ba382e4f7307091"
+	semanticInstallerHeaderDigest        = "acc0cf4b3f28d39339c76770d76164bb7a0637dc89f5fde764b4017b632f6743"
+	semanticInstallerModelDigest         = "69a0b846f4f116b5e6aabf9546ea6754d02264f3211a13a1bd69b31b8040749a"
+	semanticInstallerModelSize           = uint64(94851877)
+	semanticInstallerTokenizerDigest     = "48cea5d44424912a6fd1ea647bf4fe50b55ab8b1e5879c3275f80e339e8fae26"
+	semanticInstallerTokenizerSize       = uint64(439125)
+	semanticInstallerHeaderSize          = uint64(398209)
+	// This receipt is generated from the immutable zvec-go module identity
+	// above. Keep both facts pinned: a self-consistent descriptor cannot make a
+	// replaced provenance receipt admissible.
+	semanticInstallerZvecGoReceiptDigest = "c4844b64f066fc24daf39d274bf380fe08cfcf37facb08509a74d724cafb2092"
+	semanticInstallerZvecGoReceiptSize   = uint64(134)
 
 	semanticInstallerORTVersion          = "1.29.0"
 	semanticInstallerZvecVersion         = "0.6.0"
@@ -113,27 +123,33 @@ func semanticBundleInstallPlatformFor(goos, goarch string) (semanticBundleInstal
 	zbase := "https://github.com/zvec-ai/zvec-go/releases/download/v0.6.0/"
 	switch {
 	case goos == "darwin" && goarch == "arm64":
-		return semanticBundleInstallPlatform{goos, goarch,
-			base + "onnxruntime-osx-arm64-1.29.0.tgz", "d0706fc34f315d8c88639d0a8c81f2e09e815f282cabed3493c06a054352cf92",
-			zbase + "zvec-libs-darwin-arm64.tar.gz", "7ee1f84a2b044458f1d9864c54e80f320a1d2101829f7a744d30a43be25bd6a9",
-			"onnxruntime-cpu-darwin-arm64-1.29.0", "zvec-cpu-darwin-arm64-0.6.0"}, nil
+		return semanticBundleInstallPlatform{
+			OS: goos, Arch: goarch,
+			ORTURL: base + "onnxruntime-osx-arm64-1.29.0.tgz", ORTSHA: "d0706fc34f315d8c88639d0a8c81f2e09e815f282cabed3493c06a054352cf92",
+			ZvecURL: zbase + "zvec-libs-darwin-arm64.tar.gz", ZvecSHA: "7ee1f84a2b044458f1d9864c54e80f320a1d2101829f7a744d30a43be25bd6a9",
+			ORTBuild: "onnxruntime-cpu-darwin-arm64-1.29.0", ZvecBuild: "zvec-cpu-darwin-arm64-0.6.0",
+		}, nil
 	case goos == "linux" && goarch == "arm64":
-		return semanticBundleInstallPlatform{goos, goarch,
-			base + "onnxruntime-linux-aarch64-1.29.0.tgz", "e1799098ebc054b370f6176a450f158720f297818c613e5dc99b92e2ec82346f",
-			zbase + "zvec-libs-linux-arm64.tar.gz", "a3354e7eff8c8c43fcd04f00cd93829e178794256740752fcd9d47f0301225a3",
-			"onnxruntime-cpu-linux-arm64-1.29.0", "zvec-cpu-linux-arm64-0.6.0"}, nil
+		return semanticBundleInstallPlatform{
+			OS: goos, Arch: goarch,
+			ORTURL: base + "onnxruntime-linux-aarch64-1.29.0.tgz", ORTSHA: "e1799098ebc054b370f6176a450f158720f297818c613e5dc99b92e2ec82346f",
+			ZvecURL: zbase + "zvec-libs-linux-arm64.tar.gz", ZvecSHA: "a3354e7eff8c8c43fcd04f00cd93829e178794256740752fcd9d47f0301225a3",
+			ORTBuild: "onnxruntime-cpu-linux-arm64-1.29.0", ZvecBuild: "zvec-cpu-linux-arm64-0.6.0",
+		}, nil
 	case goos == "linux" && goarch == "amd64":
-		return semanticBundleInstallPlatform{goos, goarch,
-			base + "onnxruntime-linux-x64-1.29.0.tgz", "c3fddc4f139a045b0c4902c57410f0694f1c2fdf9b6939fbe38b1aeae7cd14ba",
-			zbase + "zvec-libs-linux-x64.tar.gz", "770009b0e79a2dc6d4b2278da7119d4e47493c8f52006f0289f87d3eee4078db",
-			"onnxruntime-cpu-linux-amd64-1.29.0", "zvec-cpu-linux-amd64-0.6.0"}, nil
+		return semanticBundleInstallPlatform{
+			OS: goos, Arch: goarch,
+			ORTURL: base + "onnxruntime-linux-x64-1.29.0.tgz", ORTSHA: "c3fddc4f139a045b0c4902c57410f0694f1c2fdf9b6939fbe38b1aeae7cd14ba",
+			ZvecURL: zbase + "zvec-libs-linux-x64.tar.gz", ZvecSHA: "770009b0e79a2dc6d4b2278da7119d4e47493c8f52006f0289f87d3eee4078db",
+			ORTBuild: "onnxruntime-cpu-linux-amd64-1.29.0", ZvecBuild: "zvec-cpu-linux-amd64-0.6.0",
+		}, nil
 	default:
 		return semanticBundleInstallPlatform{}, fmt.Errorf("%w: default semantic bundle is unavailable for %s/%s", ErrInvalidSemanticBundle, goos, goarch)
 	}
 }
 
 func installDefaultSemanticBundleForPlatform(ctx context.Context, modelsRoot string, platform semanticBundleInstallPlatform, client semanticBundleHTTPClient) (semanticBundleInstallResult, error) {
-	return installDefaultSemanticBundleForPlatformWithSpecs(ctx, modelsRoot, platform, client, semanticDefaultInstallDownloads(platform))
+	return installDefaultSemanticBundleForPlatformWithSpecsPolicy(ctx, modelsRoot, platform, client, semanticDefaultInstallDownloads(platform), true)
 }
 
 func semanticDefaultInstallDownloads(platform semanticBundleInstallPlatform) []semanticBundleInstallDownload {
@@ -147,6 +163,14 @@ func semanticDefaultInstallDownloads(platform semanticBundleInstallPlatform) []s
 }
 
 func installDefaultSemanticBundleForPlatformWithSpecs(ctx context.Context, modelsRoot string, platform semanticBundleInstallPlatform, client semanticBundleHTTPClient, downloads []semanticBundleInstallDownload) (semanticBundleInstallResult, error) {
+	return installDefaultSemanticBundleForPlatformWithSpecsPolicy(ctx, modelsRoot, platform, client, downloads, false)
+}
+
+// installDefaultSemanticBundleForPlatformWithSpecsPolicy keeps the test-only
+// specification seam separate from the real pinned installer.  The former is
+// intentionally allowed to use tiny synthetic archives; the latter must also
+// match the trusted extracted-binary manifest before it can be published.
+func installDefaultSemanticBundleForPlatformWithSpecsPolicy(ctx context.Context, modelsRoot string, platform semanticBundleInstallPlatform, client semanticBundleHTTPClient, downloads []semanticBundleInstallDownload, requirePinned bool) (semanticBundleInstallResult, error) {
 	if client == nil {
 		return semanticBundleInstallResult{}, fmt.Errorf("%w: HTTP client is required", ErrInvalidSemanticBundle)
 	}
@@ -155,14 +179,27 @@ func installDefaultSemanticBundleForPlatformWithSpecs(ctx context.Context, model
 		return semanticBundleInstallResult{}, err
 	}
 	destination := filepath.Join(modelsRoot, SemanticBundleBGEProfileID, platform.OS+"-"+platform.Arch)
+	if err := validateSemanticBundlePath(filepath.Dir(destination), true); err != nil {
+		return semanticBundleInstallResult{}, fmt.Errorf("%w: bundle parent: %v", ErrInvalidSemanticBundle, err)
+	}
+	var recoveryValidator func(SemanticBundleAdmission) error
+	if requirePinned {
+		recoveryValidator = func(admission SemanticBundleAdmission) error {
+			return validateSemanticInstallerPinnedAdmission(admission, platform)
+		}
+	}
+	if err := recoverSemanticBundleInstallWithValidator(destination, recoveryValidator); err != nil {
+		return semanticBundleInstallResult{}, err
+	}
 	if existing, err := LoadSemanticBundle(destination); err == nil {
-		if defaultSemanticBundleMatches(existing.Descriptor, platform) {
+		if semanticInstallerExistingMatches(existing, platform, downloads, requirePinned) {
 			return semanticBundleInstallResult{Destination: destination, Admission: existing}, nil
 		}
-		return semanticBundleInstallResult{}, fmt.Errorf("%w: existing bundle does not match pinned profile", ErrInvalidSemanticBundle)
 	} else if !errors.Is(err, os.ErrNotExist) {
-		if _, statErr := os.Lstat(destination); statErr == nil {
-			return semanticBundleInstallResult{}, fmt.Errorf("%w: existing bundle is invalid: %v", ErrInvalidSemanticBundle, err)
+		// A malformed or old bundle is replaceable, but is never removed.  It is
+		// moved aside only after the replacement has been completely staged.
+		if _, statErr := os.Lstat(destination); statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+			return semanticBundleInstallResult{}, fmt.Errorf("%w: inspect existing bundle: %v", ErrInvalidSemanticBundle, statErr)
 		}
 	}
 	// Check all existing ancestors before MkdirAll.  Creating the missing
@@ -185,6 +222,9 @@ func installDefaultSemanticBundleForPlatformWithSpecs(ctx context.Context, model
 
 	paths := make(map[string]string, len(downloads))
 	for _, spec := range downloads {
+		if err := ctx.Err(); err != nil {
+			return semanticBundleInstallResult{}, fmt.Errorf("%w: installation canceled: %v", ErrInvalidSemanticBundle, err)
+		}
 		path := filepath.Join(stage, spec.Name)
 		if err := downloadSemanticInstallerAsset(ctx, client, spec, path); err != nil {
 			return semanticBundleInstallResult{}, err
@@ -245,7 +285,46 @@ func installDefaultSemanticBundleForPlatformWithSpecs(ctx context.Context, model
 	if err != nil {
 		return semanticBundleInstallResult{}, err
 	}
-	sbom := map[string]any{"schema": "restoreweave.semantic-bundle.sbom.v1", "profile": SemanticBundleBGEProfileID, "base_model": "BAAI/bge-small-zh-v1.5@" + semanticInstallerBaseRevision, "onnx_converter_source": "Xenova/bge-small-zh-v1.5@" + semanticInstallerModelRevision, "assets": map[string]any{"onnxruntime_archive": map[string]any{"url": platform.ORTURL, "sha256": platform.ORTSHA}, "zvec_archive": map[string]any{"url": platform.ZvecURL, "sha256": platform.ZvecSHA}, "runtime": map[string]any{"sha256": runtimeDigest, "size": runtimeSize}, "zvec": map[string]any{"sha256": zvecDigest, "size": zvecSize}}}
+	if requirePinned {
+		if err := validateSemanticInstallerBinaryPin(platform, runtimeDigest, runtimeSize, zvecDigest, zvecSize); err != nil {
+			return semanticBundleInstallResult{}, err
+		}
+	}
+	// Keep the Go binding's module identity in the generated SBOM rather than
+	// relying on the descriptor's abbreviated version/commit fields.  The
+	// detached zvec-go.txt receipt is itself packaged and hashed, so a clean
+	// install can audit exactly which immutable dependency was used.
+	zvecGoPath := filepath.Join(stage, "zvec-go.txt")
+	if err := writeSemanticInstallerAsset(zvecGoPath, []byte("zvec-go 0.6.0\nmodule "+semanticInstallerZvecGoModule+" version "+semanticInstallerZvecGoModuleVersion+"\n"+semanticInstallerZvecCommit+"\n")); err != nil {
+		return semanticBundleInstallResult{}, err
+	}
+	zvecGoDigest, zvecGoSize, err := semanticFileDigest(zvecGoPath)
+	if err != nil {
+		return semanticBundleInstallResult{}, err
+	}
+	zvecGoAsset := map[string]any{"path": "zvec-go.txt", "sha256": zvecGoDigest, "size": zvecGoSize}
+	sbom := map[string]any{
+		"schema":                "restoreweave.semantic-bundle.sbom.v1",
+		"profile":               SemanticBundleBGEProfileID,
+		"base_model":            "BAAI/bge-small-zh-v1.5@" + semanticInstallerBaseRevision,
+		"onnx_converter_source": "Xenova/bge-small-zh-v1.5@" + semanticInstallerModelRevision,
+		"assets": map[string]any{
+			"onnxruntime_archive": map[string]any{"url": platform.ORTURL, "sha256": platform.ORTSHA},
+			"zvec_archive":        map[string]any{"url": platform.ZvecURL, "sha256": platform.ZvecSHA},
+			"runtime":             map[string]any{"sha256": runtimeDigest, "size": runtimeSize},
+			"zvec":                map[string]any{"sha256": zvecDigest, "size": zvecSize},
+			"zvec_go":             zvecGoAsset,
+		},
+		"dependencies": map[string]any{
+			"zvec_go": map[string]any{
+				"module":  semanticInstallerZvecGoModule,
+				"version": semanticInstallerZvecGoModuleVersion,
+				"commit":  semanticInstallerZvecCommit,
+				"license": "Apache-2.0",
+				"asset":   zvecGoAsset,
+			},
+		},
+	}
 	if err := writeSemanticInstallerJSON(generated["sbom.json"], sbom); err != nil {
 		return semanticBundleInstallResult{}, err
 	}
@@ -264,10 +343,6 @@ func installDefaultSemanticBundleForPlatformWithSpecs(ctx context.Context, model
 	assets["sbom"] = struct{ path, source string }{"sbom.json", generated["sbom.json"]}
 	// zvec-go.txt is intentionally a separate generated file, despite sharing
 	// the small staging directory. Its contents are the pinned zvec-go commit.
-	zvecGoPath := filepath.Join(stage, "zvec-go.txt")
-	if err := writeSemanticInstallerAsset(zvecGoPath, []byte("zvec-go 0.6.0\n"+semanticInstallerZvecCommit+"\n")); err != nil {
-		return semanticBundleInstallResult{}, err
-	}
 	assets["zvec_go"] = struct{ path, source string }{"zvec-go.txt", zvecGoPath}
 	for name, item := range assets {
 		asset, err := semanticInstallerAsset(item.path, item.source)
@@ -299,11 +374,353 @@ func installDefaultSemanticBundleForPlatformWithSpecs(ctx context.Context, model
 			descriptor.SBOM = asset
 		}
 	}
-	admission, err := PackageSemanticBundle(destination, descriptor, map[string]string{"runtime": assets["runtime"].source, "onnx_binding": assets["onnx_binding"].source, "onnx_c_api": assets["onnx_c_api"].source, "model": assets["model"].source, "tokenizer": assets["tokenizer"].source, "profile": assets["profile"].source, "zvec": assets["zvec"].source, "zvec_go": assets["zvec_go"].source, "license": assets["license"].source, "notice": assets["notice"].source, "sbom": assets["sbom"].source})
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		return semanticBundleInstallResult{}, fmt.Errorf("%w: create bundle parent: %v", ErrInvalidSemanticBundle, err)
+	}
+	if err := validateSemanticBundlePath(filepath.Dir(destination), false); err != nil {
+		return semanticBundleInstallResult{}, fmt.Errorf("%w: bundle parent: %v", ErrInvalidSemanticBundle, err)
+	}
+	// PackageSemanticBundle has its own private staging directory and refuses
+	// an existing destination.  Give it a unique sibling candidate, then swap
+	// that already-admitted tree into place below.  Thus no partially downloaded
+	// tree can ever be mistaken for a ready bundle.
+	candidate, err := semanticInstallerSiblingPath(filepath.Dir(destination), semanticInstallerCandidatePrefix)
+	if err != nil {
+		return semanticBundleInstallResult{}, fmt.Errorf("%w: candidate path: %v", ErrInvalidSemanticBundle, err)
+	}
+	defer os.RemoveAll(candidate)
+	admission, err := PackageSemanticBundle(candidate, descriptor, map[string]string{"runtime": assets["runtime"].source, "onnx_binding": assets["onnx_binding"].source, "onnx_c_api": assets["onnx_c_api"].source, "model": assets["model"].source, "tokenizer": assets["tokenizer"].source, "profile": assets["profile"].source, "zvec": assets["zvec"].source, "zvec_go": assets["zvec_go"].source, "license": assets["license"].source, "notice": assets["notice"].source, "sbom": assets["sbom"].source})
 	if err != nil {
 		return semanticBundleInstallResult{}, err
 	}
-	return semanticBundleInstallResult{Destination: destination, Admission: admission}, nil
+	if requirePinned {
+		if err := validateSemanticInstallerPinnedAdmission(admission, platform); err != nil {
+			return semanticBundleInstallResult{}, err
+		}
+	}
+	verify := func() error {
+		published, err := LoadSemanticBundle(destination)
+		if err != nil {
+			return err
+		}
+		if requirePinned {
+			if err := validateSemanticInstallerPinnedAdmission(published, platform); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := publishSemanticBundleReplacement(candidate, destination, verify); err != nil {
+		return semanticBundleInstallResult{}, err
+	}
+	published, err := LoadSemanticBundle(destination)
+	if err != nil {
+		return semanticBundleInstallResult{}, fmt.Errorf("%w: published bundle readback: %v", ErrInvalidSemanticBundle, err)
+	}
+	return semanticBundleInstallResult{Destination: destination, Admission: published}, nil
+}
+
+func semanticInstallerExistingMatches(existing SemanticBundleAdmission, platform semanticBundleInstallPlatform, downloads []semanticBundleInstallDownload, requirePinned bool) bool {
+	if !defaultSemanticBundleMatches(existing.Descriptor, platform) {
+		return false
+	}
+	if requirePinned {
+		return validateSemanticInstallerPinnedAdmission(existing, platform) == nil
+	}
+	// The private spec seam is used by tests with synthetic assets. Compare
+	// every directly downloaded payload so a changed test/profile manifest is
+	// not mistaken for an idempotent install. Archive digests are intentionally
+	// excluded: their extracted canonical library digest is the admission fact.
+	for _, spec := range downloads {
+		name := ""
+		switch spec.Name {
+		case "model.onnx":
+			name = "model"
+		case "tokenizer.json":
+			name = "tokenizer"
+		case "onnx-c-api.h":
+			name = "onnx_c_api"
+		}
+		if name != "" && existing.AssetDigests[name] != spec.SHA256 {
+			return false
+		}
+	}
+	return true
+}
+
+const (
+	semanticInstallerOldPrefix       = ".restoreweave-semantic-old-"
+	semanticInstallerActiveSuffix    = ".restoreweave-semantic-active-old"
+	semanticInstallerRejectedPrefix  = ".restoreweave-semantic-rejected-"
+	semanticInstallerCandidatePrefix = ".restoreweave-semantic-candidate-"
+)
+
+// semanticInstallerSiblingPath reserves a name without leaving a directory
+// at that name. It is used only for installer-owned candidates/backups; user
+// data is never removed to make room for one of these names.
+func semanticInstallerSiblingPath(parent, prefix string) (string, error) {
+	if err := validateSemanticBundlePath(parent, false); err != nil {
+		return "", err
+	}
+	path, err := os.MkdirTemp(parent, prefix)
+	if err != nil {
+		return "", err
+	}
+	if err := os.Remove(path); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func semanticInstallerActiveBackupPath(destination string) string {
+	return destination + semanticInstallerActiveSuffix
+}
+
+// recoverSemanticBundleInstall closes the only crash window in which the old
+// destination has been renamed aside but the new candidate has not yet been
+// published. The active backup has one deterministic name; historical copies
+// are never guessed during recovery. If a new destination was already
+// published before a crash, the active backup is finalized as history.
+func recoverSemanticBundleInstall(destination string) error {
+	return recoverSemanticBundleInstallWithValidator(destination, nil)
+}
+
+// recoverSemanticBundleInstallWithValidator is kept private so the synthetic
+// installer seam can retain its generic Load-only behavior. The fixed default
+// installer supplies a pinned validator: a self-consistent but non-default
+// live tree is an interrupted candidate, not a successful publication.
+func recoverSemanticBundleInstallWithValidator(destination string, validate func(SemanticBundleAdmission) error) error {
+	parent := filepath.Dir(destination)
+	active := semanticInstallerActiveBackupPath(destination)
+	if _, err := os.Lstat(active); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("%w: inspect active install backup: %v", ErrInvalidSemanticBundle, err)
+	}
+	activeInfo, err := os.Lstat(active)
+	if err != nil {
+		return fmt.Errorf("%w: inspect active install backup: %v", ErrInvalidSemanticBundle, err)
+	}
+	if !activeInfo.IsDir() || activeInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: active install backup is not a real directory", ErrInvalidSemanticBundle)
+	}
+	// Never restore a backup based only on its directory shape. Load performs
+	// complete descriptor/asset admission, including no-follow and digest
+	// checks. A pinned caller gets the stronger profile check before any rename.
+	activeAdmission, err := LoadSemanticBundle(active)
+	if err != nil {
+		return fmt.Errorf("%w: active install backup admission: %v", ErrInvalidSemanticBundle, err)
+	}
+	// The active tree is about to become the live destination in the
+	// interrupted-replacement case.  Validate it against the same admission
+	// policy before any rename, regardless of whether the destination is
+	// missing or merely malformed.  A generic-valid/non-pinned tree must never
+	// be restored into the fixed default path, even transiently.
+	if validate != nil {
+		if err := validate(activeAdmission); err != nil {
+			return fmt.Errorf("%w: active install backup is not admitted: %v", ErrInvalidSemanticBundle, err)
+		}
+	}
+	if _, err := os.Lstat(destination); errors.Is(err, os.ErrNotExist) {
+		if err := os.Rename(active, destination); err != nil {
+			return fmt.Errorf("%w: restore interrupted bundle: %v", ErrInvalidSemanticBundle, err)
+		}
+		if err := syncSemanticInstallerDirectory(parent); err != nil {
+			return fmt.Errorf("%w: persist recovered bundle: %v", ErrInvalidSemanticBundle, err)
+		}
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("%w: inspect destination: %v", ErrInvalidSemanticBundle, err)
+	}
+	// A valid live destination means the process reached the new publication
+	// before interruption. Keep the old tree, but move it to a historical
+	// sibling so only the deterministic active marker participates in recovery.
+	if admission, err := LoadSemanticBundle(destination); err == nil && (validate == nil || validate(admission) == nil) {
+		if _, err := finalizeSemanticBundleActiveBackup(destination); err != nil {
+			return err
+		}
+		return nil
+	}
+	// The live destination is an incomplete/corrupt candidate. Preserve it in
+	// a rejection sibling, then restore the active old tree before retrying.
+	rejected, err := semanticInstallerSiblingPath(parent, semanticInstallerRejectedPrefix)
+	if err != nil {
+		return fmt.Errorf("%w: reserve rejected bundle path: %v", ErrInvalidSemanticBundle, err)
+	}
+	if err := os.Rename(destination, rejected); err != nil {
+		return fmt.Errorf("%w: quarantine interrupted candidate: %v", ErrInvalidSemanticBundle, err)
+	}
+	if err := os.Rename(active, destination); err != nil {
+		return fmt.Errorf("%w: restore interrupted bundle: %v", ErrInvalidSemanticBundle, err)
+	}
+	if err := syncSemanticInstallerDirectory(parent); err != nil {
+		return fmt.Errorf("%w: persist recovered bundle: %v", ErrInvalidSemanticBundle, err)
+	}
+	return nil
+}
+
+func finalizeSemanticBundleActiveBackup(destination string) (bool, error) {
+	active := semanticInstallerActiveBackupPath(destination)
+	parent := filepath.Dir(destination)
+	history, err := semanticInstallerSiblingPath(parent, "."+filepath.Base(destination)+semanticInstallerOldPrefix)
+	if err != nil {
+		return false, fmt.Errorf("%w: reserve old bundle history path: %v", ErrInvalidSemanticBundle, err)
+	}
+	if err := os.Rename(active, history); err != nil {
+		return false, fmt.Errorf("%w: retain old bundle history: %v", ErrInvalidSemanticBundle, err)
+	}
+	if err := syncSemanticInstallerDirectory(parent); err != nil {
+		// The rename is complete and the new destination has already passed
+		// admission. Returning the fact that it happened prevents callers from
+		// trying to restore through the now-missing active marker.
+		return true, fmt.Errorf("%w: persist old bundle history: %v", ErrInvalidSemanticBundle, err)
+	}
+	return true, nil
+}
+
+// publishSemanticBundleReplacement swaps an already complete candidate into
+// the stable path. The old path is first isolated as a sibling, never deleted.
+// If the rename, directory sync, or post-publish verifier fails, the new tree
+// is quarantined and the old path is restored. Leaving a rejected tree aside
+// makes every failed state inspectable and avoids a false ready directory.
+func publishSemanticBundleReplacement(candidate, destination string, verify func() error) error {
+	parent := filepath.Dir(destination)
+	if err := validateSemanticBundlePath(parent, false); err != nil {
+		return fmt.Errorf("%w: install parent: %v", ErrInvalidSemanticBundle, err)
+	}
+	candidateInfo, err := os.Lstat(candidate)
+	if err != nil {
+		return fmt.Errorf("%w: inspect candidate: %v", ErrInvalidSemanticBundle, err)
+	}
+	if !candidateInfo.IsDir() || candidateInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: candidate must be a real directory", ErrInvalidSemanticBundle)
+	}
+	active := semanticInstallerActiveBackupPath(destination)
+	if _, activeErr := os.Lstat(active); activeErr == nil {
+		return fmt.Errorf("%w: active old bundle marker already exists", ErrInvalidSemanticBundle)
+	} else if !errors.Is(activeErr, os.ErrNotExist) {
+		return fmt.Errorf("%w: inspect active old bundle marker: %v", ErrInvalidSemanticBundle, activeErr)
+	}
+	var backup bool
+	if _, err := os.Lstat(destination); err == nil {
+		if err := os.Rename(destination, active); err != nil {
+			return fmt.Errorf("%w: isolate old bundle: %v", ErrInvalidSemanticBundle, err)
+		}
+		backup = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("%w: inspect old bundle: %v", ErrInvalidSemanticBundle, err)
+	}
+	restore := func(cause error) error {
+		if _, err := os.Lstat(destination); err == nil {
+			rejected, reserveErr := semanticInstallerSiblingPath(parent, semanticInstallerRejectedPrefix)
+			if reserveErr == nil {
+				if renameErr := os.Rename(destination, rejected); renameErr != nil {
+					reserveErr = renameErr
+				}
+			}
+			if reserveErr != nil {
+				return fmt.Errorf("%w; quarantine failed: %v", cause, reserveErr)
+			}
+		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%w; inspect failed candidate: %v", cause, err)
+		}
+		if backup {
+			if err := os.Rename(active, destination); err != nil {
+				return fmt.Errorf("%w; restore old bundle failed: %v", cause, err)
+			}
+			if err := syncSemanticInstallerDirectory(parent); err != nil {
+				return fmt.Errorf("%w; persist old bundle restore failed: %v", cause, err)
+			}
+		}
+		return cause
+	}
+	if err := os.Rename(candidate, destination); err != nil {
+		return restore(fmt.Errorf("%w: publish candidate: %v", ErrInvalidSemanticBundle, err))
+	}
+	if err := syncSemanticInstallerDirectory(parent); err != nil {
+		return restore(fmt.Errorf("%w: persist candidate publication: %v", ErrInvalidSemanticBundle, err))
+	}
+	if verify != nil {
+		if err := verify(); err != nil {
+			return restore(fmt.Errorf("%w: candidate readback: %v", ErrInvalidSemanticBundle, err))
+		}
+	}
+	if backup {
+		if renamed, err := finalizeSemanticBundleActiveBackup(destination); err != nil {
+			if renamed {
+				// The verified new tree and retained old history are the safest
+				// state after a post-rename durability error. There is no active
+				// marker left to restore, so do not quarantine the live bundle.
+				return err
+			}
+			return restore(err)
+		}
+	}
+	return nil
+}
+
+func syncSemanticInstallerDirectory(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+
+func semanticInstallerBinaryPin(platform semanticBundleInstallPlatform) (runtimeDigest string, runtimeSize uint64, zvecDigest string, zvecSize uint64) {
+	// Measured from each fixed archive's canonical regular library. These are
+	// intentionally separate from archive SHA so extraction/layout drift cannot
+	// bypass admission.
+	switch platform.OS + "/" + platform.Arch {
+	case "darwin/arm64":
+		return "c04fe65021445904a3cae047272cad05e648282c75bf1f9eb7b3440120ae13dc", 43184400, "c461a253d5b5dcf010c95847a56657930af2eaac94b5a30637bb0ae8574c00b3", 41594848
+	case "linux/arm64":
+		return "a27d21126db312aa8f02f3d5eaebe466e991f51f469882e6d0407d5a8b64afda", 24538024, "3d80fa6bbb193a37afe036c2c414cb3fed63c1ca02e1930aebd35265780e7189", 53714192
+	case "linux/amd64":
+		return "5715f06d8992ca8eeeddcce43df3a7d38f97d537052126f558e912cb312460ca", 28497752, "b2f3e406f9930ce0606e61dc69267bec26ea3cd9a56621688bc082076744626b", 59775584
+	default:
+		return "", 0, "", 0
+	}
+}
+
+func validateSemanticInstallerBinaryPin(platform semanticBundleInstallPlatform, runtimeDigest string, runtimeSize uint64, zvecDigest string, zvecSize uint64) error {
+	wantRuntimeDigest, wantRuntimeSize, wantZvecDigest, wantZvecSize := semanticInstallerBinaryPin(platform)
+	if wantRuntimeDigest == "" || wantZvecDigest == "" || wantRuntimeSize == 0 || wantZvecSize == 0 {
+		return fmt.Errorf("%w: no trusted extracted runtime/zvec binary pin for %s/%s", ErrInvalidSemanticBundle, platform.OS, platform.Arch)
+	}
+	if runtimeDigest != wantRuntimeDigest || runtimeSize != wantRuntimeSize {
+		return fmt.Errorf("%w: ONNX Runtime binary %s/%d does not match pinned %s/%d", ErrInvalidSemanticBundle, runtimeDigest, runtimeSize, wantRuntimeDigest, wantRuntimeSize)
+	}
+	if zvecDigest != wantZvecDigest || zvecSize != wantZvecSize {
+		return fmt.Errorf("%w: zvec binary %s/%d does not match pinned %s/%d", ErrInvalidSemanticBundle, zvecDigest, zvecSize, wantZvecDigest, wantZvecSize)
+	}
+	return nil
+}
+
+func validateSemanticInstallerPinnedAdmission(admission SemanticBundleAdmission, platform semanticBundleInstallPlatform) error {
+	if err := admission.Validate(); err != nil {
+		return err
+	}
+	if !defaultSemanticBundleMatches(admission.Descriptor, platform) {
+		return fmt.Errorf("%w: bundle facts do not match the pinned default", ErrInvalidSemanticBundle)
+	}
+	if err := validateSemanticInstallerBinaryPin(platform, admission.AssetDigests["runtime"], admission.Descriptor.Runtime.Size, admission.AssetDigests["zvec"], admission.Descriptor.Zvec.Size); err != nil {
+		return err
+	}
+	if admission.AssetDigests["model"] != semanticInstallerModelDigest || admission.Descriptor.Model.Size != semanticInstallerModelSize {
+		return fmt.Errorf("%w: model asset does not match the pinned default", ErrInvalidSemanticBundle)
+	}
+	if admission.AssetDigests["tokenizer"] != semanticInstallerTokenizerDigest || admission.Descriptor.Tokenizer.Size != semanticInstallerTokenizerSize {
+		return fmt.Errorf("%w: tokenizer asset does not match the pinned default", ErrInvalidSemanticBundle)
+	}
+	if admission.AssetDigests["onnx_c_api"] != semanticInstallerHeaderDigest || admission.Descriptor.ONNXCAPI.Size != semanticInstallerHeaderSize {
+		return fmt.Errorf("%w: ONNX C API asset does not match the pinned default", ErrInvalidSemanticBundle)
+	}
+	if admission.AssetDigests["zvec_go"] != semanticInstallerZvecGoReceiptDigest || admission.Descriptor.ZvecGo.Size != semanticInstallerZvecGoReceiptSize {
+		return fmt.Errorf("%w: zvec-go receipt does not match the pinned default", ErrInvalidSemanticBundle)
+	}
+	return nil
 }
 
 func canonicalSemanticBundleInstallRoot(root string) (string, error) {
@@ -328,7 +745,20 @@ func DefaultSemanticBundleDestination(modelsRoot string) (string, error) {
 }
 
 func defaultSemanticBundleMatches(d SemanticBundleDescriptor, p semanticBundleInstallPlatform) bool {
-	return d.Schema == SemanticBundleSchemaV1 && d.ProfileID == SemanticBundleBGEProfileID && d.PlatformOS == p.OS && d.PlatformArch == p.Arch && d.ONNXRuntimeVersion == semanticInstallerORTVersion && d.ONNXRuntimeBuild == p.ORTBuild && d.ONNXRuntimeCAPI == semanticInstallerORTCAPI && d.ONNXGoBindingCommit == semanticInstallerBindingCommit && d.ONNXGoBindingDigest == semanticInstallerBindingDigest && d.ONNXGoBindingCAPI == semanticInstallerORTCAPI && d.ZvecVersion == semanticInstallerZvecVersion && d.ZvecBuild == p.ZvecBuild && d.ZvecGoVersion == semanticInstallerZvecVersion && d.ZvecGoCommit == semanticInstallerZvecCommit && d.ModelID == "BAAI/bge-small-zh-v1.5" && d.ModelRevision == semanticInstallerModelRevision && d.ModelExport == "onnx-single-file;converter=Xenova" && d.ONNXOpset == 11 && d.ModelLicenseID == "BAAI/bge-small-zh-v1.5:MIT" && d.TokenizerVersion == "huggingface-tokenizers" && d.TokenizerRevision == semanticInstallerModelRevision && d.LicenseExpression == SemanticBundleLicenseExpression && d.PreprocessingDigest == semanticInstallerPreprocessingDigest && d.QueryPrefix == SemanticBundleBGEQueryPrefix && d.DocumentPrefix == SemanticBundleBGEDocumentPrefix && d.MaxTokens == SemanticBundleBGEMaxTokens && d.Pooling == SemanticBundleBGEPooling && d.Normalization == SemanticBundleBGENormalization && d.ElementType == SemanticBundleBGEElementType && d.Dimension == SemanticBundleBGEDimension && d.VectorSchema == SemanticBundleBGEVectorSchema && d.SemanticSpace == SemanticBundleBGESemanticSpace && d.Distance == SemanticBundleBGEDistance && d.IndexConfig == "hnsw:m=16" && d.QueryConfig == "ef=64"
+	if !(d.Schema == SemanticBundleSchemaV1 && d.ProfileID == SemanticBundleBGEProfileID && d.PlatformOS == p.OS && d.PlatformArch == p.Arch && d.ONNXRuntimeVersion == semanticInstallerORTVersion && d.ONNXRuntimeBuild == p.ORTBuild && d.ONNXRuntimeCAPI == semanticInstallerORTCAPI && d.ONNXGoBindingCommit == semanticInstallerBindingCommit && d.ONNXGoBindingDigest == semanticInstallerBindingDigest && d.ONNXGoBindingCAPI == semanticInstallerORTCAPI && d.ZvecVersion == semanticInstallerZvecVersion && d.ZvecBuild == p.ZvecBuild && d.ZvecGoVersion == semanticInstallerZvecVersion && d.ZvecGoCommit == semanticInstallerZvecCommit && d.ModelID == "BAAI/bge-small-zh-v1.5" && d.ModelRevision == semanticInstallerModelRevision && d.ModelExport == "onnx-single-file;converter=Xenova" && d.ONNXOpset == 11 && d.ModelLicenseID == "BAAI/bge-small-zh-v1.5:MIT" && d.TokenizerVersion == "huggingface-tokenizers" && d.TokenizerRevision == semanticInstallerModelRevision && d.LicenseExpression == SemanticBundleLicenseExpression && d.PreprocessingDigest == semanticInstallerPreprocessingDigest && d.QueryPrefix == SemanticBundleBGEQueryPrefix && d.DocumentPrefix == SemanticBundleBGEDocumentPrefix && d.MaxTokens == SemanticBundleBGEMaxTokens && d.Pooling == SemanticBundleBGEPooling && d.Normalization == SemanticBundleBGENormalization && d.ElementType == SemanticBundleBGEElementType && d.Dimension == SemanticBundleBGEDimension && d.VectorSchema == SemanticBundleBGEVectorSchema && d.SemanticSpace == SemanticBundleBGESemanticSpace && d.Distance == SemanticBundleBGEDistance && d.IndexConfig == "hnsw:m=16" && d.QueryConfig == "ef=64") {
+		return false
+	}
+	paths := map[string]string{
+		"runtime": "runtime.bin", "onnx_binding": "onnx-binding.txt", "onnx_c_api": "onnx-c-api.h",
+		"model": "model.onnx", "tokenizer": "tokenizer.json", "profile": "profile.json", "zvec": "zvec.dylib",
+		"zvec_go": "zvec-go.txt", "license": "LICENSE", "notice": "NOTICE", "sbom": "sbom.json",
+	}
+	for _, entry := range d.assets() {
+		if paths[entry.Name] != entry.Asset.Path {
+			return false
+		}
+	}
+	return true
 }
 
 // ValidateDefaultSemanticBundleAdmission verifies the complete admission and
@@ -337,26 +767,11 @@ func defaultSemanticBundleMatches(d SemanticBundleDescriptor, p semanticBundleIn
 // callbacks and explicit local-bundle overrides from accepting a self-
 // consistent descriptor for a different model revision or output space.
 func ValidateDefaultSemanticBundleAdmission(admission SemanticBundleAdmission) error {
-	if err := admission.Validate(); err != nil {
-		return err
-	}
 	platform, err := semanticBundleInstallPlatformFor(runtime.GOOS, runtime.GOARCH)
 	if err != nil {
 		return err
 	}
-	if !defaultSemanticBundleMatches(admission.Descriptor, platform) {
-		return fmt.Errorf("%w: bundle facts do not match the pinned default", ErrInvalidSemanticBundle)
-	}
-	if admission.AssetDigests["model"] != semanticInstallerModelDigest || admission.Descriptor.Model.Size != semanticInstallerModelSize {
-		return fmt.Errorf("%w: model asset does not match the pinned default", ErrInvalidSemanticBundle)
-	}
-	if admission.AssetDigests["tokenizer"] != semanticInstallerTokenizerDigest || admission.Descriptor.Tokenizer.Size != semanticInstallerTokenizerSize {
-		return fmt.Errorf("%w: tokenizer asset does not match the pinned default", ErrInvalidSemanticBundle)
-	}
-	if admission.AssetDigests["onnx_c_api"] != semanticInstallerHeaderDigest || admission.Descriptor.ONNXCAPI.Size != semanticInstallerHeaderSize {
-		return fmt.Errorf("%w: ONNX C API asset does not match the pinned default", ErrInvalidSemanticBundle)
-	}
-	return nil
+	return validateSemanticInstallerPinnedAdmission(admission, platform)
 }
 
 func downloadSemanticInstallerAsset(ctx context.Context, client semanticBundleHTTPClient, spec semanticBundleInstallDownload, destination string) error {
@@ -630,4 +1045,217 @@ func semanticInstallerAsset(path, source string) (SemanticBundleAsset, error) {
 		return SemanticBundleAsset{}, err
 	}
 	return SemanticBundleAsset{Path: path, SHA256: digest, Size: size}, nil
+}
+
+// InstallDefaultSemanticBundleFromDirectory installs the pinned local BGE
+// bundle from an already packaged directory. The source directory is an
+// offline custody boundary: it is loaded and fully content-validated before
+// any destination is staged, and no network client or ambient model lookup is
+// involved. Only the one host/platform-specific default destination is
+// admitted.
+//
+// The source remains untouched. Installation is idempotent when the live
+// destination has the same admitted profile, and replacement uses the same
+// staged, atomic, recoverable publication path as the online installer.
+func InstallDefaultSemanticBundleFromDirectory(ctx context.Context, modelsRoot, sourceRoot string) (SemanticBundleAdmission, error) {
+	return installSemanticBundleFromDirectory(ctx, modelsRoot, sourceRoot, true)
+}
+
+// installSemanticBundleFromDirectory is deliberately private so tests can use
+// small synthetic bundles without weakening the public pinned-default
+// contract. requirePinned is never false from production code.
+func installSemanticBundleFromDirectory(ctx context.Context, modelsRoot, sourceRoot string, requirePinned bool) (SemanticBundleAdmission, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return SemanticBundleAdmission{}, err
+	}
+	modelsRoot, err := canonicalSemanticBundleInstallRoot(modelsRoot)
+	if err != nil {
+		return SemanticBundleAdmission{}, err
+	}
+	sourceRoot, err = canonicalSemanticBundleRoot(sourceRoot)
+	if err != nil {
+		return SemanticBundleAdmission{}, err
+	}
+	if err := validateSemanticOfflineBundleSourceRoot(sourceRoot); err != nil {
+		return SemanticBundleAdmission{}, err
+	}
+	platform, err := semanticBundleInstallPlatformFor(runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		return SemanticBundleAdmission{}, err
+	}
+	destination := filepath.Join(modelsRoot, SemanticBundleBGEProfileID, platform.OS+"-"+platform.Arch)
+	if err := validateSemanticBundlePath(filepath.Dir(destination), true); err != nil {
+		return SemanticBundleAdmission{}, fmt.Errorf("%w: bundle parent: %v", ErrInvalidSemanticBundle, err)
+	}
+	overlaps, samePath := semanticInstallerPathsOverlap(sourceRoot, destination)
+	if overlaps && !samePath {
+		return SemanticBundleAdmission{}, fmt.Errorf("%w: source and destination paths overlap", ErrInvalidSemanticBundle)
+	}
+	if info, statErr := os.Lstat(destination); statErr == nil && info.Mode()&os.ModeSymlink != 0 {
+		return SemanticBundleAdmission{}, fmt.Errorf("%w: destination must not be a symlink", ErrInvalidSemanticBundle)
+	} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return SemanticBundleAdmission{}, fmt.Errorf("%w: inspect destination: %v", ErrInvalidSemanticBundle, statErr)
+	}
+	var pinned func(SemanticBundleAdmission) error
+	if requirePinned {
+		pinned = func(admission SemanticBundleAdmission) error {
+			return validateSemanticInstallerPinnedAdmission(admission, platform)
+		}
+	}
+	source, err := LoadSemanticBundle(sourceRoot)
+	if err != nil {
+		return SemanticBundleAdmission{}, fmt.Errorf("%w: source admission: %v", ErrInvalidSemanticBundle, err)
+	}
+	if pinned != nil {
+		if err := pinned(source); err != nil {
+			return SemanticBundleAdmission{}, fmt.Errorf("%w: source is not the pinned default: %v", ErrInvalidSemanticBundle, err)
+		}
+	}
+	// An already complete bundle may be used as its own offline source. Return
+	// before recovery/staging so this idempotent case leaves the source tree
+	// byte-for-byte untouched.
+	if samePath {
+		return source, nil
+	}
+	// Recover a previous interrupted replacement before inspecting whether the
+	// destination is reusable. A bad live candidate is quarantined and the
+	// active old tree is restored by this helper.
+	if err := recoverSemanticBundleInstallWithValidator(destination, pinned); err != nil {
+		return SemanticBundleAdmission{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return SemanticBundleAdmission{}, err
+	}
+	// A complete, independently revalidated destination is already the desired
+	// result. This avoids touching it (and avoids staging a copy) on repeats.
+	if existing, loadErr := LoadSemanticBundle(destination); loadErr == nil {
+		if existing.ProfileDigest == source.ProfileDigest && (pinned == nil || pinned(existing) == nil) {
+			return existing, nil
+		}
+	} else if !errors.Is(loadErr, os.ErrNotExist) {
+		// A malformed existing tree is replaceable, but no error is hidden here:
+		// publishSemanticBundleReplacement retains it as history or quarantines
+		// it if the replacement later fails.
+		if _, statErr := os.Lstat(destination); statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+			return SemanticBundleAdmission{}, fmt.Errorf("%w: inspect destination: %v", ErrInvalidSemanticBundle, statErr)
+		}
+	}
+	if err := validateSemanticBundlePath(modelsRoot, true); err != nil {
+		return SemanticBundleAdmission{}, fmt.Errorf("%w: models root: %v", ErrInvalidSemanticBundle, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		return SemanticBundleAdmission{}, fmt.Errorf("%w: create bundle parent: %v", ErrInvalidSemanticBundle, err)
+	}
+	if err := validateSemanticBundlePath(filepath.Dir(destination), false); err != nil {
+		return SemanticBundleAdmission{}, fmt.Errorf("%w: bundle parent: %v", ErrInvalidSemanticBundle, err)
+	}
+	candidate, err := semanticInstallerSiblingPath(filepath.Dir(destination), semanticInstallerCandidatePrefix)
+	if err != nil {
+		return SemanticBundleAdmission{}, fmt.Errorf("%w: candidate path: %v", ErrInvalidSemanticBundle, err)
+	}
+	defer os.RemoveAll(candidate)
+	sources := make(map[string]string, len(source.Descriptor.assets()))
+	for _, entry := range source.Descriptor.assets() {
+		sources[entry.Name] = filepath.Join(sourceRoot, filepath.FromSlash(entry.Asset.Path))
+	}
+	if _, err := PackageSemanticBundle(candidate, source.Descriptor, sources); err != nil {
+		return SemanticBundleAdmission{}, fmt.Errorf("%w: stage offline bundle: %v", ErrInvalidSemanticBundle, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return SemanticBundleAdmission{}, err
+	}
+	verify := func() error {
+		published, err := LoadSemanticBundle(destination)
+		if err != nil {
+			return err
+		}
+		if published.ProfileDigest != source.ProfileDigest {
+			return fmt.Errorf("%w: published profile differs from source", ErrInvalidSemanticBundle)
+		}
+		if pinned != nil {
+			return pinned(published)
+		}
+		return nil
+	}
+	if err := publishSemanticBundleReplacement(candidate, destination, verify); err != nil {
+		return SemanticBundleAdmission{}, err
+	}
+	published, err := LoadSemanticBundle(destination)
+	if err != nil {
+		return SemanticBundleAdmission{}, fmt.Errorf("%w: offline install readback: %v", ErrInvalidSemanticBundle, err)
+	}
+	if pinned != nil {
+		if err := pinned(published); err != nil {
+			return SemanticBundleAdmission{}, fmt.Errorf("%w: installed bundle is not pinned: %v", ErrInvalidSemanticBundle, err)
+		}
+	}
+	return published, nil
+}
+
+// semanticInstallerPathsOverlap rejects ancestor/descendant source and target
+// pairs before any recovery or staging mutation. Both inputs are canonical
+// absolute paths, so component-aware Rel checks avoid false positives such as
+// /models-a versus /models-ab.
+func semanticInstallerPathsOverlap(sourceRoot, destination string) (overlaps, samePath bool) {
+	sourceRoot = semanticInstallerResolvedPathForOverlap(sourceRoot)
+	destination = semanticInstallerResolvedPathForOverlap(destination)
+	if sourceRoot == destination {
+		return true, true
+	}
+	isWithin := func(parent, child string) bool {
+		relative, err := filepath.Rel(parent, child)
+		if err != nil || relative == "." || filepath.IsAbs(relative) {
+			return false
+		}
+		return relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+	}
+	return isWithin(sourceRoot, destination) || isWithin(destination, sourceRoot), false
+}
+
+// semanticInstallerResolvedPathForOverlap resolves the longest existing
+// prefix, then appends missing components. This catches Darwin aliases such
+// as /tmp and /private/tmp even when the destination has not been created yet.
+func semanticInstallerResolvedPathForOverlap(path string) string {
+	path = filepath.Clean(path)
+	current := path
+	var suffix []string
+	for {
+		if _, err := os.Lstat(current); err == nil {
+			if resolved, resolveErr := filepath.EvalSymlinks(current); resolveErr == nil {
+				for i := len(suffix) - 1; i >= 0; i-- {
+					resolved = filepath.Join(resolved, suffix[i])
+				}
+				return filepath.Clean(resolved)
+			}
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+		suffix = append(suffix, filepath.Base(current))
+		current = parent
+	}
+	return path
+}
+
+// validateSemanticOfflineBundleSourceRoot rejects a symlink root explicitly,
+// even on hosts where /var or another platform alias is allowed elsewhere.
+func validateSemanticOfflineBundleSourceRoot(root string) error {
+	info, err := os.Lstat(root)
+	if err != nil {
+		return fmt.Errorf("%w: source root: %v", ErrInvalidSemanticBundle, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("%w: source root must be a real directory", ErrInvalidSemanticBundle)
+	}
+	if err := validateSemanticBundlePath(root, false); err != nil {
+		return fmt.Errorf("%w: source root path: %v", ErrInvalidSemanticBundle, err)
+	}
+	return nil
 }

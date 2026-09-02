@@ -4,6 +4,7 @@ package search
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -280,7 +281,7 @@ func (d *puregoZvecGenerationDriver) Coverage(ctx context.Context, spec ZvecGene
 // CoveragePairs returns subject-bound identities from the immutable metadata
 // written alongside the generation. Generations carrying only the legacy
 // segment_ids field remain queryable, but cannot claim complete coverage.
-func (d *puregoZvecGenerationDriver) CoveragePairs(ctx context.Context, spec ZvecGenerationSpec) ([]ZvecCoverageIdentity, error) {
+func (d *puregoZvecGenerationDriver) CoveragePairs(ctx context.Context, spec ZvecGenerationSpec) (identities []ZvecCoverageIdentity, retErr error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -290,12 +291,22 @@ func (d *puregoZvecGenerationDriver) CoveragePairs(ctx context.Context, spec Zve
 	if err != nil {
 		return nil, err
 	}
+	if opened == nil {
+		return nil, fmt.Errorf("%w: generation is nil", ErrZvecUnavailable)
+	}
+	defer func() {
+		if closeErr := opened.Close(); closeErr != nil {
+			closeErr = fmt.Errorf("close generation after coverage: %w", closeErr)
+			retErr = errors.Join(retErr, closeErr)
+			if retErr != nil {
+				identities = nil
+			}
+		}
+	}()
 	generation, ok := opened.(*puregoZvecGeneration)
 	if !ok || generation == nil || generation.collection == nil {
-		_ = opened.Close()
 		return nil, fmt.Errorf("%w: generation does not expose collection coverage", ErrZvecUnavailable)
 	}
-	defer func() { _ = opened.Close() }()
 	metadata, err := readZvecGenerationMetadata(spec.Path)
 	if err != nil {
 		return nil, err
@@ -323,7 +334,7 @@ func (d *puregoZvecGenerationDriver) CoveragePairs(ctx context.Context, spec Zve
 // VerifyMembership checks only the supplied query candidates against the
 // generation's bound identity metadata and actual collection rows. It is
 // intentionally bounded by the caller's result set and never loads vectors.
-func (d *puregoZvecGenerationDriver) VerifyMembership(ctx context.Context, spec ZvecGenerationSpec, candidates []ZvecCoverageIdentity) error {
+func (d *puregoZvecGenerationDriver) VerifyMembership(ctx context.Context, spec ZvecGenerationSpec, candidates []ZvecCoverageIdentity) (retErr error) {
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -331,12 +342,18 @@ func (d *puregoZvecGenerationDriver) VerifyMembership(ctx context.Context, spec 
 	if err != nil {
 		return err
 	}
+	if opened == nil {
+		return fmt.Errorf("%w: generation is nil", ErrZvecUnavailable)
+	}
+	defer func() {
+		if closeErr := opened.Close(); closeErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close generation after membership verification: %w", closeErr))
+		}
+	}()
 	generation, ok := opened.(*puregoZvecGeneration)
 	if !ok || generation == nil || generation.collection == nil {
-		_ = opened.Close()
 		return fmt.Errorf("%w: generation does not expose collection membership", ErrZvecUnavailable)
 	}
-	defer func() { _ = opened.Close() }()
 	metadata, err := readZvecGenerationMetadata(spec.Path)
 	if err != nil {
 		return err

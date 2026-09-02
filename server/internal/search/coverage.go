@@ -2,12 +2,17 @@ package search
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/ailiheizi/restoreweave/server/internal/store/sqlite"
 	_ "modernc.org/sqlite"
@@ -44,6 +49,479 @@ type SemanticCoverageStatement struct {
 	Notes         string
 }
 
+// semanticCoverageComparison is the host-owned comparison between the
+// durable segment set and the identities reported by one backend generation.
+// A segment ID is only an identity when its subject binding also matches. The
+// distinction is intentionally retained so callers can report the reason a
+// generation was rejected without treating a partial result as ready.
+type semanticCoverageComparison struct {
+	Expected        int
+	Indexed         int
+	Missing         []string
+	Extra           []ZvecCoverageIdentity
+	Duplicate       []ZvecCoverageIdentity
+	SubjectMismatch []ZvecCoverageIdentity
+}
+
+// semanticGenerationReceiptFile is an immutable, generation-local snapshot of
+// the expected semantic input set. The operational catalog is intentionally
+// not consulted when reopening an old generation: descriptions and notes may
+// have advanced since that projection was built.
+type semanticGenerationReceiptFile struct {
+	Schema         string                 `json:"schema"`
+	GenerationID   string                 `json:"generation_id"`
+	WorkspaceID    string                 `json:"workspace_id"`
+	SnapshotRef    string                 `json:"snapshot_ref"`
+	NamespaceRoot  string                 `json:"namespace_root_id"`
+	ConfigDigest   string                 `json:"config_digest"`
+	ProfileDigest  string                 `json:"profile_digest"`
+	SemanticSpace  string                 `json:"semantic_space"`
+	LibraryDigest  string                 `json:"library_digest"`
+	IdentityDigest string                 `json:"identity_digest"`
+	Identities     []ZvecCoverageIdentity `json:"identities"`
+}
+
+const semanticGenerationReceiptSchema = "restoreweave.semantic-generation-receipt.v1"
+
+// Receipts are disposable search projection evidence, not an unbounded
+// metadata channel. Keep the limit high enough for a large real generation,
+// while refusing attacker-controlled allocations before decoding JSON.
+const semanticGenerationReceiptMaxBytes = uint64(16 << 20)
+
+func semanticGenerationReceiptPath(generationPath string) string {
+	return filepath.Clean(generationPath) + ".receipt.json"
+}
+
+func semanticCoverageDigest(identities []ZvecCoverageIdentity) string {
+	canonical := append([]ZvecCoverageIdentity(nil), identities...)
+	sort.Slice(canonical, func(i, j int) bool {
+		if canonical[i].SegmentID != canonical[j].SegmentID {
+			return canonical[i].SegmentID < canonical[j].SegmentID
+		}
+		return canonical[i].SubjectID < canonical[j].SubjectID
+	})
+	b, _ := json.Marshal(canonical)
+	digest := sha256.Sum256(b)
+	return "sha256:" + hex.EncodeToString(digest[:])
+}
+
+func writeSemanticGenerationReceipt(generation sqlite.IndexGeneration, libraryDigest string, identities []ZvecCoverageIdentity) error {
+	if strings.TrimSpace(generation.DBPath) == "" || strings.TrimSpace(generation.ID) == "" {
+		return errors.New("semantic generation receipt requires generation identity and path")
+	}
+	identities = append([]ZvecCoverageIdentity(nil), identities...)
+	receipt := semanticGenerationReceiptFile{
+		Schema: semanticGenerationReceiptSchema, GenerationID: generation.ID,
+		WorkspaceID: generation.WorkspaceID, SnapshotRef: generation.SnapshotRef,
+		NamespaceRoot: generation.NamespaceRootID, ConfigDigest: generation.ConfigDigest,
+		ProfileDigest: generation.ProviderProfileDigest, SemanticSpace: generation.SemanticSpace,
+		LibraryDigest: libraryDigest, IdentityDigest: semanticCoverageDigest(identities), Identities: identities,
+	}
+	payload, err := json.Marshal(receipt)
+	if err != nil {
+		return err
+	}
+	// Generation IDs are unique. Refuse replacement so a stale or concurrent
+	// writer cannot silently reinterpret an existing generation.
+	finalPath := semanticGenerationReceiptPath(generation.DBPath)
+	parent := filepath.Dir(finalPath)
+	file, err := os.CreateTemp(parent, ".restoreweave-semantic-receipt-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := file.Name()
+	published := false
+	linked := false
+	defer func() {
+		_ = file.Close()
+		if !published {
+			_ = os.Remove(tmpPath)
+			if linked {
+				_ = os.Remove(finalPath)
+			}
+		}
+	}()
+	if _, err := file.Write(payload); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	// Link is an atomic no-replace publication: unlike Rename it cannot
+	// overwrite an existing receipt, and a crash cannot expose a truncated
+	// final file. Sync the containing directory after the link.
+	if err := os.Link(tmpPath, finalPath); err != nil {
+		return err
+	}
+	linked = true
+	if err := os.Remove(tmpPath); err != nil {
+		return err
+	}
+	directory, err := os.Open(parent)
+	if err != nil {
+		return err
+	}
+	if err := directory.Sync(); err != nil {
+		_ = directory.Close()
+		return err
+	}
+	if err := directory.Close(); err != nil {
+		return err
+	}
+	published = true
+	return nil
+}
+
+// openSemanticGenerationReceipt opens the receipt through the same descriptor
+// relative, no-follow helper used for admitted semantic bundle assets. Resolve
+// only ancestor aliases so Darwin's /var -> /private/var layout remains
+// compatible; the final receipt component is still opened with O_NOFOLLOW.
+func openSemanticGenerationReceipt(path string) (*os.File, error) {
+	clean := filepath.Clean(path)
+	if clean == "" || !filepath.IsAbs(clean) || clean != path || clean == string(filepath.Separator) {
+		return nil, errors.New("semantic generation receipt path must be an absolute clean non-root path")
+	}
+	// Reject non-regular objects before opening. In particular, opening a FIFO
+	// read-only can block indefinitely; the descriptor-relative helper below
+	// then supplies the no-follow race-safe final open for regular files.
+	info, err := os.Lstat(clean)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return nil, errors.New("semantic generation receipt must be a regular non-symlink file")
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(clean))
+	if err != nil {
+		return nil, fmt.Errorf("resolve semantic generation receipt parent: %w", err)
+	}
+	canonical := filepath.Join(parent, filepath.Base(clean))
+	relative := strings.TrimPrefix(filepath.ToSlash(canonical), "/")
+	if relative == "" {
+		return nil, errors.New("semantic generation receipt path is empty")
+	}
+	return openBundleFileNoFollow(string(filepath.Separator), relative)
+}
+
+func readBoundedSemanticGenerationReceipt(path string) ([]byte, error) {
+	file, err := openSemanticGenerationReceipt(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = file.Close() }()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat semantic generation receipt: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("semantic generation receipt is not a regular file")
+	}
+	if info.Size() <= 0 || uint64(info.Size()) > semanticGenerationReceiptMaxBytes {
+		return nil, fmt.Errorf("semantic generation receipt size %d is outside bounds", info.Size())
+	}
+	maxInt := uint64(^uint(0) >> 1)
+	if uint64(info.Size()) > maxInt {
+		return nil, errors.New("semantic generation receipt is too large for this platform")
+	}
+	payload := make([]byte, int(info.Size()))
+	if _, err := io.ReadFull(file, payload); err != nil {
+		return nil, fmt.Errorf("read semantic generation receipt: %w", err)
+	}
+	// A writer may truncate or append after the initial stat. The descriptor
+	// remains anchored to the opened inode, so a second stat makes both races
+	// fail closed instead of decoding a partial snapshot.
+	after, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("restat semantic generation receipt: %w", err)
+	}
+	if !after.Mode().IsRegular() || after.Size() != info.Size() {
+		return nil, errors.New("semantic generation receipt changed during read")
+	}
+	return payload, nil
+}
+
+func readSemanticGenerationReceipt(generation sqlite.IndexGeneration) ([]ZvecCoverageIdentity, string, string, error) {
+	if strings.TrimSpace(generation.DBPath) == "" {
+		return nil, "", "", errors.New("semantic generation path is empty")
+	}
+	payload, err := readBoundedSemanticGenerationReceipt(semanticGenerationReceiptPath(generation.DBPath))
+	if err == nil {
+		var receipt semanticGenerationReceiptFile
+		if err := json.Unmarshal(payload, &receipt); err != nil {
+			return nil, "", "", fmt.Errorf("semantic generation receipt: %v", err)
+		}
+		if receipt.Schema != semanticGenerationReceiptSchema || receipt.GenerationID != generation.ID || receipt.WorkspaceID != generation.WorkspaceID ||
+			receipt.SnapshotRef != generation.SnapshotRef || receipt.NamespaceRoot != generation.NamespaceRootID ||
+			receipt.ConfigDigest != generation.ConfigDigest || receipt.ProfileDigest != generation.ProviderProfileDigest || receipt.SemanticSpace != generation.SemanticSpace ||
+			receipt.IdentityDigest == "" || receipt.IdentityDigest != semanticCoverageDigest(receipt.Identities) {
+			return nil, "", "", errors.New("semantic generation receipt binding is invalid")
+		}
+		if validateZvecLibraryDigest(receipt.LibraryDigest) != nil {
+			return nil, "", "", errors.New("semantic generation receipt library digest is invalid")
+		}
+		if err := validateZvecCoverageIdentities(receipt.Identities); err != nil || len(receipt.Identities) == 0 {
+			return nil, "", "", errors.New("semantic generation receipt identities are invalid")
+		}
+		return append([]ZvecCoverageIdentity(nil), receipt.Identities...), receipt.IdentityDigest, receipt.LibraryDigest, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, "", "", err
+	}
+	// Generations written by the existing pure-Go zvec backend already carry
+	// an immutable identity list in their side metadata. Accept that format as
+	// a restart-compatible fallback; generic drivers get the receipt above.
+	metadata, metadataErr := readZvecGenerationMetadata(generation.DBPath)
+	if metadataErr != nil || len(metadata.Identities) == 0 {
+		if metadataErr != nil {
+			return nil, "", "", metadataErr
+		}
+		return nil, "", "", errors.New("semantic generation expected identity receipt is missing")
+	}
+	if metadata.Path != generation.DBPath || metadata.LibraryDigest == "" || metadata.ProfileDigest != generation.ProviderProfileDigest ||
+		metadata.Manifest.ConfigDigest != generation.ConfigDigest || metadata.Manifest.CanonicalDigest() != generation.ProviderProfileDigest || metadata.Manifest.SemanticSpace != generation.SemanticSpace {
+		return nil, "", "", errors.New("semantic generation metadata binding is invalid")
+	}
+	if err := validateZvecCoverageIdentities(metadata.Identities); err != nil || len(metadata.Identities) == 0 {
+		return nil, "", "", errors.New("semantic generation metadata identities are invalid")
+	}
+	return append([]ZvecCoverageIdentity(nil), metadata.Identities...), semanticCoverageDigest(metadata.Identities), metadata.LibraryDigest, nil
+}
+
+func validateSemanticReceiptLibrary(idx *Indexer, libraryDigest string) error {
+	if idx == nil || strings.TrimSpace(libraryDigest) == "" || libraryDigest != idx.SemanticLibraryDigest {
+		return errors.New("semantic generation library binding is invalid")
+	}
+	return nil
+}
+
+func openCloseSemanticGeneration(ctx context.Context, backend ZvecGenerationDriver, spec ZvecGenerationSpec) error {
+	opened, err := backend.Open(ctx, spec)
+	if err != nil {
+		return fmt.Errorf("open semantic generation: %v", err)
+	}
+	if opened == nil {
+		// The in-memory qualification drivers intentionally have no reader
+		// object. The pinned local BGE profile, by contrast, must return a real
+		// reader and therefore fails closed on nil.
+		if spec.Manifest.SemanticSpace != SemanticBundleBGESemanticSpace {
+			return nil
+		}
+		return errors.New("semantic backend returned a nil generation")
+	}
+	if err := opened.Close(); err != nil {
+		return fmt.Errorf("close semantic generation: %v", err)
+	}
+	return nil
+}
+
+func (c semanticCoverageComparison) Complete() bool {
+	return len(c.Missing) == 0 && len(c.Extra) == 0 && len(c.Duplicate) == 0 && len(c.SubjectMismatch) == 0 && c.Indexed == c.Expected
+}
+
+// compareSemanticCoverage enforces exact set equality over the pair
+// (subject_ref, semantic_segment_id). It is deliberately generation-specific:
+// backend rows from another generation are extra rows, not harmless stale
+// data, and repeated IDs are never collapsed into a ready count.
+func compareSemanticCoverage(expected, actual []ZvecCoverageIdentity) semanticCoverageComparison {
+	comparison := semanticCoverageComparison{Expected: len(expected)}
+	want := make(map[string]string, len(expected))
+	for _, identity := range expected {
+		id := strings.TrimSpace(identity.SegmentID)
+		subject := strings.TrimSpace(identity.SubjectID)
+		if id == "" || subject == "" {
+			comparison.Extra = append(comparison.Extra, identity)
+			continue
+		}
+		if previous, exists := want[id]; exists {
+			// Duplicate durable identities are not a valid expected set. Keep
+			// this visible as a subject mismatch when the duplicate disagrees.
+			if previous != subject {
+				comparison.SubjectMismatch = append(comparison.SubjectMismatch, identity)
+			}
+			comparison.Duplicate = append(comparison.Duplicate, identity)
+			continue
+		}
+		want[id] = subject
+	}
+	seen := make(map[string]struct{}, len(actual))
+	for _, identity := range actual {
+		id := strings.TrimSpace(identity.SegmentID)
+		subject := strings.TrimSpace(identity.SubjectID)
+		wantSubject, known := want[id]
+		if !known || id == "" || subject == "" {
+			comparison.Extra = append(comparison.Extra, identity)
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			comparison.Duplicate = append(comparison.Duplicate, identity)
+			// Continue checking the binding: a repeated ID with a different
+			// subject is both duplicate and a binding violation.
+		}
+		seen[id] = struct{}{}
+		if subject != wantSubject {
+			comparison.SubjectMismatch = append(comparison.SubjectMismatch, identity)
+			continue
+		}
+	}
+	comparison.Indexed = len(seen)
+	for id := range want {
+		if _, exists := seen[id]; !exists {
+			comparison.Missing = append(comparison.Missing, id)
+		}
+	}
+	sort.Strings(comparison.Missing)
+	sort.Slice(comparison.Extra, func(i, j int) bool { return comparison.Extra[i].SegmentID < comparison.Extra[j].SegmentID })
+	sort.Slice(comparison.Duplicate, func(i, j int) bool { return comparison.Duplicate[i].SegmentID < comparison.Duplicate[j].SegmentID })
+	sort.Slice(comparison.SubjectMismatch, func(i, j int) bool {
+		return comparison.SubjectMismatch[i].SegmentID < comparison.SubjectMismatch[j].SegmentID
+	})
+	return comparison
+}
+
+func semanticCoverageError(comparison semanticCoverageComparison) error {
+	switch {
+	case len(comparison.SubjectMismatch) > 0:
+		return errors.New("semantic generation contains subject/segment identity mismatch")
+	case len(comparison.Extra) > 0:
+		return errors.New("semantic generation contains unknown segment identities")
+	case len(comparison.Duplicate) > 0:
+		return errors.New("semantic generation contains duplicate segment identities")
+	case len(comparison.Missing) > 0:
+		return errors.New("semantic generation has incomplete segment coverage")
+	default:
+		return errors.New("semantic generation coverage is incomplete")
+	}
+}
+
+// validateSemanticGenerationMapping verifies only the immutable namespace-root
+// mapping recorded for a generation. It intentionally does not enumerate the
+// current namespace projection or derive a mutable semantic denominator: those
+// records may have changed since this disposable generation was published.
+func validateSemanticGenerationMapping(ctx context.Context, store *sqlite.Store, generation sqlite.IndexGeneration) error {
+	if store == nil {
+		return errors.New("catalog is required")
+	}
+	roots, err := store.ListIndexGenerationRoots(ctx, generation.WorkspaceID, generation.ID)
+	if err != nil {
+		return err
+	}
+	if len(roots) == 0 {
+		return errors.New("index generation root mapping is empty")
+	}
+	seen := make(map[string]struct{}, len(roots))
+	containsPrimary := false
+	for _, root := range roots {
+		if root.WorkspaceID != generation.WorkspaceID || strings.TrimSpace(root.ID) == "" || strings.TrimSpace(root.SnapshotRef) == "" {
+			return fmt.Errorf("index generation root %q is outside workspace scope", root.ID)
+		}
+		if _, duplicate := seen[root.ID]; duplicate {
+			return fmt.Errorf("duplicate index generation root %q", root.ID)
+		}
+		seen[root.ID] = struct{}{}
+		if root.ID == generation.NamespaceRootID {
+			containsPrimary = true
+			if root.SnapshotRef != generation.SnapshotRef {
+				return fmt.Errorf("primary index generation root %q snapshot %q does not match generation snapshot %q", root.ID, root.SnapshotRef, generation.SnapshotRef)
+			}
+		}
+	}
+	if !containsPrimary {
+		return fmt.Errorf("index generation root mapping omits primary root %q", generation.NamespaceRootID)
+	}
+	return nil
+}
+
+// semanticCoveragePairs returns only subject-bound backend evidence. The
+// legacy ID-only Coverage method remains useful for a degraded report, but it
+// cannot establish readiness because it cannot prove subject provenance.
+func semanticCoveragePairs(ctx context.Context, backend ZvecGenerationDriver, spec ZvecGenerationSpec) ([]ZvecCoverageIdentity, error) {
+	switch probe := backend.(type) {
+	case semanticCoveragePairsProbe:
+		return probe.CoveragePairs(ctx, spec)
+	case semanticCoveragePairMethodProbe:
+		return probe.Coverage(ctx, spec)
+	default:
+		return nil, errors.New("semantic backend does not provide generation identity coverage")
+	}
+}
+
+func semanticExpectedPairs(expected map[string]string) []ZvecCoverageIdentity {
+	pairs := make([]ZvecCoverageIdentity, 0, len(expected))
+	for id, subject := range expected {
+		pairs = append(pairs, ZvecCoverageIdentity{SegmentID: id, SubjectID: subject})
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].SegmentID != pairs[j].SegmentID {
+			return pairs[i].SegmentID < pairs[j].SegmentID
+		}
+		return pairs[i].SubjectID < pairs[j].SubjectID
+	})
+	return pairs
+}
+
+func (idx *Indexer) verifySemanticGenerationCoverage(ctx context.Context, spec ZvecGenerationSpec, expected []ZvecCoverageIdentity) ([]ZvecCoverageIdentity, error) {
+	actual, err := semanticCoveragePairs(ctx, idx.SemanticZvec, spec)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
+	}
+	comparison := compareSemanticCoverage(expected, actual)
+	if !comparison.Complete() {
+		return nil, fmt.Errorf("%w: %v", ErrUnavailable, semanticCoverageError(comparison))
+	}
+	verifier, ok := idx.SemanticZvec.(ZvecGenerationMembershipVerifier)
+	if !ok {
+		return nil, fmt.Errorf("%w: semantic backend does not provide generation membership verification", ErrUnavailable)
+	}
+	if err := verifier.VerifyMembership(ctx, spec, actual); err != nil {
+		return nil, fmt.Errorf("%w: semantic generation membership: %v", ErrUnavailable, err)
+	}
+	return append([]ZvecCoverageIdentity(nil), actual...), nil
+}
+
+// ensureSemanticGenerationVerified validates a generation once per process
+// and profile binding. Restarted processes begin with an empty cache and
+// re-open the immutable backend metadata/collection; they do not consult the
+// mutable catalog to reconstruct an old generation's denominator.
+func (idx *Indexer) ensureSemanticGenerationVerified(ctx context.Context, generation sqlite.IndexGeneration) error {
+	if idx == nil || idx.SemanticZvec == nil {
+		return fmt.Errorf("%w: semantic backend is unavailable", ErrUnavailable)
+	}
+	// Serialize cache misses so concurrent first queries cannot each perform a
+	// full collection enumeration before one of them publishes the receipt.
+	idx.semanticVerifyMu.Lock()
+	defer idx.semanticVerifyMu.Unlock()
+	if identityCount, ok := idx.cachedSemanticGeneration(generation); ok {
+		if identityCount == 0 {
+			return fmt.Errorf("%w: semantic generation coverage is empty", ErrUnavailable)
+		}
+		return nil
+	}
+	expected, _, libraryDigest, err := readSemanticGenerationReceipt(generation)
+	if err != nil {
+		return fmt.Errorf("%w: read semantic generation receipt: %v", ErrUnavailable, err)
+	}
+	if err := validateSemanticReceiptLibrary(idx, libraryDigest); err != nil {
+		return fmt.Errorf("%w: %v", ErrUnavailable, err)
+	}
+	spec := ZvecGenerationSpec{
+		Path: generation.DBPath, LibraryPath: idx.SemanticLibraryPath,
+		LibraryDigest: idx.SemanticLibraryDigest,
+		ProfileDigest: idx.SemanticManifest.CanonicalDigest(), Manifest: idx.SemanticManifest,
+	}
+	if err := openCloseSemanticGeneration(ctx, idx.SemanticZvec, spec); err != nil {
+		return fmt.Errorf("%w: %v", ErrUnavailable, err)
+	}
+	actual, err := idx.verifySemanticGenerationCoverage(ctx, spec, expected)
+	if err != nil {
+		return err
+	}
+	idx.cacheSemanticGeneration(generation, actual)
+	return nil
+}
+
 // SemanticCoverage reports only evidence available from the durable segment
 // set and the backend's generation coverage probe. A backend that cannot
 // enumerate indexed segment IDs is deliberately partial, never complete.
@@ -77,66 +555,28 @@ func (idx *Indexer) SemanticCoverage(ctx context.Context, workspaceID string) (S
 		statement.Notes = "semantic generation binding mismatch"
 		return statement, nil
 	}
-	entries, err := semanticNamespaceEntries(ctx, idx.Store, generation)
-	if err != nil {
+	// Root/entry provenance is still required for a usable report, but it is
+	// deliberately not used to derive the generation's expected denominator.
+	if _, err := semanticNamespaceEntries(ctx, idx.Store, generation); err != nil {
 		statement.Notes = "semantic namespace provenance is unavailable"
 		return statement, nil
 	}
-	expected := map[string]string{}
-	activeSubjects := make(map[string]struct{}, len(entries))
-	for _, entry := range entries {
-		activeSubjects[semanticEntrySubject(entry)] = struct{}{}
-		if strings.TrimSpace(entry.DisplayName) != "" {
-			expected[entry.ID] = semanticEntrySubject(entry)
-		}
+	expectedPairs, _, libraryDigest, receiptErr := readSemanticGenerationReceipt(generation)
+	if receiptErr != nil {
+		statement.Notes = "semantic generation expected identity receipt is unavailable"
+		return statement, nil
 	}
-	docs, err := idx.Store.ListDescriptionDocuments(ctx, workspaceID, "")
-	if err != nil {
-		return statement, err
+	if err := validateSemanticReceiptLibrary(idx, libraryDigest); err != nil {
+		statement.Notes = "semantic generation library binding is unavailable"
+		return statement, nil
 	}
-	activeDescriptions := activeDescriptionLeaves(docs)
-	for _, doc := range docs {
-		if _, ok := activeDescriptions[doc.ID]; !ok {
-			continue
+	expected := make(map[string]string, len(expectedPairs))
+	for _, pair := range expectedPairs {
+		if _, duplicate := expected[pair.SegmentID]; duplicate {
+			statement.Notes = "semantic generation expected identity receipt is invalid"
+			return statement, nil
 		}
-		if _, ok := activeSubjects[semanticCanonicalSubject(entries, doc.SubjectRef)]; !ok {
-			continue
-		}
-		segments, listErr := idx.Store.ListSemanticSegments(ctx, workspaceID, doc.ID)
-		if listErr != nil {
-			return statement, listErr
-		}
-		for _, segment := range segments {
-			subject := semanticCanonicalSubject(entries, segment.SubjectRef)
-			if _, ok := activeSubjects[subject]; ok {
-				expected[segment.ID] = subject
-			}
-		}
-	}
-	annotations, err := idx.Store.ListAnnotations(ctx, workspaceID, "", false)
-	if err != nil {
-		return statement, err
-	}
-	for _, annotation := range annotations {
-		if annotation.Kind == sqlite.AnnotationNote {
-			if _, ok := activeSubjects[semanticCanonicalSubject(entries, annotation.SubjectRef)]; !ok {
-				continue
-			}
-			expected[annotation.ID] = semanticCanonicalSubject(entries, annotation.SubjectRef)
-		}
-	}
-	artifacts, err := idx.Store.ListAdmittedArtifacts(ctx, workspaceID, "")
-	if err != nil {
-		return statement, err
-	}
-	for _, artifact := range artifacts {
-		if artifact.Stage != "EXTRACT" || strings.TrimSpace(artifact.Body) == "" || !utf8.ValidString(artifact.Body) {
-			continue
-		}
-		if _, ok := semanticEntryForSubject(ctx, idx.Store, entries, semanticCanonicalSubject(entries, artifact.SubjectRef), artifact.SnapshotRef, generation); !ok {
-			continue
-		}
-		expected[artifact.ID] = semanticCanonicalSubject(entries, artifact.SubjectRef)
+		expected[pair.SegmentID] = pair.SubjectID
 	}
 	statement.Expected = len(expected)
 	spec := ZvecGenerationSpec{Path: generation.DBPath, LibraryPath: idx.SemanticLibraryPath, LibraryDigest: idx.SemanticLibraryDigest, ProfileDigest: idx.SemanticManifest.CanonicalDigest(), Manifest: idx.SemanticManifest}
@@ -162,43 +602,52 @@ func (idx *Indexer) SemanticCoverage(ctx context.Context, workspaceID string) (S
 		statement.Notes = "semantic coverage probe unavailable"
 		return statement, nil
 	}
-	seen := map[string]struct{}{}
-	unknown := false
-	duplicate := false
-	identityMismatch := false
-	for _, pair := range pairs {
-		id := strings.TrimSpace(pair.SegmentID)
-		subject := strings.TrimSpace(pair.SubjectID)
-		wantSubject, known := expected[id]
-		if known {
-			if _, exists := seen[id]; exists {
-				duplicate = true
+	comparison := semanticCoverageComparison{}
+	if pairBound {
+		comparison = compareSemanticCoverage(semanticExpectedPairs(expected), pairs)
+	} else {
+		// Preserve the legacy report's ID-only semantics while explicitly
+		// denying complete coverage in the absence of subject provenance.
+		seen := map[string]struct{}{}
+		for _, pair := range pairs {
+			id := strings.TrimSpace(pair.SegmentID)
+			if _, known := expected[id]; !known {
+				comparison.Extra = append(comparison.Extra, pair)
+				continue
 			}
 			seen[id] = struct{}{}
-			if pairBound && subject != wantSubject {
-				identityMismatch = true
+		}
+		comparison.Expected = len(expected)
+		comparison.Indexed = len(seen)
+		for id := range expected {
+			if _, ok := seen[id]; !ok {
+				comparison.Missing = append(comparison.Missing, id)
 			}
-		} else {
-			unknown = true
 		}
+		sort.Strings(comparison.Missing)
 	}
-	statement.Indexed = len(seen)
+	statement.Indexed = comparison.Indexed
 	statement.Available = true
-	for id := range expected {
-		if _, ok := seen[id]; !ok {
-			statement.Missing = append(statement.Missing, id)
+	statement.Missing = append(statement.Missing, comparison.Missing...)
+	statement.Complete = pairBound && comparison.Complete()
+	if statement.Complete {
+		// Coverage is allowed to report complete only after an explicit
+		// generation lifecycle check. CoveragePairs may be metadata-backed and
+		// must not be the sole evidence that the reader can reopen cleanly.
+		if err := openCloseSemanticGeneration(ctx, idx.SemanticZvec, spec); err != nil {
+			statement.Complete = false
+			statement.Notes = "semantic generation lifecycle is unavailable"
+			return statement, nil
 		}
 	}
-	sort.Strings(statement.Missing)
-	statement.Complete = pairBound && len(statement.Missing) == 0 && statement.Indexed == statement.Expected && !unknown && !duplicate && !identityMismatch
 	switch {
 	case !pairBound:
 		statement.Notes = "semantic backend coverage is ID-only; subject/segment identity evidence is unavailable"
-	case identityMismatch:
+	case len(comparison.SubjectMismatch) > 0:
 		statement.Notes = "semantic generation contains subject/segment identity mismatch"
-	case unknown:
+	case len(comparison.Extra) > 0:
 		statement.Notes = "semantic generation contains unknown segment identities"
-	case duplicate:
+	case len(comparison.Duplicate) > 0:
 		statement.Notes = "semantic generation contains duplicate segment identities"
 	case statement.Expected > 0 && statement.Indexed == 0:
 		statement.Notes = "semantic generation is empty"

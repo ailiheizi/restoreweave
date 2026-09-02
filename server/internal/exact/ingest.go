@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"path"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/ailiheizi/restoreweave/server/internal/capture"
@@ -598,6 +599,9 @@ func (s *Service) adopt(
 				if err := tx.InsertObservation(ctx, &observation); err != nil {
 					return err
 				}
+				if err := insertDetectionEvidence(ctx, tx, ids.workspaceID, item.observationID, item.entry.Detection, s.now()); err != nil {
+					return err
+				}
 			}
 			if item.entryType != sqlite.EntryFile || item.representation == "" {
 				continue
@@ -864,6 +868,72 @@ func observationRecord(ids catalogIDs, item prepared) sqlite.Observation {
 		record.LogicalSize = &size
 	}
 	return record
+}
+
+// insertDetectionEvidence projects the scanner's immutable detection result
+// into the durable catalog. The scanner result intentionally remains the
+// source shape; this row stores each Method/Value line while retaining the
+// result-level detector and candidate fields needed by lexical discovery.
+func insertDetectionEvidence(ctx context.Context, tx *sqlite.Tx, workspaceID, observationID string, observation scanner.DetectionObservation, observedAt time.Time) error {
+	result := observation.Result
+	if observation.State != scanner.DetectionSucceeded || len(result.Evidence) == 0 {
+		return nil
+	}
+	detectorID := strings.TrimSpace(result.DetectorID)
+	detectorVersion := strings.TrimSpace(result.DetectorVersion)
+	if detectorID == "" || detectorVersion == "" {
+		// A successful result without detector identity is not durable detector
+		// evidence. Do not invent an identity merely to populate a required row.
+		return nil
+	}
+	detectorDigest := detectorVersion
+	if !strings.HasPrefix(detectorDigest, "sha256:") {
+		detectorDigest = DigestBytes([]byte("restoreweave.detector:" + detectorID + "\x00" + detectorVersion))
+	}
+	// The scanner detector runs in-process under host control; this digest
+	// identifies that policy and does not claim a separate sandbox boundary.
+	sandboxPolicyHash := DigestBytes([]byte("restoreweave.detection.host.in-process.v1"))
+	for index, evidence := range result.Evidence {
+		kind := strings.ToUpper(strings.TrimSpace(evidence.Method))
+		if kind == "" {
+			kind = "RESULT"
+		}
+		payload := struct {
+			Method          string  `json:"method"`
+			Value           string  `json:"value"`
+			DetectorID      string  `json:"detector_id"`
+			DetectorVersion string  `json:"detector_version"`
+			FormatID        string  `json:"format_id,omitempty"`
+			MediaType       string  `json:"media_type,omitempty"`
+			Confidence      float64 `json:"confidence"`
+		}{
+			Method: evidence.Method, Value: evidence.Value,
+			DetectorID: detectorID, DetectorVersion: detectorVersion,
+			FormatID: result.FormatID, MediaType: result.MediaType,
+			Confidence: result.Confidence,
+		}
+		evidenceJSON, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("marshal detection evidence %d: %w", index, err)
+		}
+		evidenceID, err := sqlite.NewStableID(sqlite.IDPrefixDetectionEvidence)
+		if err != nil {
+			return err
+		}
+		confidence := result.Confidence
+		if err := tx.InsertDetectionEvidence(ctx, &sqlite.DetectionEvidence{
+			ID: evidenceID, WorkspaceID: workspaceID, ObservationID: observationID,
+			DetectorID: detectorID, DetectorDigest: detectorDigest,
+			EvidenceKind: kind, CandidateFormat: result.FormatID,
+			CandidateMIME: result.MediaType, Confidence: &confidence,
+			ExecutionClass: "BYTE_DETERMINISTIC", Evidence: evidenceJSON,
+			EvidenceDigest: DigestBytes(evidenceJSON), SandboxPolicyHash: sandboxPolicyHash,
+			StartedAt: observedAt, FinishedAt: observedAt,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func contentIDOf(entry scanner.EntryRecord) string {

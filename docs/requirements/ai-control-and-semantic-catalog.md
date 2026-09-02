@@ -46,7 +46,7 @@ This baseline is a real product feature, not a placeholder for later semantic se
 
 ## 4. Operator annotations and machine suggestions
 
-`RW-MVP-1` supports durable whole-subject tags, plain-text notes, versioned `DescriptionDocument` revisions, and source-aligned `SemanticSegment` records. AI description generation is optional and on-demand; user-authored and imported descriptions do not depend on a model. Later catalog profiles may add ratings, corrections, aliases, collections, relationships, and richer typed segments such as a page, time range, image region, archive member, source symbol, or media track.
+`RW-MVP-1` supports durable whole-subject tags, plain-text notes, versioned `DescriptionDocument` revisions, source-aligned `SemanticSegment` records, and the minimal file-only LinkGroup current state defined by the content-store contract. AI description generation is optional and on-demand; user-authored and imported descriptions do not depend on a model. Later catalog profiles may add ratings, corrections, aliases, richer Collections, relationships, and richer typed segments such as a page, time range, image region, archive member, source symbol, or media track.
 
 Operator-authored semantics are durable user data. They MUST:
 

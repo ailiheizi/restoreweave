@@ -52,7 +52,7 @@ These foundations are not release completion. In particular, fixture embeddings 
 | 3 | Recovery closure | 1, 2 | A clean machine can verify and restore without SQLite or indexes | Signed closure/publication and corruption tests pass |
 | 4 | Descriptions and complete discovery | 1, 3 | Users can search filename, metadata, text, tags, notes, descriptions, and semantic meaning | Structured coverage and segment provenance are complete |
 | 5 | Simple qualified storage savings | 2, 3 | Real physical savings are measured and recoverable | Repository codec/dedup qualification passes |
-| 6 | Export and operator ergonomics | 2, 3, 4, 5 | Users select by view and export without internal IDs | View -> manifest -> materialize -> verify passes |
+| 6 | Link groups, export, and operator ergonomics | 2, 3, 4, 5 | Users keep related file links together, select by group or view, and export without internal IDs | LinkGroup/view -> manifest -> materialize -> verify passes |
 | 7 | Release hardening | 3, 4, 5, 6 | Native personal-use installation and upgrade path | Full `RW-MVP-1` acceptance passes |
 
 The order is deliberate. Semantic features must not be allowed to hide missing recovery evidence, and neural compression must not be allowed to decide exact identity or postpone a trustworthy restore path.
@@ -88,8 +88,8 @@ This table is checkout status, not a change to phase gates:
 | 2 | **Sub-items complete in this checkout:** non-mutating ingest and restore planning, digest-bound apply, source/config/manifest/destination revalidation, same-plan replay, committed-publication reconciliation, verified completed-restore reconciliation, typed ingest-protection revision with reinspection/recomputation, fail-closed apply for blocked plans, per-subject degraded processor reporting, durable append-only processor terminal outcomes, a signed complete-state successor lineage that retains later outcomes without rewriting earlier attempts, and bounded automatic retry of the same signed processor plan with idempotency, leases/fencing, reconciliation, restart/resume, and retry ceilings. The exact apply Job remains successful after post-publication processor/index failure. **The Phase 2 gate remains open.** | Qualify the formal asynchronous processor model and define a separately signed contract for arbitrary manual, rerouted, or general reprocessing; production repository qualification and release acceptance belong to Phases 5 and 7 |
 | 3 | **Implemented and tested for the admitted development profile (2026-08-24):** Ed25519 `PREPARED_CLOSURE`, `PUBLICATION_COMMIT`, `PROCESSOR_ATTEMPT_CLOSURE`, and `PORTABLE_FACT_CLOSURE` records; portable mapping, descriptions/annotations, artifact-body attachments, typed filesystem facts, token-set export, immutable placement and independently hashed readback, generation/parent lineage, catalog-free validation/restore, clean-install import, independent-anchor validation, no-follow input/repository reads, cross-process fencing (including two real daemon processes sharing one catalog/repository), unknown-outcome reconciliation, bounded retry of the same signed processor plan, and raw/zstd relocation/corruption/reader-dependency evidence. The daemon enables signed publication by default | This is not release qualification. Manual reprocessing needs an explicit signed successor lineage; broader metadata/provenance capture, production repository selection (Phase 5), and full release acceptance remain open |
 | 4 | Durable description revisions and source-aligned segments have portable authenticated recovery with config/provider/segmentation profile bindings; the complete stated lexical/structured field scope, typed filters, segment-hit provenance, measured coverage, host-owned fusion, generation binding, honest semantic degradation, focused tests for the fixed development installer, and a real supervised Darwin arm64 ONNX/BGE + zvec daemon/CLI E2E (with corresponding opt-in Linux arm64 evidence) are implemented and executed. The browser adapter build/E2E covers semantic-unavailable degradation and does not claim browser install/restart/rebuild/real-query execution | Package the real pinned worker and bundle for supported offline installs, complete semantic coverage/qualification evidence, and make the qualified default broker lexical + structured + semantic |
-| 5 | `local-zstd-v1` remains an opt-in, no-Compose unencrypted candidate with whole-file SHA-256 deduplication, checksummed zstd payloads, transparent decode-and-hash verification, physical-byte placement receipts, profile mismatch protection, relocation/corruption tests, explicit host-owned repair and copy-forward migration that preserves repository identity, independently reopened source/target signed clean-reader verification with target-tamper rejection and source rollback restore, concurrent no-replace placement, catalog-free signed restore, fail-closed logical/duplicate/compression/physical/overhead/net accounting, and non-destructive verified placement inventory/root/active-lease candidate planning. A separate `local-zstd-encrypted-v1` experimental profile now proves host-owned AES-256-GCM key resolution, missing/wrong-key fail-closed behavior, encrypted readback, relocation, and key-rotation copy-forward without changing portable records or the config default | Encryption release admission, chunk deduplication, destructive collection, broader crash qualification, representative corpus measurements, full migration rollback/reader-closure qualification, packaging, and a release repository decision. Phase 5 remains open |
-| 6-7 | SavedView and frozen ExportManifest work for the stated local scope; a real daemon/CLI process test covers description/annotation/search -> view -> manifest -> materialize/verify -> independent-anchor clean restore | Phase 6 cannot qualify before Phases 4 and 5 close. Packaging, upgrade, backup, performance, ID-free ergonomics, and full release acceptance remain Phase 7 |
+| 5 | `local-zstd-v1` remains an opt-in, no-Docker-Compose unencrypted candidate with whole-file SHA-256 deduplication, checksummed zstd payloads, transparent decode-and-hash verification, physical-byte placement receipts, profile mismatch protection, relocation/corruption tests, explicit host-owned repair and copy-forward migration that preserves repository identity, independently reopened source/target signed clean-reader verification with target-tamper rejection and source rollback restore, concurrent no-replace placement, catalog-free signed restore, fail-closed logical/duplicate/compression/physical/overhead/net accounting, and non-destructive verified placement inventory/root/active-lease candidate planning. A separate `local-zstd-encrypted-v1` experimental profile now proves host-owned AES-256-GCM key resolution, missing/wrong-key fail-closed behavior, encrypted readback, relocation, and key-rotation copy-forward without changing portable records or the config default | Encryption release admission, chunk deduplication, destructive collection, broader crash qualification, representative corpus measurements, full migration rollback/reader-closure qualification, packaging, and a release repository decision. Phase 5 remains open |
+| 6-7 | SavedView and legacy flat-output ExportManifest work for the stated local scope; a real daemon/CLI process test covers description/annotation/search -> view -> manifest -> materialize/verify -> independent-anchor clean restore. Export v1 still uses a snapshot-local entry handle and single-component name. Minimal LinkGroup is documented but has no schema, operation, subject-kind/search authorization, group-aware export successor, browser flow, portable current-state record, or executable evidence | Phase 6 cannot qualify before Phases 4 and 5 close. Implement and qualify the minimal current-link LinkGroup and export successor without reopening richer Collections; packaging, upgrade, backup, performance, ID-free ergonomics, and full release acceptance remain Phase 7 |
 
 `capability.list` is fail-closed: without a real semantic provider it reports `SEMANTIC_INDEX_UNAVAILABLE`. Acoustic, semantic, and multimodal fixtures are available only to an explicitly enabled qualification harness and are never default capabilities.
 
@@ -101,7 +101,7 @@ The Phase 3 implementation lock remains the recovery guardrail for this checkpoi
 2. Extend sparse extent maps or per-field provenance only through a new reviewed portable-record shape; do not reinterpret the frozen admitted shape.
 3. Full repository repair, repository-profile migration/rollback, and engine selection remain Phase 5.
 
-After that, Phase 4 and Phase 5 may run in parallel. Phase 4 first delivers the real local ONNX/BGE worker, zvec generation, complete field coverage, segment provenance, and fused query. Phase 5 measures `local-zstd-v1` and selects and qualifies one mature repository target from the common evidence. Only then does Phase 6 complete and qualify views and exports.
+After that, Phase 4 and Phase 5 may run in parallel. Phase 4 first delivers the real local ONNX/BGE worker, zvec generation, complete field coverage, segment provenance, and fused query. Phase 5 measures `local-zstd-v1` and selects and qualifies one mature repository target from the common evidence. Only then does Phase 6 implement the reviewed minimal LinkGroup shape and complete and qualify groups, views, and exports. The LinkGroup documentation decision alone does not unlock that implementation.
 
 The later phase locks prohibit FUSE or network filesystem behavior; an OpenList fork or dependency; player or domain-reader behavior; additional acoustic/graph/multimodal dimensions; and RWKV/Transformer codec implementation. The retired OpenSubsonic/OPDS/Inbox compatibility code is not part of the daemon. Any future browser/API surface must remain a bounded adapter and cannot count as recovery or storage qualification.
 
@@ -354,7 +354,7 @@ the required decoder can make data unrecoverable.
 4. Total dependency overhead is included in net-savings reports.
 5. Removing an experimental codec does not make retained data unreadable.
 
-## 10. Phase 6: Export and Operator Ergonomics
+## 10. Phase 6: Link Groups, Export, and Operator Ergonomics
 
 Implement the user-facing organization loop:
 
@@ -366,16 +366,72 @@ rw export apply <manifest> --to <directory>
 rw export verify <manifest> --to <directory>
 ```
 
+Add one minimal LinkGroup path to the same typed core and adapters:
+
+```text
+create a named group from explicit file selections or one explicit directory
+show its current file links and member health
+add, remove, or rename links in one atomic update
+freeze the current resolved contents into an ExportManifest
+```
+
+The durable shape is one stable group subject and one complete current mapping
+from safe group-relative path to stable file `SubjectRef`. The LinkGroup has no
+version number, revision row, predecessor/successor chain, or member history.
+Files may occur in multiple groups without another repository placement.
+Directory import is only a convenience that builds the flat current mapping
+with relative paths; directories are not group members. The mapping is
+unordered and its unique relative-path keys are the only membership authority.
+
+The group does not pin `FileVersionId`, `SnapshotId`, content digest, or
+representation. When a stable file subject is updated, the live group shows
+the latest or last available admitted state that the ordinary subject resolver
+can provide. If it cannot be resolved or read, the link stays visible as
+`MISSING`/`UNAVAILABLE`; it does not silently disappear.
+An empty group remains until explicit deletion. SQLite transactionality may
+protect an update internally, but no concurrency token is exposed as a user
+version concept.
+
+Group name, tags, notes, and descriptions reuse the existing subject facts and
+search feed. Do not add a group database, group index dimension, nested group,
+member role, dependency graph, AI membership decision, ownership, or deletion
+authority. Do not add group-owned binary attachments or make a generated
+`.rwgroup` file the membership authority.
+
+Because membership is durable and must survive catalog loss, Phase 6 starts
+with three reviewed additions: group catalog/current-state portable records
+and clean-reader support; host subject-kind authorization plus a replayable
+group search feed; and an `ExportManifest` successor capable of resolving and
+pinning each current link's `FileVersionId`, snapshot, representation, and
+multi-component relative output path at export-plan time. The
+current namespace-only subject resolver/search feed, legacy snapshot-entry
+handle in export v1, single-component output name, and existing portable-fact
+schemas retain their original meaning. Phase 6 must include old-reader,
+migration, clean-import, corruption, missing-member, and path-collision
+evidence before the group operation is reported as implemented.
+
 Saved views remain dynamic. `ExportManifest` freezes membership, representations, output names, metadata/sidecar policy, config/profile digests, and verification requirements. Replaying a manifest is reproducible; reevaluating a view is not.
 
-Normal commands SHOULD accept a view, subject, path, or search expression and SHOULD print stable human references. Internal workspace/root/entry IDs remain available in JSON diagnostics but are not required for the ordinary loop.
+Normal commands SHOULD accept a LinkGroup, view, subject, path, or search
+expression and SHOULD print stable human references. Internal
+workspace/root/entry IDs remain available in JSON diagnostics but are not
+required for the ordinary loop.
 
 ### Exit tests
 
-1. View membership may change while an existing manifest does not.
-2. Export destination collisions, unsafe reuse, symlink attacks, and metadata degradation are explicit.
-3. Every materialized item has an exact or declared non-exact receipt.
-4. Re-running the same manifest is idempotent and verifies the same bytes.
+1. One explicit directory builds one current file-only LinkGroup mapping with complete accounting and preserved safe relative paths; a later rescan or edit atomically replaces that current mapping without creating group history.
+2. The same stable file may occur in two groups while exact placement and deduplication remain unchanged. Removing either link or deleting either group does not delete the file or change protection/GC eligibility.
+3. Updating a linked file subject is reflected by the live group. Freezing the group resolves and pins the exact file versions into an `ExportManifest`; later file or group changes cannot change that manifest.
+4. Missing members remain visible as unavailable, an empty group remains until explicit deletion, and neither state is silently collapsed.
+5. Catalog and index removal followed by authenticated import reconstructs the same current group mapping and resolves every available member recovery reference; corruption, missing members, path traversal, and duplicate output paths fail closed.
+6. View membership may change while an existing manifest does not.
+7. Export destination collisions, unsafe reuse, symlink attacks, and metadata degradation are explicit.
+8. Every materialized item has an exact or declared non-exact receipt.
+9. Repeating verification returns the same byte evidence. Applying to a
+   populated destination either reconciles an exact prior receipt through an
+   explicitly admitted successor operation or fails closed and directs the
+   operator to verify; it never overwrites merely because the manifest is the
+   same.
 
 ## 11. Phase 7: Release Hardening
 
@@ -390,7 +446,7 @@ Only after phases 0-6 pass:
 ### Exit tests
 
 1. A clean supported host installs without Docker Compose or first-query downloads, validates the generated config, and reports the exact repository, embedding, vector, reader, and trust profiles.
-2. The full ordinary loop succeeds: configure -> ingest plan -> review/apply -> fused search -> description/tag -> saved view -> frozen manifest -> materialize/verify -> clean restore.
+2. The full ordinary loop succeeds: configure -> ingest plan -> review/apply -> fused search -> description/tag -> LinkGroup or saved view -> frozen manifest -> materialize/verify -> clean restore.
 3. Removing SQLite and every index still permits authenticated clean discovery of committed recovery records and exact restore with an independently supplied trust anchor.
 4. Removing the semantic generation produces explicit degradation; rebuilding it restores the same profile-bound coverage without changing subjects or durable descriptions.
 5. Upgrade, interrupted upgrade, rollback, repository relocation, corruption, low-space, process crash, and reboot tests preserve or fail closed on every durable contract.
@@ -411,6 +467,8 @@ These are not blockers for the core plan and must not be pulled forward:
 - P2P/reacquisition automation without a separate `RetrieverDriver` profile;
 - RWKV/Transformer neural compression before the simple lossless profile is qualified;
 - enterprise HA, multitenancy, or distributed control plane.
+- richer Collections beyond the minimal file-only LinkGroup, including nested
+  groups, member roles, dependency graphs, ratings, and automatic AI grouping.
 
 ## 13. Traceability Rule
 

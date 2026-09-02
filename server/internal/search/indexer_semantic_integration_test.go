@@ -41,6 +41,7 @@ type integrationSemanticGenerationDriver struct {
 	mu               sync.Mutex
 	byPath           map[string][]ZvecSegment
 	membershipByPath map[string]map[ZvecCoverageIdentity]struct{}
+	coverageCalls    int
 }
 
 func (d *integrationSemanticGenerationDriver) ZvecReady(string, string, EmbeddingGenerationManifest) bool {
@@ -94,12 +95,19 @@ func (d *integrationSemanticGenerationDriver) Coverage(_ context.Context, spec Z
 func (d *integrationSemanticGenerationDriver) CoveragePairs(_ context.Context, spec ZvecGenerationSpec) ([]ZvecCoverageIdentity, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.coverageCalls++
 	segments := d.byPath[spec.Path]
 	pairs := make([]ZvecCoverageIdentity, 0, len(segments))
 	for _, segment := range segments {
 		pairs = append(pairs, ZvecCoverageIdentity{SubjectID: segment.SubjectID, SegmentID: segment.SegmentID})
 	}
 	return pairs, nil
+}
+
+func (d *integrationSemanticGenerationDriver) coverageProbeCalls() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.coverageCalls
 }
 
 func (d *integrationSemanticGenerationDriver) VerifyMembership(_ context.Context, spec ZvecGenerationSpec, candidates []ZvecCoverageIdentity) error {
@@ -612,8 +620,18 @@ func TestIndexerSemanticWarmAndQueryFailClosedForMissingGenerationMapping(t *tes
 	if err := store.InsertIndexGeneration(ctx, legacy); err != nil {
 		t.Fatalf("insert legacy semantic generation: %v", err)
 	}
+	if _, err := driver.Build(ctx, ZvecGenerationSpec{
+		Path: legacy.DBPath, LibraryPath: indexer.SemanticLibraryPath,
+		LibraryDigest: indexer.SemanticLibraryDigest, ProfileDigest: manifest.CanonicalDigest(),
+		Manifest: manifest,
+	}, []ZvecSegment{{SubjectID: seed.FileEntryID, SegmentID: "segment:valid", Vector: []float32{1, 0, 0, 0}}}); err != nil {
+		t.Fatalf("seed valid semantic backend coverage: %v", err)
+	}
 	if err := indexer.WarmSemanticGeneration(ctx, seed.WorkspaceID); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("warm missing mapping error = %v, want ErrUnavailable", err)
+	}
+	if calls := driver.coverageProbeCalls(); calls != 0 {
+		t.Fatalf("warm missing mapping performed backend coverage probe = %d, want 0", calls)
 	}
 	if IndexerReadiness(indexer).SemanticReal {
 		t.Fatal("missing generation mapping advertised semantic readiness")

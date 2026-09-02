@@ -148,7 +148,7 @@ func TestSemanticBundleCapabilityRejectsMissingOrCorruptBundle(t *testing.T) {
 	}
 }
 
-func TestSemanticBundleCapabilityAcceptsAdmittedBundleWithoutIndexReadiness(t *testing.T) {
+func TestSemanticBundleCapabilitySeparatesOperatorOverrideFromPinnedDefault(t *testing.T) {
 	sourceRoot := t.TempDir()
 	destination := filepath.Join(t.TempDir(), "bundle")
 	descriptor := search.SemanticBundleDescriptor{
@@ -197,13 +197,16 @@ func TestSemanticBundleCapabilityAcceptsAdmittedBundleWithoutIndexReadiness(t *t
 	if _, err := search.PackageSemanticBundle(destination, descriptor, sources); err != nil {
 		t.Fatalf("package test bundle: %v", err)
 	}
-	capability := semanticBundleCapability(destination, false)
-	if capability.State != command.CapabilityAvailable || capability.Version == "" {
-		t.Fatalf("admitted bundle capability = %+v, want AVAILABLE with profile digest", capability)
-	}
 	override := semanticBundleCapability(destination, true)
 	if override.State != command.CapabilityAvailable || override.Source != "operator-provided" || !strings.Contains(override.Notes, "not the release-pinned default") {
 		t.Fatalf("override capability = %+v, want explicit operator provenance", override)
+	}
+	defaultCapability := semanticBundleCapability(destination, false)
+	if defaultCapability.State != command.CapabilityUnavailable {
+		t.Fatalf("generic bundle default capability = %+v, want UNAVAILABLE", defaultCapability)
+	}
+	if override.State != command.CapabilityAvailable || override.Version == "" {
+		t.Fatalf("operator bundle capability = %+v, want AVAILABLE with profile digest", override)
 	}
 }
 
@@ -325,7 +328,7 @@ func TestConfigureSemanticBindingRequiresLocalZvecSelection(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			candidate := resolved
 			test.mutate(&candidate.Config)
-			_, _, err := configureSemanticBinding(context.Background(), candidate, nil, filepath.Join(t.TempDir(), "missing-bundle"))
+			_, _, err := configureSemanticBinding(context.Background(), candidate, nil, filepath.Join(t.TempDir(), "missing-bundle"), false)
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("configure error = %v, want %q", err, test.want)
 			}

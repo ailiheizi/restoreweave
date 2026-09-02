@@ -113,7 +113,19 @@ An unspecified or `ORIGINAL` selection resolves to the authoritative exact repre
 
 ## 4. Virtual collections and durable user state
 
-Collections are virtual by default and do not move or duplicate physical bytes. A later catalog profile should provide two forms:
+Collections are virtual by default and do not move or duplicate physical
+bytes. `RW-MVP-1` provides the file-only `LinkGroup` and the dynamic
+`SavedView`; the LinkGroup is deliberately smaller than a general collection:
+one stable group subject and one current map from safe group-relative paths to
+stable file `SubjectRef` values. It has no user-visible version number,
+revision chain, predecessor, or member-version pin. A file may belong to
+several groups, and changing a file does not require copying its bytes or
+creating a new group identity. Missing members remain in the current map with
+an explicit unavailable status until the operator removes the link.
+
+The richer `CollectionRevision/v1` shape in this extended design remains
+later and MUST NOT reinterpret the MVP LinkGroup or SavedView. A later catalog
+profile may provide two richer forms:
 
 - **Static collection:** an ordered, explicitly edited membership list of `SubjectRef` or `SegmentRef` values.
 - **Dynamic collection:** a saved, schema-checked query plus an optional pinned index-generation policy. Membership is evaluated against an authorized generation and is labeled as dynamic.
@@ -139,7 +151,12 @@ A `CollectionRevision/v1` contains:
 }
 ~~~
 
-Membership updates use immutable successor revisions and optimistic concurrency. A collection may contain mixed domains; a client decides whether a member is playable/readable. Missing or unauthorized members remain represented with typed status rather than silently disappearing from a durable collection.
+Membership updates for these richer collections use immutable successor
+revisions and optimistic concurrency. A collection may contain mixed domains;
+a client decides whether a member is playable/readable. Missing or
+unauthorized members remain represented with typed status rather than silently
+disappearing from a durable collection. Those richer collection semantics do
+not apply to the MVP LinkGroup mapping.
 
 Playback position, reading progress, bookmarks, highlights, ratings, watch history, queue state, and review decisions are typed annotation records. The host owns revision, subject binding, visibility, export, tombstone, and authorization; the domain pack owns the payload schema. Ephemeral decoder state, open queues, and UI layout remain app-owned and may be discarded.
 

@@ -10,12 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
-	"runtime"
 	"strings"
 	"testing"
-
-	ort "github.com/yalue/onnxruntime_go"
 )
 
 func TestStageVerifiedONNXRuntimeUsesPrivateImmutableCopy(t *testing.T) {
@@ -60,6 +56,7 @@ func TestPinnedONNXRuntimeGoDependencyAndHeader(t *testing.T) {
 		Path    string
 		Version string
 		Sum     string
+		Dir     string
 		Replace *struct{}
 	}
 	if err := json.Unmarshal(payload, &module); err != nil {
@@ -71,12 +68,10 @@ func TestPinnedONNXRuntimeGoDependencyAndHeader(t *testing.T) {
 	if onnxRuntimeGoModuleVersion != "v1.33.0" || onnxRuntimeGoBindingCommit != "b4e0f0b495a4ad1eb8a2f61c0286b6e670771525" {
 		t.Fatalf("unexpected binding pin %s/%s", onnxRuntimeGoModuleVersion, onnxRuntimeGoBindingCommit)
 	}
-	function := runtime.FuncForPC(reflect.ValueOf(ort.GetVersion).Pointer())
-	if function == nil {
-		t.Fatal("cannot locate ONNX Runtime Go binding source")
+	if strings.TrimSpace(module.Dir) == "" || !filepath.IsAbs(module.Dir) || filepath.Clean(module.Dir) != module.Dir {
+		t.Fatalf("linked dependency has no canonical source directory: %q", module.Dir)
 	}
-	source, _ := function.FileLine(function.Entry())
-	header := filepath.Join(filepath.Dir(source), "onnxruntime_c_api.h")
+	header := filepath.Join(module.Dir, "onnxruntime_c_api.h")
 	payload, err = os.ReadFile(header)
 	if err != nil {
 		t.Fatalf("read vendored C API header: %v", err)

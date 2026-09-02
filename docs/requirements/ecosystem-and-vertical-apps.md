@@ -32,7 +32,7 @@ The shared catalog has four durability layers:
 | Layer | Examples | Durability |
 | --- | --- | --- |
 | Core subject facts | `SubjectRef`, path, snapshot, exact digest, size, type evidence, representations, verification | Authoritative and recovery-relevant |
-| Common catalog facts | Tags, notes, source, timestamps, duplicate groups, processing state, collections | Authoritative user/catalog data |
+| Common catalog facts | Tags, notes, source, timestamps, duplicate groups, processing state, minimal link groups, and saved views | Authoritative user/catalog data |
 | Typed domain artifacts | Audio tags, video streams, book chapters, EXIF, game membership evidence | Versioned and provenance-bound; rebuildable unless explicitly promoted |
 | Search projections | Lexical, vector, visual, acoustic, graph, and recommendation indexes | Rebuildable and generation-pinned |
 
@@ -100,7 +100,7 @@ These capabilities should be implemented once and reused by every vertical:
 - Capture, placement, publication, verification, restore, and lifecycle evidence.
 - Generic metadata, type evidence, processing state, and failure reasons.
 - Versioned tags, notes, ratings, progress markers, and user corrections.
-- Virtual collections and saved queries that do not require physical file moves.
+- Minimal file-only LinkGroups and saved queries that do not require physical file moves.
 - Baseline lexical, structured, and bundled local text-semantic search.
 - Optional additional semantic and multimodal artifacts bound to stable subjects or segments.
 - Capability discovery, processor provenance, authorization, and resource limits.
@@ -355,7 +355,15 @@ Collections are virtual by default. A user can create:
 
 Collections store membership and ordering over stable subjects. They do not duplicate bytes or authorize deletion. Physical path moves are a separate reviewed operation.
 
-The baseline catalog profile should provide generic tags, notes, saved searches, and simple virtual collections as soon as `RW-CATALOG-1` is usable. Domain-specific collection lenses (albums, reading lists, seasons, photo projects, game libraries, and similar views) may arrive with later packs, but they must use the same `CollectionRef`/`CollectionRevision` records and remain portable across clients.
+The `RW-MVP-1` baseline provides generic tags, notes, `SavedView`, and the
+minimal file-only `LinkGroup` defined by the content-store contract. A
+LinkGroup is one stable group subject plus its current map of safe
+group-relative paths to stable file `SubjectRef` values. It is a composition
+of links, not a second copy of the files and not a versioned collection
+history. Richer virtual Collections and domain-specific lenses (albums,
+reading lists, seasons, photo projects, game libraries, and similar views)
+remain later profiles; they must remain portable across clients and MUST NOT
+reinterpret the LinkGroup mapping.
 
 ## 8. Client and presentation strategy
 
@@ -461,9 +469,9 @@ The design is successful when:
 5. User tags, notes, playlists, bookmarks, ratings, and reading/playback progress survive index rebuild and client replacement.
 6. An unresolved game remains searchable and restorable as generic files; resolver failure does not authorize omission.
 7. A retrieval plugin cannot access credentials, network, or execution authority unless its profile explicitly grants them.
-8. A user can create a virtual collection without moving or duplicating physical bytes.
+8. A user can create a minimal LinkGroup or later virtual collection without moving or duplicating physical bytes.
 9. Every domain result links to an authoritative `SubjectRef` or `SegmentRef` and exposes its provenance and freshness.
-10. The same collection can be browsed through CLI, MCP, a universal UI, and specialized clients with equivalent authorization and recovery semantics.
+10. The same group or collection can be browsed through CLI, MCP, a universal UI, and specialized clients with equivalent authorization and recovery semantics.
 
 ## 14. Product recommendation
 

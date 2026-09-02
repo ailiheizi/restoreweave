@@ -77,9 +77,10 @@ RestoreWeave helps an operator:
 3. Select safe storage strategies with strong automatic defaults and human control over weaker outcomes.
 4. Reduce physical storage through exact deduplication, compression, and later class-specific representations.
 5. Search paths, metadata, durable tags and notes, extracted content, and local semantic embeddings through one subject model.
-6. Browse and read data through its original directory structure regardless of physical layout.
-7. Update processors or indexes without invalidating stored content or losing historical meaning.
-8. Verify storage through independent readback and restore on a fresh installation.
+6. Keep related files together as a minimal link group without copying their bytes or turning source directories into the catalog.
+7. Browse and read data through its original directory structure regardless of physical layout.
+8. Update processors or indexes without invalidating stored content or losing historical meaning.
+9. Verify storage through independent readback and restore on a fresh installation.
 
 ## 4. Product promise
 
@@ -150,6 +151,7 @@ The core owns facts and decisions that require one trusted arbiter:
 - Portable Recovery Record Format publication and verification acceptance.
 - `SnapshotTree`, `FileAccess`, and subject-resolution semantics.
 - Versioned user tag and note records, revision checks, tombstones, and portable export truth.
+- Stable LinkGroup identity and one authoritative current member mapping for the minimal file-only grouping profile.
 - Generation tracking for derived metadata and indexes.
 
 The core is a finite data and recovery coordinator. It is not a general workflow engine, model runtime, vector database, media server, or autonomous agent.
@@ -185,6 +187,7 @@ The first distribution includes:
 - A mature exact repository integration providing compression, deduplication, encryption, and readback.
 - Qualified default metadata and text extraction for common formats.
 - Durable, versioned tag and note CRUD with portable export independent of index storage.
+- Minimal LinkGroups that reuse subject descriptions, tags, notes, search, exact file recovery, and export manifests without copying file bytes.
 - An operational catalog, bundled lexical/structured index, and bundled local semantic generation.
 - A read-only snapshot namespace with browse, bounded read, export-manifest materialization, and restore.
 - Export-manifest and `FileAccess` contracts that external presentation tools may consume; no filesystem or network-mount adapter ships in `RW-MVP-1`.
@@ -215,11 +218,53 @@ The core does not infer snapshot consistency from a platform name. A snapshot-ca
 
 ### 7.2 Subject and content identity
 
-A **Subject** is a durable reference to a source entry, snapshot entry, file version, directory, collection, representation, or segment. A **ContentIdentity** binds exact bytes to length and an independent cryptographic digest.
+A **Subject** is a durable reference to a stable logical file, source entry,
+snapshot entry, file version, directory, LinkGroup, representation, or
+segment. A **ContentIdentity** binds exact bytes to length and an independent
+cryptographic digest.
 
 Paths identify namespace positions, not byte identity. Duplicate paths may share a content identity while retaining distinct names and metadata.
 
-### 7.3 Classification evidence
+### 7.3 LinkGroup
+
+A **LinkGroup** is the minimal durable answer to “which files belong
+together?” It is one stable group subject with one current member mapping.
+Each member maps a safe group-relative path to one stable file `SubjectRef`.
+The mapping describes the group's current composition; it is not a second
+file identity, a version history, or a frozen snapshot. When a file is
+rescanned, the link continues to identify that file subject and the group
+shows the latest or last available content that the subject can provide.
+
+The group-relative path is unique within the current mapping. Adding,
+removing, or renaming a member atomically updates that mapping. The group has
+no user-visible version number, predecessor/successor chain, ordering, or
+history. When a fixed point-in-time set is needed, `ExportManifest` resolves
+the current links and freezes the concrete file versions and representations
+for that export.
+
+A file may appear in multiple LinkGroups. That creates additional membership
+facts, not additional file bytes: exact placement and deduplication continue
+to use `ContentIdentity`. LinkGroup membership is not ownership, protection
+policy, deletion authority, a physical directory, a repository pack, or an
+index dimension. Removing a member or deleting a group does not delete the
+file or make its representation collection-eligible.
+
+The group itself is a `Subject`, so its name and durable descriptions, tags,
+and notes reuse the existing subject mechanisms and search feed. The current
+member mapping is the only membership authority. Reverse “groups containing
+this file” views are projections of that mapping and MUST NOT be independently
+written.
+
+The initial profile is intentionally narrow: members are files only. It has
+no nested groups, member roles, dependency graph, ratings, AI-created
+membership, or separate collection database. An explicit “add directory as a
+group” action records each admitted file subject and its relative path; it
+does not change the source namespace into the group model. A missing or
+unavailable member remains in the mapping and is shown as such; it is never
+silently dropped. An empty group remains until the operator explicitly
+deletes the group.
+
+### 7.4 Classification evidence
 
 Classification is an evidence set, not one mutable MIME string. Evidence records include method, implementation, version, inspected range, output, confidence where applicable, and conflicts.
 
@@ -232,13 +277,13 @@ The default evidence ladder is:
 
 Later evidence may refine a class but cannot erase earlier evidence or silently change a committed representation contract.
 
-### 7.4 Processor
+### 7.5 Processor
 
 A **Processor** advertises typed capabilities and receives bounded immutable inputs. Capabilities may perform learned classification, parsing, extraction, enrichment, fingerprinting, transformation, validation, or index preparation.
 
 Each result records implementation and configuration identity, dependency digests, coverage, resource use, warnings, and output schemas. Processor output remains non-authoritative until the core validates and admits it.
 
-### 7.5 Representation kind, recovery claim, and lifecycle
+### 7.6 Representation kind, recovery claim, and lifecycle
 
 A **Representation** is a stored or derivable form of a subject. Representation kind is separate from its recovery claim and lifecycle:
 
@@ -251,21 +296,21 @@ Recovery claims use the subject, relation, validator, and policy model in [Recov
 
 The MVP publishes only exact source recovery. Repository-private compression and deduplication are physical implementation details beneath that contract. Later representation kinds and claims require explicit policy and qualification.
 
-### 7.6 Namespace
+### 7.7 Namespace
 
 A **Namespace** maps original paths and metadata to content and representation identities for one immutable snapshot. It remains independent of repository-private chunk, pack, and object layouts.
 
-### 7.7 Plan and decision authority
+### 7.8 Plan and decision authority
 
 A **Plan** is an immutable, digest-addressed blueprint covering scope, processing, representations, placements, expected savings, verification, risks, and unresolved decisions.
 
 Review creates a successor plan. A human or previously published policy supplies authority for exclusions or weaker representations. A processor, search result, MCP client, or conversational confirmation cannot approve its own recommendation.
 
-### 7.8 Derived index generation
+### 7.9 Derived index generation
 
 An **IndexGeneration** binds an index provider and configuration to a precise set of subjects and processor artifacts. It can be discarded and rebuilt. Search results cite durable subject references and the generation that produced them.
 
-### 7.9 Publication and verification
+### 7.10 Publication and verification
 
 A **Publication** is a committed recoverable snapshot backed by repository receipts and a portable recovery closure. A **VerificationRecord** captures independent evidence such as authenticated metadata, sampled readback, full-byte readback, or an exact restore.
 
@@ -293,9 +338,9 @@ The exact lane is mandatory and independent. Classification and processing impro
 ### 8.2 Discover and access
 
 ```text
-query path, metadata, type, checksum, duplicate, tag, note, description, extracted text, or semantic meaning
+query path, metadata, type, checksum, duplicate, tag, note, description, group, extracted text, or semantic meaning
 -> resolve result to durable SubjectRef
--> inspect provenance and available representations
+-> inspect provenance, group membership, and available representations
 -> browse namespace, open bounded content, or materialize an export
 ```
 
@@ -420,14 +465,27 @@ The public discovery model must permit later alternate lexical, vector, hybrid, 
 
 Basic user-authored tags and notes are Product Milestone 1 durable data, not an external-catalog dependency. The core stores them as versioned records bound to stable `SubjectRef` values with author, time, revision, visibility, provenance, and tombstone state. The CLI provides create, read/list, update, delete, and portable export operations with optimistic revision checks. Annotation changes feed the lexical index without re-ingesting content, survive index deletion, and can be exported and re-imported without losing subject bindings.
 
-Collections, ratings, accepted relationship graphs, recovery-intent services, and machine-suggested annotation workflows are later capabilities. They must remain distinguishable from operator-authored tags and notes.
+The minimal Product Milestone 1 LinkGroup reuses the same stable-subject,
+annotation, description, and search contracts. Phase 6 MUST extend the
+host-owned subject registry, authorization, and replayable search feed for the
+group subject kind; the current namespace-only implementation is not evidence
+of this capability. Searching a group name, description, tag, or note MAY then
+return the group subject; selecting it resolves the current member mapping and
+its current file members. Member contents are not copied into the group description or
+a new index dimension. Richer
+Collections, nested groups, roles, ratings, accepted relationship graphs,
+recovery-intent services, and machine-suggested grouping or annotation
+workflows are later capabilities. They must remain distinguishable from
+operator-authored membership, tags, and notes.
 
 ### FR-08: Incremental lifecycle
 
 RestoreWeave must distinguish source mutation, new snapshot publication, representation replacement, index rebuild, and repository retention.
 
 - Unchanged content identities should reuse admitted representations and processor artifacts when provenance and policy still match.
-- Changed content creates a new subject version and does not rewrite historical snapshots.
+- Changed content creates a new immutable `FileVersion` and snapshot
+  observation without rewriting historical snapshots. When the capture policy
+  accepts continuity, the stable file `SubjectRef` remains the same.
 - A deleted source path becomes a tombstone or absence in a later namespace generation; it does not erase prior published snapshots.
 - Processor or model upgrades create new derived generations and may run incrementally.
 - Representation migration must verify the new placement before retiring an old placement.
@@ -470,6 +528,16 @@ A successful managed-ingest apply must publish an authenticated Recovery Record 
 - Component and schema compatibility information.
 
 User tags and notes may change after an immutable snapshot publication, so their revision stream is exported as a separately authenticated portable annotation bundle bound to `SubjectRef` values and snapshot identities. Recovery export may include or reference a pinned annotation-bundle revision without rewriting the original snapshot commit. Losing a lexical index must never lose this bundle or its authoritative records.
+
+LinkGroup descriptors and the current member mapping are durable user facts
+and require authenticated portable export before the feature can ship. The
+portable form records each group-relative path and stable file `SubjectRef`,
+including a visible missing or unavailable state; it does not create a group
+version history or reinterpret an existing namespace, annotation, or
+portable-fact schema. Freezing a group with multi-component relative paths
+requires an `ExportManifest` successor; the existing manifest shape and
+legacy snapshot-entry handle retain their original meaning. Compatibility
+tests MUST cover old readers and old publications.
 
 The crash-safe publication sequence preserves distinct `PAYLOAD`, `PREPARED_CLOSURE`, and signed `PUBLICATION_COMMIT` facts. Orphan payloads or prepared closures are not published snapshots.
 
@@ -517,6 +585,13 @@ A compatible RestoreWeave reader, repository access, portable recovery closure, 
 
 Tag and note recovery must work without the lexical index by importing a valid portable annotation bundle into a compatible catalog. The index may then be rebuilt from namespace, extracted artifacts, and authoritative annotation records.
 
+Once admitted, LinkGroup recovery must likewise work without the operational
+catalog or any search index by importing an authenticated group descriptor and
+current member mapping. Each member then restores through its existing
+recovery reference. A missing or unhealthy member is reported individually
+and cannot be hidden behind a successful group status. An empty group remains
+recoverable until explicitly deleted.
+
 ### FR-15: Operations and observability
 
 Long-running operations must be durable, idempotent, cancellable, resumable, and observable through ordered events. Ambiguous external outcomes enter reconciliation rather than silent retry.
@@ -552,6 +627,7 @@ Status must separate:
 | Embeddings | Isolated ONNX Runtime worker with pinned `BAAI/bge-small-zh-v1.5` profile |
 | Vector store | In-process zvec v0.6.x through `zvec-go`; Qdrant and Milvus are not MVP dependencies |
 | Annotations | Durable versioned tag and note CRUD plus portable export |
+| Link groups | Minimal file-only current membership mapping with safe group-relative paths; no version history, nesting, roles, dependency graph, or automatic grouping |
 | Namespace | Read-only authenticated `SnapshotTree` and `FileAccess`, with export-manifest materialization; no built-in mount service |
 | Human interface | CLI |
 | Automation interface | Stable JSON/JSONL and local read-only MCP |
@@ -576,6 +652,7 @@ The first profile proves the complete NAS data-layer loop:
 - Default local zvec-backed semantic search plus lexical and structured search.
 - Export-manifest materialization to an explicit destination.
 - Durable tag and note CRUD with portable export.
+- Minimal file-only LinkGroups with current group-relative membership mappings, subject-bound descriptions/annotations, and portable recovery.
 - Default hybrid lexical, structured, semantic, checksum, duplicate, tag, and note search.
 - Incremental reruns and processor-generation tracking.
 - Verification and clean-install exact restore.
@@ -589,7 +666,7 @@ This profile also proves practical replaceability through at least one independe
 
 ### 11.3 Semantic and multimodal expansion
 
-The next discovery stage adds external OCR, ASR, captions, alternate embedding spaces, CLIP, acoustic fingerprints, additional vector/graph/multimodal indexes, richer query ranking, external metadata enrichment, collections, ratings, and relationship graphs. The bundled local text embedding and its default hybrid lexical/structured/semantic broker are already `RW-MVP-1` requirements.
+The next discovery stage adds external OCR, ASR, captions, alternate embedding spaces, CLIP, acoustic fingerprints, additional vector/graph/multimodal indexes, richer query ranking, external metadata enrichment, richer Collections beyond the minimal LinkGroup, ratings, and relationship graphs. The bundled local text embedding and its default hybrid lexical/structured/semantic broker are already `RW-MVP-1` requirements.
 
 These are product capabilities delivered through replaceable processors and index providers. They remain outside exact recovery dependencies and can be upgraded or rebuilt independently.
 
@@ -615,7 +692,7 @@ The first qualified profile does not require:
 - Authoritative external reacquisition, magnet, BitTorrent, or swarm storage.
 - A WebUI, public REST listener, A2A protocol, or workflow marketplace.
 - A writable primary NAS filesystem or synchronization engine.
-- Collections, ratings, relationship graphs, or semantic knowledge management beyond basic tags and notes.
+- Collections beyond the minimal file-only LinkGroup, including nested groups, member roles, dependency graphs, ratings, or semantic knowledge management beyond basic tags, notes, and group descriptions.
 - Multiple repositories, erasure coding, or a redundancy claim.
 - Multitenancy, high availability, enterprise identity, compliance, or legal hold.
 - Application-consistent database, virtual-machine, container, game, or bare-metal capture.
@@ -641,6 +718,7 @@ These are product-level milestones, not the numbered engineering phases. The dep
 - Durable tag, note, and description revisions with portable export and complete lexical/structured feed coverage.
 - The real bundled local ONNX/BGE embedding worker, in-process zvec generation, and default fused lexical/structured/semantic query with honest degradation.
 - Dynamic saved views that freeze into immutable export manifests.
+- Minimal file-only LinkGroups that map group-relative paths to stable file subjects, reuse the existing subject semantic layer, and freeze into immutable export manifests.
 - Export-manifest materialization and authenticated `FileAccess` reads over the namespace; mounting and network filesystem presentation are external-tool responsibilities.
 - Baseline search, incremental operation, verification, recovery export, and clean-install restore.
 - Strong defaults and installation diagnostics.
@@ -655,7 +733,7 @@ These are product-level milestones, not the numbered engineering phases. The dep
 ### Product Milestone 3: Additional semantic discovery and advanced storage profiles
 
 - Alternate or external embedding, CLIP, OCR, ASR, caption, vector, and hybrid search providers beyond the bundled local text profile.
-- Subject-bound collections, ratings, relationship graphs, machine suggestions, and external enrichment.
+- Richer subject-bound Collections, nested groups, roles, ratings, relationship graphs, machine suggestions, and external enrichment beyond the minimal LinkGroup.
 - Optional external SMB, NFS, WebDAV, S3, media-server, or other presentation integrations. RestoreWeave does not ship those gateways.
 - Lossless class-specific transforms and tier placement.
 - Multiple failure-independent repositories.
@@ -724,6 +802,7 @@ These are product-level milestones, not the numbered engineering phases. The dep
 | Source deletion destroys the safety story | Keep deletion disabled by default and require separately reviewed migration and retention policies |
 | Search scope overwhelms the MVP | Keep the required local semantic profile bounded and generation-aware, with metadata and extracted-text dimensions as the explicit fallback when semantic indexing is unavailable |
 | User annotations become disposable index state | Store tag and note revisions durably, export them portably, and rebuild lexical projections from authoritative records |
+| Link groups become folders, ownership, or a second catalog | Keep one file-only current membership mapping in the configured catalog, map relative paths to stable subjects, reuse existing subject semantics and export, and require an authenticated current-state portable record before shipping |
 
 ## 16. Research basis
 

@@ -124,13 +124,17 @@ The artifact envelope does not make its payload authoritative. It becomes visibl
 
 ### 5.1 Durable user semantics
 
-User-authored tags, notes, and description revisions are MVP **AUTHORITATIVE_DATA** with subtype **DURABLE_USER_SEMANTICS**. Imported and model-generated descriptions are durable attributed records with their own authority/provenance class. Later catalog profiles MAY add ratings, corrections, collections, aliases, and relationships; once enabled, those values use the same authoritative lifecycle rather than disposable index state.
+User-authored tags, notes, description revisions, and the minimal file-only LinkGroup current state are MVP **AUTHORITATIVE_DATA** with subtype **DURABLE_USER_SEMANTICS**. Imported and model-generated descriptions are durable attributed records with their own authority/provenance class. Later catalog profiles MAY add ratings, corrections, richer Collections, aliases, and relationships; once enabled, those values use the same authoritative lifecycle rather than disposable index state.
 
 Durable user semantics MUST:
 
-- Bind to a `SubjectRef` and optional typed segment; later collections bind through their own versioned identities.
-- Record author, time, revision, and conflict history.
-- Support portable export and exact protection.
+- Bind to a `SubjectRef` and optional typed segment. A minimal LinkGroup additionally has one stable group `SubjectRef` and a current map from each group-relative path to a stable member-file `SubjectRef`; later richer Collections may use their own identities.
+- Record author, time, and type-appropriate provenance. Records whose contract
+  is versioned retain revision and conflict history; the minimal LinkGroup
+  current mapping does not create such a history.
+- Support authenticated portable export. Exact protection applies to
+  byte-bearing records; a LinkGroup mapping is metadata, creates no exact
+  payload or `ProtectionRecord`, and never owns member bytes.
 - Remain available when every semantic model and index is removed.
 - Never be overwritten by machine-generated enrichment.
 
@@ -267,7 +271,7 @@ A **DiscoveryQuery** contains:
 
 The structured-filter expression is a bounded tree of `all`, `any`, and `not` nodes over typed field predicates. A predicate contains a registered field, a schema-allowed operator, and typed value or values. Baseline operators include `EQ`, `NE`, `IN`, `NOT_IN`, `LT`, `LTE`, `GT`, `GTE`, `BETWEEN`, `PREFIX`, `CONTAINS`, and `EXISTS`. Providers MUST reject unsupported field/operator pairs rather than interpreting raw SQL or provider query syntax.
 
-The MVP field registry includes path, filename, suffix, selected format, content class, logical size, recorded time, source, snapshot, representation state, verification state, processing state, tag, and note text. Later profiles MAY register collection, rating, relationship, and graph fields through versioned query schemas.
+The MVP field registry includes path, filename, suffix, selected format, content class, logical size, recorded time, source, snapshot, representation state, verification state, processing state, tag, note text, LinkGroup name, and LinkGroup subject kind. Later profiles MAY register richer Collection, rating, relationship, and graph fields through versioned query schemas.
 
 Supported clause types MAY include:
 
@@ -308,7 +312,7 @@ A `QueryProvider` may combine:
 - Structured metadata and tags.
 - Vector similarity.
 - Acoustic or perceptual fingerprints.
-- Later collection and graph relations.
+- Minimal LinkGroup facts, plus later richer Collection and graph relations.
 - Recency, frequency, and operator-defined importance.
 
 Each score component MUST retain its producer, index generation, range, and normalization semantics. The `QueryProvider` profile defines retrieval, fusion, tie breaking, missing-component behavior, and deterministic or stochastic class.
@@ -460,7 +464,7 @@ The reference product SHOULD deliver semantic value incrementally:
 - Processor-produced CLIP-compatible image and text features.
 - Processor-produced audio, video, code, graph, and domain-specific features.
 - Compatible IndexProvider projections and QueryProvider-owned hybrid retrieval, ranking, recommendations, and related-content views.
-- Later collections, ratings, relationships, and graph catalog views.
+- Minimal LinkGroup views, plus later richer Collections, ratings, relationships, and graph catalog views.
 
 ### Experimental storage representations
 

@@ -8,13 +8,28 @@ import type { Locale, Translator } from "./i18n";
 import "./styles.css";
 
 type Result = { status?: string; data?: any; reasons?: Array<{ message?: string }> };
-type SearchHit = { subject_ref?: string; entry_id?: string; name?: string; path?: string; entry_type?: string; content_id?: string; logical_size?: number; segments?: Array<{ matched_text?: string; producer?: string }> };
+type SearchSegment = {
+  description_document_id?: string;
+  source_type?: string;
+  source_id?: string;
+  semantic_segment_id?: string;
+  ordinal?: number;
+  matched_text?: string;
+  kind?: string;
+  producer?: string;
+  accepted?: boolean;
+  language?: string;
+};
+type SearchHit = { subject_ref?: string; entry_id?: string; name?: string; path?: string; entry_type?: string; content_id?: string; logical_size?: number; segments?: SearchSegment[] };
 type AnnotationRecord = { annotation_id?: string; subject_ref?: string; kind?: string; body?: string; tombstoned?: boolean; revision?: number; updated_at?: string };
 type SnapshotSummary = { snapshot_ref?: string; workspace_id?: string; namespace_root_id?: string };
 type SourceScan = { scan_ref?: string; generation?: number; state?: string; full_traversal?: boolean; started_at?: string; finished_at?: string; entries?: number; regular_files?: number; directories?: number; symlinks?: number; special_files?: number; bytes_hashed?: number; failed_entries?: number; unstable_entries?: number; detection_failures?: number };
 type SourceSummary = { source_ref?: string; kind?: string; locator?: string; state?: string; reachability?: string; reachability_checked_at?: string; reachability_message?: string; latest_scan?: SourceScan; latest_snapshot_ref?: string; latest_namespace_root_id?: string };
 type SourceProjection = { state: "READY" | "DEGRADED"; message?: string };
 type ActionFeedback = { state: "IDLE" | "RUNNING" | "SUCCEEDED" | "DEGRADED" | "FAILED"; message?: string };
+type DetailResourceStatus = "idle" | "loading" | "ready" | "error";
+type DetailState = { subjectRef: string; annotations: DetailResourceStatus; representations: DetailResourceStatus; descriptions: DetailResourceStatus };
+type DetailCollection = { status: DetailResourceStatus; items: any[] };
 type BrowseCrumb = { subject_ref: string; entry_id: string; name: string };
 type BrowseRoot = { root_id: string; name: string; source_path?: string };
 type SettingsSection = "storage" | "search" | "descriptions" | "recovery" | "service";
@@ -51,6 +66,25 @@ async function command(operation: string, input: unknown): Promise<Result> {
   return payload;
 }
 
+function subjectBoundDetailCollection(result: PromiseSettledResult<Result>, key: "annotations" | "documents" | "representations", subjectRef: string): DetailCollection {
+  if (result.status !== "fulfilled" || result.value.status !== "SUCCEEDED") return { status: "error", items: [] };
+  const data = result.value.data;
+  const items = data?.[key];
+  if (!Array.isArray(items)) return { status: "error", items: [] };
+  if (key === "representations") {
+    return typeof data?.subject_ref === "string" && data.subject_ref.trim() === subjectRef
+      ? { status: "ready", items }
+      : { status: "error", items: [] };
+  }
+  return items.every((item) => typeof item?.subject_ref === "string" && item.subject_ref.trim() === subjectRef)
+    ? { status: "ready", items }
+    : { status: "error", items: [] };
+}
+
+function annotationBelongsToSubject(annotation: unknown, subjectRef: string): annotation is AnnotationRecord {
+  return Boolean(subjectRef && typeof annotation === "object" && annotation && typeof (annotation as AnnotationRecord).subject_ref === "string" && (annotation as AnnotationRecord).subject_ref?.trim() === subjectRef);
+}
+
 function App() {
   const [locale, setLocale] = useState<Locale>(resolveInitialLocale);
   const [query, setQuery] = useState("");
@@ -63,6 +97,7 @@ function App() {
   const [annotations, setAnnotations] = useState<any[]>([]);
   const [representations, setRepresentations] = useState<any[]>([]);
   const [descriptions, setDescriptions] = useState<any[]>([]);
+  const [detailState, setDetailState] = useState<DetailState>({ subjectRef: "", annotations: "idle", representations: "idle", descriptions: "idle" });
   const [statusData, setStatusData] = useState<any>();
   const [capabilities, setCapabilities] = useState<any[]>([]);
   const [sources, setSources] = useState<SourceSummary[]>([]);
@@ -166,44 +201,101 @@ function App() {
   const tagVocabulary = useMemo(() => [...new Set(workspaceTags.map((tag) => tag.body?.trim()).filter((value): value is string => Boolean(value)))].sort((left, right) => left.localeCompare(right, locale)), [locale, workspaceTags]);
   const isConnected = status === "Connected";
   const isUnavailable = status === "Unavailable";
+  const catalogHealthy = statusData?.catalog?.ok === true;
+  const repositoryHealthy = statusData?.repository?.ok === true;
+  const annotationStorageReady = isConnected && catalogHealthy;
+  const coreStorageReady = isConnected && catalogHealthy && repositoryHealthy;
+  const coreStorageComponent = [
+    !catalogHealthy ? t("Catalog unavailable") : "",
+    !repositoryHealthy ? t("Repository unavailable") : "",
+  ].filter(Boolean).join("; ");
+  const coreStorageMessage = !isConnected
+    ? t("Could not connect to RestoreWeave service. Start the service, then refresh.")
+    : !statusData
+      ? t("Core storage status unavailable")
+      : t("Service connected, but core storage is unavailable: {{component}}", { component: coreStorageComponent || t("Core storage status unavailable") });
+  const catalogStorageMessage = !isConnected
+    ? t("Could not connect to RestoreWeave service. Start the service, then refresh.")
+    : !statusData
+      ? t("Core storage status unavailable")
+      : t("Service connected, but catalog is unavailable.");
   const drawerOpen = addOpen || settingsOpen || restoreOpen;
   const configDirty = useMemo(() => Boolean(configDraft && configData?.config && JSON.stringify(configDraft) !== JSON.stringify(configData.config)), [configDraft, configData]);
   const settingsGuard = useRef({ open: false, dirty: false, prompt: "" });
+  const refreshGenerationRef = useRef(0);
+  const detailRequestRef = useRef(0);
+  const detailSubjectRef = useRef("");
+
+  function clearCatalogBackedState() {
+    setWorkspaceID("");
+    window.localStorage.removeItem("restoreweave.workspace_id");
+    setSnapshotRef(""); setPlan(undefined); setRestorePlan(undefined); setAnnotations([]); setRepresentations([]); setDescriptions([]); setSources([]); setHits([]); setLibraryItems([]); setSelected(undefined);
+    setBrowseRootID(""); setBrowseRoots([]); setBrowseCrumbs([]);
+    setActiveTags([]); setActiveSystemFacets({ type: "", format: "", dedup: "" }); setViewMode("content");
+    detailRequestRef.current += 1; detailSubjectRef.current = ""; setDetailState({ subjectRef: "", annotations: "idle", representations: "idle", descriptions: "idle" });
+  }
+
+  function clearRepositoryDependentState() {
+    setSnapshotRef(""); setPlan(undefined); setRestorePlan(undefined);
+  }
 
   async function refresh() {
+    const refreshGeneration = ++refreshGenerationRef.current;
+    const isCurrentRefresh = () => refreshGenerationRef.current === refreshGeneration;
     setStatus("Checking service");
-    try {
-      const [health, statusResult, capabilityResult, snapshotResult] = await Promise.all([fetch(`${apiBase}/healthz`), command("status.get", {}), command("capability.list", {}), command("snapshot.list", {})]);
-      setStatus(health.ok && statusResult.status !== "FAILED" ? "Connected" : "Unavailable");
-      setStatusData(statusResult.data);
-      setCapabilities(capabilityResult.data?.capabilities ?? []);
-      const snapshots = (snapshotResult.data?.snapshots ?? []) as SnapshotSummary[];
-      const latest = snapshots.at(-1);
-      setSnapshotRef(latest?.snapshot_ref ?? "");
-      // A browser-local workspace id is only a convenience after an explicit
-      // ingest; it is not evidence for a newly opened daemon/catalog. Refresh
-      // trusts only durable state reported by this daemon.
-      const activeWorkspaceID = latest?.workspace_id || statusResult.data?.recent_plans?.[0]?.workspace_id || "";
-      if (activeWorkspaceID) rememberWorkspace(activeWorkspaceID);
-      if (activeWorkspaceID) {
-        try {
-          await loadSources(activeWorkspaceID);
-          if (latest) {
-            await loadContentLibrary(activeWorkspaceID);
-          } else {
-            setHits([]); setLibraryItems([]); setSelected(undefined); setBrowseRootID(""); setBrowseRoots([]); setBrowseCrumbs([]); setActiveTags([]); setActiveSystemFacets({ type: "", format: "", dedup: "" }); setViewMode("content");
-          }
-        } catch (error) {
-          setHits([]); setLibraryItems([]); setSelected(undefined); setBrowseRootID(""); setBrowseRoots([]); setBrowseCrumbs([]); setActiveTags([]); setActiveSystemFacets({ type: "", format: "", dedup: "" }); setViewMode("content");
-          setNotice({ kind: "warning", text: error instanceof Error ? t("Content library is unavailable: {{message}}", { message: error.message }) : t("Content library is unavailable.") });
-        }
-      } else {
-        setWorkspaceID(""); window.localStorage.removeItem("restoreweave.workspace_id"); setSourceProjection({ state: "READY" }); setSources([]); setHits([]); setLibraryItems([]); setSelected(undefined); setBrowseRootID(""); setBrowseRoots([]); setBrowseCrumbs([]); setActiveTags([]); setActiveSystemFacets({ type: "", format: "", dedup: "" }); setViewMode("content");
-      }
-    } catch {
+    const [healthResult, statusResult] = await Promise.allSettled([fetch(`${apiBase}/healthz`), command("status.get", {})]);
+    if (!isCurrentRefresh()) return;
+    if (healthResult.status !== "fulfilled" || statusResult.status !== "fulfilled") {
       setSourceProjection({ state: "DEGRADED" });
       setCapabilities([]);
+      setStatusData(undefined);
+      clearCatalogBackedState();
       setStatus("Unavailable");
+      return;
+    }
+    const health = healthResult.value;
+    const statusResponse = statusResult.value;
+    const serviceConnected = health.ok && statusResponse.status !== "FAILED";
+    const nextStatusData = statusResponse.data;
+    const nextCatalogHealthy = nextStatusData?.catalog?.ok === true;
+    const nextRepositoryHealthy = nextStatusData?.repository?.ok === true;
+    const nextCoreStorageReady = serviceConnected && nextCatalogHealthy && nextRepositoryHealthy;
+    setStatus(serviceConnected ? "Connected" : "Unavailable");
+    setStatusData(nextStatusData);
+
+    if (!serviceConnected || !nextCatalogHealthy) {
+      // A reachable HTTP adapter is not evidence that its durable catalog can
+      // serve content. Do not wait on catalog-backed follow-up operations
+      // before exposing that failure or clearing stale browser projections.
+      setCapabilities([]);
+      clearCatalogBackedState();
+      return;
+    }
+
+    const [capabilityResult, snapshotResult] = await Promise.allSettled([command("capability.list", {}), command("snapshot.list", {})]);
+    if (!isCurrentRefresh()) return;
+    if (capabilityResult.status === "fulfilled") setCapabilities(capabilityResult.value.data?.capabilities ?? []);
+    else setCapabilities([]);
+    const snapshots = snapshotResult.status === "fulfilled" ? (snapshotResult.value.data?.snapshots ?? []) as SnapshotSummary[] : [];
+    const latest = snapshots.at(-1);
+    if (nextCoreStorageReady && snapshotResult.status === "fulfilled") setSnapshotRef(latest?.snapshot_ref ?? "");
+    else clearRepositoryDependentState();
+    // A browser-local workspace id is only a convenience after an explicit
+    // ingest; it is not evidence for a newly opened daemon/catalog. Refresh
+    // trusts only durable state reported by this daemon.
+    const activeWorkspaceID = latest?.workspace_id || nextStatusData?.recent_plans?.[0]?.workspace_id || "";
+    if (activeWorkspaceID) rememberWorkspace(activeWorkspaceID);
+    if (activeWorkspaceID) {
+      try {
+        await loadSources(activeWorkspaceID, refreshGeneration);
+        await loadContentLibrary(activeWorkspaceID, refreshGeneration);
+      } catch (error) {
+        if (!isCurrentRefresh()) return;
+        setHits([]); setLibraryItems([]); setSelected(undefined); setBrowseRootID(""); setBrowseRoots([]); setBrowseCrumbs([]); setActiveTags([]); setActiveSystemFacets({ type: "", format: "", dedup: "" }); setViewMode("content");
+        setNotice({ kind: "warning", text: error instanceof Error ? t("Content library is unavailable: {{message}}", { message: error.message }) : t("Content library is unavailable.") });
+      }
+    } else {
+      clearCatalogBackedState(); setSourceProjection({ state: "READY" });
     }
   }
   async function refreshCapabilities() {
@@ -212,7 +304,6 @@ function App() {
       setCapabilities(response.data?.capabilities ?? []);
     } catch {
       setCapabilities([]);
-      setStatus("Unavailable");
     }
   }
   useEffect(() => { void refresh(); }, []);
@@ -264,6 +355,7 @@ function App() {
   async function runSearch(event?: FormEvent) {
     event?.preventDefault();
     if (!query.trim()) return;
+    if (!isConnected || !catalogHealthy) { setNotice({ kind: "error", text: catalogStorageMessage }); return; }
     if (!workspaceID) { setNotice({ kind: "warning", text: t("Add a source first so there is content to search.") }); return; }
     setBusy(true); setNotice(undefined);
     try {
@@ -294,20 +386,23 @@ function App() {
     })));
     setSelected(undefined); setBrowseRootID(rootID); setBrowseCrumbs(crumbs); setActiveTags([]); setActiveSystemFacets({ type: "", format: "", dedup: "" }); setViewMode("path");
   }
-  async function loadContentLibrary(activeWorkspaceID: string) {
+  async function loadContentLibrary(activeWorkspaceID: string, refreshGeneration = refreshGenerationRef.current) {
     const response = await command("content.list", { workspace_id: activeWorkspaceID });
+    if (refreshGenerationRef.current !== refreshGeneration) return;
     const items = (response.data?.items ?? []) as SearchHit[];
     setLibraryItems(items); setHits(items);
     const roots = (response.data?.roots ?? []) as BrowseRoot[];
     const rootID = response.data?.root_id || (roots.length === 1 ? roots[0].root_id : "");
     setSelected(undefined); setBrowseRoots(roots); setBrowseRootID(rootID); setBrowseCrumbs([]); setActiveTags([]); setActiveSystemFacets({ type: "", format: "", dedup: "" }); setViewMode("content");
   }
-  async function loadSources(activeWorkspaceID: string) {
+  async function loadSources(activeWorkspaceID: string, refreshGeneration = refreshGenerationRef.current) {
     try {
       const response = await command("source.list", { workspace_id: activeWorkspaceID });
+      if (refreshGenerationRef.current !== refreshGeneration) return;
       setSources((response.data?.sources ?? []) as SourceSummary[]);
       setSourceProjection({ state: "READY" });
     } catch {
+      if (refreshGenerationRef.current !== refreshGeneration) return;
       // Source management is a secondary projection; an unavailable projection
       // must not hide the content library or imply that saved bytes are gone.
       setSourceProjection({ state: "DEGRADED" });
@@ -415,6 +510,7 @@ function App() {
   }
   async function makePlan(event: FormEvent) {
     event.preventDefault(); if (!source.trim()) return;
+    if (!coreStorageReady) { setNotice({ kind: "error", text: coreStorageMessage }); return; }
     if (looksLikeRemoteLocator(source)) {
       setNotice({ kind: "warning", text: t("Web addresses are not supported here. Mount remote storage on the RestoreWeave host, then enter its server path.") });
       return;
@@ -426,29 +522,59 @@ function App() {
   }
   async function applyPlan() {
     if (!plan?.plan_id || !plan?.plan_digest) return;
+    if (!coreStorageReady) { setNotice({ kind: "error", text: coreStorageMessage }); return; }
     setBusy(true);
     try { const response = await command("plan.apply", { workspace_id: plan.workspace_id, plan_id: plan.plan_id, plan_digest: plan.plan_digest }); setPlan({ ...plan, ...response.data, state: response.data?.state ?? "SUCCEEDED" }); rememberWorkspace(response.data?.workspace_id ?? plan.workspace_id); const degraded = response.status === "DEGRADED" || (response.data?.warnings?.length ?? 0) > 0; setNotice({ kind: degraded ? "warning" : "success", text: t(degraded ? "Exact bytes saved, but derived processing is unavailable." : "Content saved. Exact bytes are now in the repository.") }); await refresh(); }
     catch (error) { setNotice({ kind: "error", text: error instanceof Error ? error.message : t("Could not save content") }); }
     finally { setBusy(false); }
   }
   async function loadDetails(hit: SearchHit) {
+    const subjectRef = hit.subject_ref?.trim() ?? "";
+    const requestToken = ++detailRequestRef.current;
+    detailSubjectRef.current = subjectRef;
     setSelected(hit); setAnnotations([]); setRepresentations([]); setDescriptions([]);
     setEditingNoteID(""); setEditingBody(""); setNoteDraft(""); setTagDraft("");
-    if (!workspaceID || !hit.subject_ref) return;
+    setDetailState({ subjectRef, annotations: "loading", representations: "loading", descriptions: "loading" });
+    if (!workspaceID || !subjectRef) {
+      setDetailState({ subjectRef, annotations: "error", representations: "error", descriptions: "error" });
+      return;
+    }
     const requests = await Promise.allSettled([
-      command("annotation.list", { workspace_id: workspaceID, subject_ref: hit.subject_ref }),
-      command("representation.list", { workspace_id: workspaceID, subject_ref: hit.subject_ref }),
-      command("description.list", { workspace_id: workspaceID, subject_ref: hit.subject_ref }),
+      command("annotation.list", { workspace_id: workspaceID, subject_ref: subjectRef }),
+      command("representation.list", { workspace_id: workspaceID, subject_ref: subjectRef }),
+      command("description.list", { workspace_id: workspaceID, subject_ref: subjectRef }),
     ]);
-    if (requests[0].status === "fulfilled") setAnnotations(requests[0].value.data?.annotations ?? []);
-    if (requests[1].status === "fulfilled") setRepresentations(requests[1].value.data?.representations ?? []);
-    if (requests[2].status === "fulfilled") setDescriptions(requests[2].value.data?.documents ?? []);
+    // A late response from a previous subject must never populate the current
+    // inspector. The subject check is intentional in addition to the token:
+    // it keeps detail writes bound to the durable Subject the user selected.
+    if (detailRequestRef.current !== requestToken || detailSubjectRef.current !== subjectRef) return;
+    const annotationResult = subjectBoundDetailCollection(requests[0], "annotations", subjectRef);
+    const representationResult = subjectBoundDetailCollection(requests[1], "representations", subjectRef);
+    const descriptionResult = subjectBoundDetailCollection(requests[2], "documents", subjectRef);
+    setDetailState({
+      subjectRef,
+      annotations: annotationResult.status,
+      representations: representationResult.status,
+      descriptions: descriptionResult.status,
+    });
+    setAnnotations(annotationResult.items);
+    setRepresentations(representationResult.items);
+    setDescriptions(descriptionResult.items);
   }
-  async function saveNote(annotationID = "", body = "", expectedRevision = 0) {
-    if (!selected?.subject_ref || !body.trim() || !workspaceID) return;
+  function detailIsCurrent(subjectRef: string, requestToken = detailRequestRef.current) {
+    return detailRequestRef.current === requestToken && detailSubjectRef.current === subjectRef;
+  }
+  function detailAnnotationsReady(subjectRef: string) {
+    return detailState.subjectRef === subjectRef && detailSubjectRef.current === subjectRef && detailState.annotations === "ready";
+  }
+  async function saveNote(annotationID = "", body = "", expectedRevision = 0, annotationSubjectRef = "") {
+    const subjectRef = selected?.subject_ref?.trim() ?? "";
+    if (!annotationStorageReady || !subjectRef || !body.trim() || !workspaceID || !detailAnnotationsReady(subjectRef) || (annotationID && annotationSubjectRef.trim() !== subjectRef)) { if (!annotationStorageReady) setNotice({ kind: "error", text: catalogStorageMessage }); return; }
+    const requestToken = detailRequestRef.current;
     setBusy(true);
     try {
-      const response = await command("annotation.upsert", { workspace_id: workspaceID, subject_ref: selected.subject_ref, kind: "NOTE", body: body.trim(), annotation_id: annotationID || undefined, expected_revision: expectedRevision });
+      const response = await command("annotation.upsert", { workspace_id: workspaceID, subject_ref: subjectRef, kind: "NOTE", body: body.trim(), annotation_id: annotationID || undefined, expected_revision: expectedRevision });
+      if (!detailIsCurrent(subjectRef, requestToken)) return;
       setAnnotations((items) => annotationID ? items.map((item) => item.annotation_id === annotationID ? response.data.annotation : item) : [...items, response.data.annotation]);
       setNoteDraft(""); setEditingNoteID(""); setEditingBody("");
       await refreshCapabilities();
@@ -471,10 +597,13 @@ function App() {
   }
   async function saveTag() {
     const body = tagDraft.trim();
-    if (!selected?.subject_ref || !workspaceID || !body) return;
+    const subjectRef = selected?.subject_ref?.trim() ?? "";
+    if (!annotationStorageReady || !subjectRef || !workspaceID || !body || !detailAnnotationsReady(subjectRef)) { if (!annotationStorageReady) setNotice({ kind: "error", text: catalogStorageMessage }); return; }
+    const requestToken = detailRequestRef.current;
     setBusy(true); setNotice(undefined);
     try {
-      const response = await command("annotation.upsert", { workspace_id: workspaceID, subject_ref: selected.subject_ref, kind: "TAG", body, expected_revision: 0 });
+      const response = await command("annotation.upsert", { workspace_id: workspaceID, subject_ref: subjectRef, kind: "TAG", body, expected_revision: 0 });
+      if (!detailIsCurrent(subjectRef, requestToken)) return;
       const annotation = response.data?.annotation;
       setAnnotations((items) => items.some((item) => item.annotation_id === annotation?.annotation_id) ? items : [...items, annotation]);
       setTagDraft("");
@@ -486,10 +615,13 @@ function App() {
     } finally { setBusy(false); }
   }
   async function deleteTag(tag: any) {
-    if (!workspaceID || !tag?.annotation_id || !tag?.revision) return;
+    const subjectRef = selected?.subject_ref?.trim() ?? "";
+    if (!annotationStorageReady || !workspaceID || !subjectRef || !tag?.annotation_id || !tag?.revision || !detailAnnotationsReady(subjectRef) || !annotationBelongsToSubject(tag, subjectRef)) { if (!annotationStorageReady) setNotice({ kind: "error", text: catalogStorageMessage }); return; }
+    const requestToken = detailRequestRef.current;
     setBusy(true); setNotice(undefined);
     try {
       await command("annotation.delete", { workspace_id: workspaceID, annotation_id: tag.annotation_id, expected_revision: tag.revision });
+      if (!detailIsCurrent(subjectRef, requestToken)) return;
       setAnnotations((items) => items.filter((item) => item.annotation_id !== tag.annotation_id));
       const remainingTags = await loadTagVocabulary(workspaceID);
       const removedValue = typeof tag.body === "string" ? tag.body.trim() : "";
@@ -507,10 +639,13 @@ function App() {
     } finally { setBusy(false); }
   }
   async function deleteNote(note: any) {
-    if (!workspaceID || !note?.annotation_id || !note?.revision || !window.confirm(t("Delete this note?"))) return;
+    const subjectRef = selected?.subject_ref?.trim() ?? "";
+    if (!annotationStorageReady || !workspaceID || !subjectRef || !note?.annotation_id || !note?.revision || !detailAnnotationsReady(subjectRef) || !annotationBelongsToSubject(note, subjectRef) || !window.confirm(t("Delete this note?"))) { if (!annotationStorageReady) setNotice({ kind: "error", text: catalogStorageMessage }); return; }
+    const requestToken = detailRequestRef.current;
     setBusy(true); setNotice(undefined);
     try {
       await command("annotation.delete", { workspace_id: workspaceID, annotation_id: note.annotation_id, expected_revision: note.revision });
+      if (!detailIsCurrent(subjectRef, requestToken)) return;
       setAnnotations((items) => items.filter((item) => item.annotation_id !== note.annotation_id));
       setEditingNoteID(""); setEditingBody("");
       await refreshCapabilities();
@@ -521,6 +656,7 @@ function App() {
   }
   async function makeRestorePlan(event: FormEvent) {
     event.preventDefault(); if (!snapshotRef || !restoreDestination.trim()) return;
+    if (!coreStorageReady) { setNotice({ kind: "error", text: coreStorageMessage }); return; }
     setBusy(true); setNotice(undefined);
     try { const response = await command("plan.restore", { snapshot_ref: snapshotRef, destination: restoreDestination.trim() }); setRestorePlan(response.data); setNotice({ kind: "success", text: t("Restore plan is ready to review.") }); }
     catch (error) { setNotice({ kind: "error", text: error instanceof Error ? error.message : t("Could not create restore plan") }); }
@@ -528,6 +664,7 @@ function App() {
   }
   async function applyRestore() {
     if (!restorePlan?.plan_id || !restorePlan?.plan_digest || !restorePlan?.workspace_id) return;
+    if (!coreStorageReady) { setNotice({ kind: "error", text: coreStorageMessage }); return; }
     setBusy(true);
     try { const response = await command("plan.apply", { workspace_id: restorePlan.workspace_id, plan_id: restorePlan.plan_id, plan_digest: restorePlan.plan_digest }); setRestorePlan({ ...restorePlan, ...response.data, state: response.data?.state ?? "SUCCEEDED" }); setRestoreOpen(false); setNotice({ kind: "success", text: t("Restored and verified {{files}} file(s) to {{destination}}.", { files: response.data?.files ?? restorePlan.files, destination: response.data?.destination ?? restoreDestination }) }); }
     catch (error) { setNotice({ kind: "error", text: error instanceof Error ? error.message : t("Could not restore snapshot") }); }
@@ -536,6 +673,7 @@ function App() {
   function rememberWorkspace(value: unknown) { if (typeof value === "string" && value.trim()) { setWorkspaceID(value); window.localStorage.setItem("restoreweave.workspace_id", value); } }
   function canLeaveSettings() { return !settingsOpen || !configDirty || window.confirm(t("Discard unsaved settings?")); }
   function openAdd(sourceItem?: SourceSummary) {
+    if (!isConnected || !coreStorageReady) { setNotice({ kind: "error", text: coreStorageMessage }); return; }
     if (!canLeaveSettings()) return;
     setSettingsOpen(false); setRestoreOpen(false);
     setSource(sourceItem?.locator?.trim() ?? ""); setPlan(undefined);
@@ -557,7 +695,7 @@ function App() {
     } finally { setBusy(false); }
   }
   function openSettings() { setAddOpen(false); setRecheckSourceRef(""); setRestoreOpen(false); setSettingsOpen(true); setSettingsSection("storage"); void loadSettings(); }
-  function openRestore() { if (!canLeaveSettings()) return; setAddOpen(false); setRecheckSourceRef(""); setSettingsOpen(false); setRestorePlan(undefined); setRestoreDestination(""); setRestoreOpen(true); setNotice(undefined); }
+  function openRestore() { if (!isConnected || !coreStorageReady) { setNotice({ kind: "error", text: coreStorageMessage }); return; } if (!canLeaveSettings()) return; setAddOpen(false); setRecheckSourceRef(""); setSettingsOpen(false); setRestorePlan(undefined); setRestoreDestination(""); setRestoreOpen(true); setNotice(undefined); }
   function closeSettings() {
     if (!canLeaveSettings()) return;
     setSettingsOpen(false);
@@ -574,8 +712,22 @@ function App() {
   const sourceLooksRemote = looksLikeRemoteLocator(source);
 
   return <div className="app-shell">
-    <header className="topbar"><a className="brand" href="/" aria-label={t("RestoreWeave home")}><span className="brand-mark"><ShieldCheck size={19} /></span><span>RestoreWeave</span></a><form className="global-search" onSubmit={runSearch}><Search size={17} aria-hidden="true" /><input aria-label={t("Search content library")} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("Search names, paths, metadata, tags, notes, descriptions, and extracted text...")} /><button type="submit" disabled={busy || !query.trim()}>{busy ? <LoaderCircle className="spin" size={16} /> : t("Search")}</button></form><div className="top-actions"><span className={`connection ${isConnected ? "ok" : "bad"}`} aria-label={t(status)}>{status === "Checking service" ? <LoaderCircle className="spin" size={15} /> : isConnected ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}<span>{t(status)}</span></span><button className="secondary-button restore-button" aria-label={t("Restore latest snapshot")} title={t("Restore latest snapshot")} onClick={openRestore} disabled={!snapshotRef}><ArchiveRestore size={16} /><span>{t("Restore")}</span></button><button className="primary-button add-button" aria-label={t("Add source")} title={t("Add source")} onClick={() => openAdd()}><Plus size={16} /><span>{t("Add source")}</span></button><button className="icon-button" title={t("Refresh service status")} aria-label={t("Refresh service status")} onClick={() => void refresh()}><RefreshCw size={17} /></button><button className="icon-button" title={t("Open settings")} aria-label={t("Open settings")} onClick={openSettings}><Settings size={17} /></button></div></header>
-    {isConnected && <div className="system-rail" aria-label={t("System readiness")}><span className="rail-title">{t("SYSTEM READY")}</span><span><Database size={15} />{t("Exact repository")}</span><span className={lexicalReady ? "ready" : "degraded"}><Search size={15} />{lexicalReady ? t("Keyword search") : `${t("Keyword search")} · ${t("Offline")}`}</span><span className={semanticReady ? "ready" : "degraded"}><Sparkles size={15} />{semanticReady ? t("Semantic search ready") : t("Semantic search unavailable")}</span><span className={snapshotRef ? "ready" : "degraded"}><ArchiveRestore size={15} />{snapshotRef ? t("Recovery point ready") : t("No recovery point")}</span></div>}
+    <header className="topbar">
+      <a className="brand" href="/" aria-label={t("RestoreWeave home")}><span className="brand-mark"><ShieldCheck size={19} /></span><span>RestoreWeave</span></a>
+      <form className="global-search" onSubmit={runSearch}>
+        <Search size={17} aria-hidden="true" />
+        <input aria-label={t("Search content library")} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("Search names, paths, metadata, tags, notes, descriptions, and extracted text...")} disabled={!isConnected || !catalogHealthy} />
+        <button type="submit" disabled={busy || !query.trim() || !isConnected || !catalogHealthy}>{busy ? <LoaderCircle className="spin" size={16} /> : t("Search")}</button>
+      </form>
+      <div className="top-actions">
+        <span className={`connection ${isConnected ? "ok" : "bad"}`} aria-label={t(status)}>{status === "Checking service" ? <LoaderCircle className="spin" size={15} /> : isConnected ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}<span>{t(status)}</span></span>
+        <button className="secondary-button restore-button" aria-label={t("Restore latest snapshot")} title={t("Restore latest snapshot")} onClick={openRestore} disabled={!snapshotRef || !isConnected || !coreStorageReady}><ArchiveRestore size={16} /><span>{t("Restore")}</span></button>
+        <button className="primary-button add-button" aria-label={t("Add source")} title={t("Add source")} onClick={() => openAdd()} disabled={!isConnected || !coreStorageReady}><Plus size={16} /><span>{t("Add source")}</span></button>
+        <button className="icon-button" title={t("Refresh service status")} aria-label={t("Refresh service status")} onClick={() => void refresh()}><RefreshCw size={17} /></button>
+        <button className="icon-button" title={t("Open settings")} aria-label={t("Open settings")} onClick={openSettings}><Settings size={17} /></button>
+      </div>
+    </header>
+    {isConnected && <div className="system-rail" aria-label={t("System readiness")}><span className={`rail-title ${coreStorageReady ? "" : "degraded"}`}>{t(coreStorageReady ? "SYSTEM READY" : "Core storage unavailable")}</span><span className={repositoryHealthy ? "ready" : "degraded"}><Database size={15} />{repositoryHealthy ? t("Exact repository") : t("Repository unavailable")}</span><span className={catalogHealthy ? "ready" : "degraded"}><Database size={15} />{catalogHealthy ? t("Catalog ready") : t("Catalog unavailable")}</span><span className={lexicalReady ? "ready" : "degraded"}><Search size={15} />{lexicalReady ? t("Keyword search") : `${t("Keyword search")} · ${t("Offline")}`}</span><span className={semanticReady ? "ready" : "degraded"}><Sparkles size={15} />{semanticReady ? t("Semantic search ready") : t("Semantic search unavailable")}</span><span className={snapshotRef ? "ready" : "degraded"}><ArchiveRestore size={15} />{snapshotRef ? t("Recovery point ready") : t("No recovery point")}</span></div>}
     <main className={`workspace ${selected ? "detail-active" : ""} ${showFirstSource ? "empty-library" : ""}`}><section className="content-column">
       <div className="workspace-heading"><div><p className="eyebrow">{t("YOUR LIBRARY")}</p><h1>{viewMode === "search" ? t("Results for \"{{query}}\"", { query }) : viewMode === "tag" ? activeTags.length ? t("Content tagged {{tags}}", { tags: activeTags.join(" + ") }) : t("Filtered content") : viewMode === "path" ? browseCrumbs.at(-1)?.name || t("Source paths") : t("All content")}</h1></div><div className="heading-actions">{hasActiveFilters && <button className="library-return" onClick={clearLibraryFilters}><X size={14} />{t("Clear filters")}</button>}{(viewMode === "search" || viewMode === "path") && workspaceID && <button className="library-return" onClick={() => void loadContentLibrary(workspaceID)}><Home size={14} />{t("All content")}</button>}<span className="result-count">{hits.length ? t(viewMode === "search" ? "{{count}} results" : "{{count}} items", { count: hits.length }) : workspaceID ? t("0 items") : t("No workspace yet")}</span></div></div>
       {showLibraryFacets && <section className="tag-browser" aria-label={t("Filter by tags")}>
@@ -596,25 +748,28 @@ function App() {
       {(sources.length > 0 || sourceProjection.state === "DEGRADED") && <details className="source-manager">
         <summary><HardDrive size={14} /><span>{t("Sources")}</span><small>{sourceProjection.state === "DEGRADED" ? t("Source status unavailable") : t("{{count}} configured", { count: sources.length })}</small><ChevronRight size={14} /></summary>
         {sourceProjection.state === "DEGRADED" && <div className="source-projection-warning" role="status"><AlertCircle size={14} /><span>{t("Source status could not be loaded. Saved content remains available; refresh to try again.")}</span></div>}
-        <div className="source-manager-list">{sources.map((sourceItem, index) => <SourceCard key={sourceItem.source_ref ?? sourceItem.locator ?? index} source={sourceItem} locale={locale} t={t} busy={busy} onView={() => void viewSource(sourceItem)} onRecheck={() => openAdd(sourceItem)} />)}</div>
+        <div className="source-manager-list">{sources.map((sourceItem, index) => <SourceCard key={sourceItem.source_ref ?? sourceItem.locator ?? index} source={sourceItem} locale={locale} t={t} busy={busy} coreStorageReady={coreStorageReady} onView={() => void viewSource(sourceItem)} onRecheck={() => openAdd(sourceItem)} />)}</div>
       </details>}
       {(viewMode === "content" || viewMode === "tag") && browseRoots.length > 0 && <details className="source-disclosure"><summary><Folder size={14} /><span>{t("Browse source paths")}</span><small>{t("Source paths are provenance")}</small><ChevronRight size={14} /></summary><div className="source-switcher" aria-label={t("Source paths")}>{browseRoots.map((root) => { const label = sourceButtonLabel(root, browseRoots, t); const path = root.source_path?.trim(); return <button type="button" key={root.root_id} title={path || label} aria-label={path ? t("Browse source {{name}} at {{path}}", { name: root.name || t("Source path"), path }) : label} onClick={() => void navigateLibrary("", [], root.root_id)}><Folder size={14} />{label}</button>; })}</div></details>}
       {viewMode === "path" && browseRootID && <nav className="breadcrumbs" aria-label={t("Source paths")}><button title={t("Source paths")} aria-label={t("Source path root")} onClick={() => void navigateLibrary("", [])}><Home size={14} /></button>{browseCrumbs.map((crumb, index) => <span key={crumb.entry_id}><ChevronRight size={13} /><button onClick={() => void navigateLibrary(crumb.entry_id || crumb.subject_ref, browseCrumbs.slice(0, index + 1))}>{crumb.name}</button></span>)}</nav>}
-      {isUnavailable ? <div className="service-offline" role="alert"><span><Server size={18} /></span><div><strong>{t("RestoreWeave service is unavailable")}</strong><small>{t("Start the service, then refresh this page. Saved content has not been changed.")}</small></div><button className="secondary-button compact" onClick={() => void refresh()}><RefreshCw size={15} />{t("Retry")}</button></div> : notice && <div className={`notice ${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"}>{notice.kind === "error" ? <AlertCircle size={16} /> : notice.kind === "warning" ? <Sparkles size={16} /> : <Check size={16} />}{notice.text}<button aria-label={t("Dismiss notice")} onClick={() => setNotice(undefined)}><X size={14} /></button></div>}
-      {hits.length ? <div className="result-list">{hits.map((hit, index) => <ResultRow key={hit.subject_ref ?? index} hit={hit} tags={hit.subject_ref ? tagsBySubject.get(hit.subject_ref) ?? [] : []} selected={selected?.subject_ref === hit.subject_ref} t={t} onSelect={() => void (viewMode === "path" ? openLibraryEntry(hit) : loadDetails(hit))} />)}</div> : <div className="empty-state"><span className="vault-sigil"><ShieldCheck size={35} /></span><h2>{t(showFirstSource ? "Start by adding a source" : showConfiguredSourceEmpty ? "Source configured, no saved content yet" : viewMode === "search" ? "No matches found" : viewMode === "tag" ? activeTags.length ? "No content matches these tags" : hasSystemFacets ? "No content matches these filters" : "No content matches these tags" : viewMode === "path" ? "This source path is empty" : "No content yet")}</h2><p>{t(showFirstSource ? "Add a server folder, review what will be stored, then confirm." : showConfiguredSourceEmpty ? "Recheck creates a reviewable plan. Existing saved content is not changed until you confirm." : viewMode === "search" ? "Try another name, path, metadata value, tag, note, description, or extracted phrase." : viewMode === "tag" ? activeTags.length ? "Choose fewer tags to broaden the result." : hasSystemFacets ? "Adjust or clear the system filters." : "Choose fewer tags to broaden the result." : viewMode === "path" ? "No captured items are recorded at this source path." : "Saved content will appear here independent of its original folders.")}</p>{showFirstSource && <button className="primary-button" onClick={() => openAdd()}><Plus size={16} />{t("Add source")}</button>}</div>}
-    </section>{(selected || hits.length > 0) && <aside className="detail-column">{selected ? <Details hit={selected} annotations={annotations} representations={representations} descriptions={descriptions} noteDraft={noteDraft} tagDraft={tagDraft} tagVocabulary={tagVocabulary} editingNoteID={editingNoteID} editingBody={editingBody} busy={busy} t={t} locale={locale} onBack={() => setSelected(undefined)} onDraft={setNoteDraft} onTagDraft={setTagDraft} onAddTag={() => void saveTag()} onDeleteTag={(tag) => void deleteTag(tag)} onAdd={() => void saveNote("", noteDraft)} onEdit={(note) => { setEditingNoteID(note.annotation_id); setEditingBody(note.body); }} onDeleteNote={(note) => void deleteNote(note)} onEditBody={setEditingBody} onSaveEdit={(note) => void saveNote(note.annotation_id, editingBody, note.revision)} onCancelEdit={() => { setEditingNoteID(""); setEditingBody(""); }} /> : <div className="detail-placeholder"><span className="inspection-mark"><Hash size={25} /></span><p className="eyebrow">{t("INSPECTOR")}</p><h2>{t("Select an item")}</h2><p>{t("Details, exact-storage status, tags, and notes appear here.")}</p></div>}</aside>}</main>
-    {addOpen && <div className="drawer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) closeAdd(); }}><aside className="drawer source-drawer" role="dialog" aria-modal="true" aria-label={t(recheckSourceRef ? "Recheck source" : "Add source")}><div className="drawer-header"><div><p className="eyebrow">{t(recheckSourceRef ? "RECHECK SOURCE" : "NEW SOURCE")}</p><h2>{t(recheckSourceRef ? "Recheck source" : "Add source")}</h2></div><button className="icon-button" aria-label={t("Close add source")} onClick={closeAdd}><X size={17} /></button></div><p className="drawer-copy">{t(recheckSourceRef ? "Inspect this source again. Review the changes, then confirm to publish a new snapshot." : "Choose a server folder and preview its exact storage plan. Saving starts only after you confirm.")}</p>{isUnavailable ? <div className="drawer-inline-warning" role="alert"><AlertCircle size={15} />{t("Start the RestoreWeave service before previewing this source.")}</div> : notice && <div className={`notice drawer-notice ${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"}>{notice.kind === "error" ? <AlertCircle size={16} /> : notice.kind === "warning" ? <Sparkles size={16} /> : <Check size={16} />}{notice.text}</div>}<div className="source-kind"><span className="source-kind-icon"><HardDrive size={19} /></span><div><strong>{t("Server folder")}</strong><small>{t("Local disk or mounted storage visible to RestoreWeave")}</small></div><em>{t("Supported now")}</em></div><div className="source-route" aria-label={t("Source storage route")}><div><span>{t("Read from")}</span><strong title={source.trim()}>{source.trim() || t("Enter a server path")}</strong><small>{t("Source files stay in place")}</small></div><ChevronRight size={17} /><div><span>{t("Store unique bytes in")}</span><strong title={repositoryPath}>{repositoryPath}</strong><small>{t("Exact whole-file deduplication")}</small></div></div><form className="stack-form" onSubmit={makePlan}><label>{t("Path on RestoreWeave host")}<input autoFocus value={source} onChange={(event) => { setSource(event.target.value); setPlan(undefined); }} placeholder={t("/data/to-add")} aria-invalid={sourceLooksRemote || undefined} /><small className="path-helper"><Server size={13} />{t("Use a local or mounted server path. This browser does not upload files or fetch URLs.")}</small>{sourceLooksRemote && <small className="source-inline-error"><AlertCircle size={13} />{t("Enter a server path, not a URL.")}</small>}</label><button className="primary-button" disabled={busy || isUnavailable || !source.trim() || sourceLooksRemote}>{busy ? t("Inspecting...") : t("Preview storage plan")}</button></form><p className="planning-note">{t("Planning records the source and plan in the catalog, but does not write file bytes or publish a snapshot until you confirm.")}</p>{plan && <PlanCard plan={plan} busy={busy} t={t} onApply={() => void applyPlan()} />}</aside></div>}
+      {isConnected && !coreStorageReady ? <div className="notice error" role="alert"><AlertCircle size={16} />{coreStorageMessage}</div> : isUnavailable ? <div className="service-offline" role="alert"><span><Server size={18} /></span><div><strong>{t("RestoreWeave service is unavailable")}</strong><small>{t("Start the service, then refresh this page. Saved content has not been changed.")}</small></div><button className="secondary-button compact" onClick={() => void refresh()}><RefreshCw size={15} />{t("Retry")}</button></div> : notice && <div className={`notice ${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"}>{notice.kind === "error" ? <AlertCircle size={16} /> : notice.kind === "warning" ? <Sparkles size={16} /> : <Check size={16} />}{notice.text}<button aria-label={t("Dismiss notice")} onClick={() => setNotice(undefined)}><X size={14} /></button></div>}
+      {hits.length ? <div className="result-list">{hits.map((hit, index) => <ResultRow key={hit.subject_ref ?? index} hit={hit} tags={hit.subject_ref ? tagsBySubject.get(hit.subject_ref) ?? [] : []} selected={selected?.subject_ref === hit.subject_ref} t={t} onSelect={() => void (viewMode === "path" ? openLibraryEntry(hit) : loadDetails(hit))} />)}</div> : <div className="empty-state"><span className="vault-sigil"><ShieldCheck size={35} /></span><h2>{t(showFirstSource ? "Start by adding a source" : showConfiguredSourceEmpty ? "Source configured, no saved content yet" : viewMode === "search" ? "No matches found" : viewMode === "tag" ? activeTags.length ? "No content matches these tags" : hasSystemFacets ? "No content matches these filters" : "No content matches these tags" : viewMode === "path" ? "This source path is empty" : "No content yet")}</h2><p>{t(showFirstSource ? "Add a server folder, review what will be stored, then confirm." : showConfiguredSourceEmpty ? "Recheck creates a reviewable plan. Existing saved content is not changed until you confirm." : viewMode === "search" ? "Try another name, path, metadata value, tag, note, description, or extracted phrase." : viewMode === "tag" ? activeTags.length ? "Choose fewer tags to broaden the result." : hasSystemFacets ? "Adjust or clear the system filters." : "Choose fewer tags to broaden the result." : viewMode === "path" ? "No captured items are recorded at this source path." : "Saved content will appear here independent of its original folders.")}</p>{showFirstSource && <button className="primary-button" onClick={() => openAdd()} disabled={!coreStorageReady}><Plus size={16} />{t("Add source")}</button>}</div>}
+    </section>{(selected || hits.length > 0) && <aside className="detail-column">{selected ? <Details hit={selected} annotations={annotations} representations={representations} descriptions={descriptions} annotationStatus={detailState.annotations} representationsStatus={detailState.representations} descriptionsStatus={detailState.descriptions} annotationMutationEnabled={annotationStorageReady && detailState.subjectRef === selected.subject_ref?.trim() && detailSubjectRef.current === selected.subject_ref?.trim() && detailState.annotations === "ready"} noteDraft={noteDraft} tagDraft={tagDraft} tagVocabulary={tagVocabulary} editingNoteID={editingNoteID} editingBody={editingBody} busy={busy} t={t} locale={locale} onBack={() => { detailRequestRef.current += 1; detailSubjectRef.current = ""; setDetailState({ subjectRef: "", annotations: "idle", representations: "idle", descriptions: "idle" }); setSelected(undefined); }} onDraft={setNoteDraft} onTagDraft={setTagDraft} onAddTag={() => void saveTag()} onDeleteTag={(tag) => void deleteTag(tag)} onAdd={() => void saveNote("", noteDraft)} onEdit={(note) => { setEditingNoteID(note.annotation_id); setEditingBody(note.body); }} onDeleteNote={(note) => void deleteNote(note)} onEditBody={setEditingBody} onSaveEdit={(note) => void saveNote(note.annotation_id, editingBody, note.revision, note.subject_ref)} onCancelEdit={() => { setEditingNoteID(""); setEditingBody(""); }} /> : <div className="detail-placeholder"><span className="inspection-mark"><Hash size={25} /></span><p className="eyebrow">{t("INSPECTOR")}</p><h2>{t("Select an item")}</h2><p>{t("Details, exact-storage status, tags, and notes appear here.")}</p></div>}</aside>}</main>
+    {addOpen && <div className="drawer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) closeAdd(); }}><aside className="drawer source-drawer" role="dialog" aria-modal="true" aria-label={t(recheckSourceRef ? "Recheck source" : "Add source")}><div className="drawer-header"><div><p className="eyebrow">{t(recheckSourceRef ? "RECHECK SOURCE" : "NEW SOURCE")}</p><h2>{t(recheckSourceRef ? "Recheck source" : "Add source")}</h2></div><button className="icon-button" aria-label={t("Close add source")} onClick={closeAdd}><X size={17} /></button></div><p className="drawer-copy">{t(recheckSourceRef ? "Inspect this source again. Review the changes, then confirm to publish a new snapshot." : "Choose a server folder and preview its exact storage plan. Saving starts only after you confirm.")}</p>{isUnavailable ? <div className="drawer-inline-warning" role="alert"><AlertCircle size={15} />{t("Start the RestoreWeave service before previewing this source.")}</div> : !coreStorageReady ? <div className="drawer-inline-warning" role="alert"><AlertCircle size={15} />{coreStorageMessage}</div> : notice && <div className={`notice drawer-notice ${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"}>{notice.kind === "error" ? <AlertCircle size={16} /> : notice.kind === "warning" ? <Sparkles size={16} /> : <Check size={16} />}{notice.text}</div>}<div className="source-kind"><span className="source-kind-icon"><HardDrive size={19} /></span><div><strong>{t("Server folder")}</strong><small>{t("Local disk or mounted storage visible to RestoreWeave")}</small></div><em>{t("Supported now")}</em></div><div className="source-route" aria-label={t("Source storage route")}><div><span>{t("Read from")}</span><strong title={source.trim()}>{source.trim() || t("Enter a server path")}</strong><small>{t("Source files stay in place")}</small></div><ChevronRight size={17} /><div><span>{t("Store unique bytes in")}</span><strong title={repositoryPath}>{repositoryPath}</strong><small>{t("Exact whole-file deduplication")}</small></div></div><form className="stack-form" onSubmit={makePlan}><label>{t("Path on RestoreWeave host")}<input autoFocus value={source} onChange={(event) => { setSource(event.target.value); setPlan(undefined); }} placeholder={t("/data/to-add")} aria-invalid={sourceLooksRemote || undefined} /><small className="path-helper"><Server size={13} />{t("Use a local or mounted server path. This browser does not upload files or fetch URLs.")}</small>{sourceLooksRemote && <small className="source-inline-error"><AlertCircle size={13} />{t("Enter a server path, not a URL.")}</small>}</label><button className="primary-button" disabled={busy || isUnavailable || !coreStorageReady || !source.trim() || sourceLooksRemote}>{busy ? t("Inspecting...") : t("Preview storage plan")}</button></form><p className="planning-note">{t("Planning records the source and plan in the catalog, but does not write file bytes or publish a snapshot until you confirm.")}</p>{plan && <PlanCard plan={plan} busy={busy} coreStorageReady={coreStorageReady} t={t} onApply={() => void applyPlan()} />}</aside></div>}
     {settingsOpen && <SettingsPanel section={settingsSection} configData={configData} draft={configDraft} loading={configLoading} dirty={configDirty} lexicalReady={lexicalReady} semanticReady={semanticReady} semanticBundleReady={semanticBundleReady} semanticBundleRestartRequired={semanticBundleRestartRequired} semanticInstallAvailable={semanticInstallAvailable} searchRebuildAvailable={searchRebuildAvailable} semanticInstall={semanticInstall} searchRebuild={searchRebuild} statusData={statusData} workspaceID={workspaceID} locale={locale} t={t} onLocale={setLocale} onSection={setSettingsSection} onClose={closeSettings} onField={setConfigField} onRepositoryProfile={setRepositoryProfile} onReload={reloadSettings} onSave={() => void saveSettings()} onInstallSemanticBundle={() => void installSemanticBundle()} onRebuildSearch={() => void rebuildSearch()} />}
-    {restoreOpen && <div className="drawer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setRestoreOpen(false); }}><aside className="drawer" role="dialog" aria-modal="true" aria-label={t("Restore snapshot")}><div className="drawer-header"><div><p className="eyebrow">{t("RECOVER")}</p><h2>{t("Restore snapshot")}</h2></div><button className="icon-button" aria-label={t("Close restore")} onClick={() => setRestoreOpen(false)}><X size={17} /></button></div><p className="drawer-copy">{t("Choose an empty destination, inspect the plan, then restore and verify exact bytes.")}</p><form className="stack-form" onSubmit={makeRestorePlan}><label>{t("Destination folder")}<input autoFocus value={restoreDestination} onChange={(event) => { setRestoreDestination(event.target.value); setRestorePlan(undefined); }} placeholder={t("/data/restored-copy")} /></label><button className="primary-button" disabled={busy || !restoreDestination.trim()}>{busy ? t("Inspecting...") : t("Preview restore")}</button></form>{restorePlan && <RestoreCard plan={restorePlan} busy={busy} t={t} onApply={() => void applyRestore()} />}</aside></div>}
+    {restoreOpen && <div className="drawer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setRestoreOpen(false); }}><aside className="drawer" role="dialog" aria-modal="true" aria-label={t("Restore snapshot")}><div className="drawer-header"><div><p className="eyebrow">{t("RECOVER")}</p><h2>{t("Restore snapshot")}</h2></div><button className="icon-button" aria-label={t("Close restore")} onClick={() => setRestoreOpen(false)}><X size={17} /></button></div><p className="drawer-copy">{t("Choose an empty destination, inspect the plan, then restore and verify exact bytes.")}</p><form className="stack-form" onSubmit={makeRestorePlan}><label>{t("Destination folder")}<input autoFocus value={restoreDestination} onChange={(event) => { setRestoreDestination(event.target.value); setRestorePlan(undefined); }} placeholder={t("/data/restored-copy")} /></label><button className="primary-button" disabled={busy || !coreStorageReady || !restoreDestination.trim()}>{busy ? t("Inspecting...") : t("Preview restore")}</button></form>{restorePlan && <RestoreCard plan={restorePlan} busy={busy} coreStorageReady={coreStorageReady} t={t} onApply={() => void applyRestore()} />}</aside></div>}
   </div>;
 }
 
 function ResultRow({ hit, tags, selected, t, onSelect }: { hit: SearchHit; tags: string[]; selected: boolean; t: Translator; onSelect: () => void }) {
   const directory = hit.entry_type === "DIRECTORY";
-  return <button className={`result-row ${selected ? "selected" : ""}`} onClick={onSelect}><span className="file-icon">{directory ? <Folder size={20} /> : <FileSearch size={19} />}</span><span className="result-copy"><strong>{hit.name || t("Untitled subject")}</strong><small>{hit.path || (hit.entry_type ? formatEntryType(hit.entry_type, t) : t("Protected content item"))}{hit.logical_size != null && !directory ? ` · ${formatBytes(hit.logical_size)}` : ""}</small>{tags.length > 0 && <span className="row-tags" aria-label={t("Tags")}>{tags.map((tag) => <span className="row-tag" key={tag}><Tag size={10} />{tag}</span>)}</span>}{hit.segments?.[0]?.matched_text && <em>{hit.segments[0].matched_text}</em>}</span>{!directory && <IdentityWeave value={hit.content_id || hit.subject_ref} compact t={t} />}<span className="result-kind">{formatEntryType(hit.entry_type, t)}</span><ChevronRight className="row-arrow" size={17} /></button>;
+  const matchedSegments = (hit.segments ?? []).filter((segment) => Boolean(segment.matched_text?.trim()));
+  const visibleSegments = matchedSegments.slice(0, MATCHED_SEGMENT_RENDER_LIMIT);
+  const hiddenSegmentCount = matchedSegments.length - visibleSegments.length;
+  return <button className={`result-row ${selected ? "selected" : ""}`} onClick={onSelect}><span className="file-icon">{directory ? <Folder size={20} /> : <FileSearch size={19} />}</span><span className="result-copy"><strong>{hit.name || t("Untitled subject")}</strong><small>{hit.path || (hit.entry_type ? formatEntryType(hit.entry_type, t) : t("Protected content item"))}{hit.logical_size != null && !directory ? ` · ${formatBytes(hit.logical_size)}` : ""}</small>{tags.length > 0 && <span className="row-tags" aria-label={t("Tags")}>{tags.map((tag) => <span className="row-tag" key={tag}><Tag size={10} />{tag}</span>)}</span>}{visibleSegments.map((segment, index) => { const metadata = searchSegmentMetadata(segment, t); const segmentKey = `${segment.semantic_segment_id || segment.source_id || segment.source_type || "segment"}-${segment.ordinal ?? index}-${index}`; return <span className="row-tags" aria-label={t("Matched segment provenance")} key={segmentKey}><span className="row-tag">{searchSegmentSourceLabel(segment, t)}</span><span className="row-tag">{previewUnicodeText(segment.matched_text)}</span>{metadata.map((value) => <span className="row-tag" key={value}>{value}</span>)}</span>; })}{hiddenSegmentCount > 0 && <span className="row-tags" aria-label={t("Matched segment provenance")}><span className="row-tag">{t("{{count}} more matched segments", { count: hiddenSegmentCount })}</span></span>}</span>{!directory && <IdentityWeave value={hit.content_id || hit.subject_ref} compact t={t} />}<span className="result-kind">{formatEntryType(hit.entry_type, t)}</span><ChevronRight className="row-arrow" size={17} /></button>;
 }
 
-function SourceCard({ source, locale, t, busy, onView, onRecheck }: { source: SourceSummary; locale: Locale; t: Translator; busy: boolean; onView: () => void; onRecheck: () => void }) {
+function SourceCard({ source, locale, t, busy, coreStorageReady, onView, onRecheck }: { source: SourceSummary; locale: Locale; t: Translator; busy: boolean; coreStorageReady: boolean; onView: () => void; onRecheck: () => void }) {
   const scan = source.latest_scan;
   const scanTime = scan?.finished_at || scan?.started_at;
   const issueCount = (scan?.failed_entries ?? 0) + (scan?.unstable_entries ?? 0) + (scan?.detection_failures ?? 0);
@@ -630,7 +785,7 @@ function SourceCard({ source, locale, t, busy, onView, onRecheck }: { source: So
     </div>
     <div className={`source-recovery ${source.latest_snapshot_ref ? "ready" : "pending"}`}><ArchiveRestore size={15} /><div><span>{t("Latest recovery point")}</span><strong>{source.latest_snapshot_ref ? t("Available") : t("Not published yet")}</strong></div></div>
     <p className="muted">{t("Recheck creates a reviewable plan. Existing saved content is not changed until you confirm.")}</p>
-    <footer className="source-card-actions"><button type="button" className="secondary-button compact" onClick={onRecheck} disabled={busy || source.reachability !== "AVAILABLE"}><RefreshCw size={14} />{t("Recheck source")}</button><button type="button" className="secondary-button compact" onClick={onView} disabled={busy || !source.latest_namespace_root_id && !source.latest_snapshot_ref}><Folder size={14} />{t("View content")}</button></footer>
+    <footer className="source-card-actions"><button type="button" className="secondary-button compact" onClick={onRecheck} disabled={busy || !coreStorageReady || source.reachability !== "AVAILABLE"}><RefreshCw size={14} />{t("Recheck source")}</button><button type="button" className="secondary-button compact" onClick={onView} disabled={busy || !source.latest_namespace_root_id && !source.latest_snapshot_ref}><Folder size={14} />{t("View content")}</button></footer>
   </article>;
 }
 
@@ -653,32 +808,35 @@ function sourceButtonLabel(root: BrowseRoot, roots: BrowseRoot[], t: Translator)
   return path;
 }
 
-function Details({ hit, annotations, representations, descriptions, noteDraft, tagDraft, tagVocabulary, editingNoteID, editingBody, busy, t, locale, onBack, onDraft, onTagDraft, onAddTag, onDeleteTag, onAdd, onEdit, onDeleteNote, onEditBody, onSaveEdit, onCancelEdit }: { hit: SearchHit; annotations: any[]; representations: any[]; descriptions: any[]; noteDraft: string; tagDraft: string; tagVocabulary: string[]; editingNoteID: string; editingBody: string; busy: boolean; t: Translator; locale: Locale; onBack: () => void; onDraft: (value: string) => void; onTagDraft: (value: string) => void; onAddTag: () => void; onDeleteTag: (tag: any) => void; onAdd: () => void; onEdit: (note: any) => void; onDeleteNote: (note: any) => void; onEditBody: (value: string) => void; onSaveEdit: (note: any) => void; onCancelEdit: () => void }) {
+function Details({ hit, annotations, representations, descriptions, annotationStatus, representationsStatus, descriptionsStatus, annotationMutationEnabled, noteDraft, tagDraft, tagVocabulary, editingNoteID, editingBody, busy, t, locale, onBack, onDraft, onTagDraft, onAddTag, onDeleteTag, onAdd, onEdit, onDeleteNote, onEditBody, onSaveEdit, onCancelEdit }: { hit: SearchHit; annotations: any[]; representations: any[]; descriptions: any[]; annotationStatus: DetailResourceStatus; representationsStatus: DetailResourceStatus; descriptionsStatus: DetailResourceStatus; annotationMutationEnabled: boolean; noteDraft: string; tagDraft: string; tagVocabulary: string[]; editingNoteID: string; editingBody: string; busy: boolean; t: Translator; locale: Locale; onBack: () => void; onDraft: (value: string) => void; onTagDraft: (value: string) => void; onAddTag: () => void; onDeleteTag: (tag: any) => void; onAdd: () => void; onEdit: (note: any) => void; onDeleteNote: (note: any) => void; onEditBody: (value: string) => void; onSaveEdit: (note: any) => void; onCancelEdit: () => void }) {
   const notes = annotations.filter((item) => item.kind === "NOTE" && !item.tombstoned);
   const tags = annotations.filter((item) => item.kind === "TAG" && !item.tombstoned);
   const systemTags = deriveSystemTags(hit);
   const suggestions = tagVocabulary.filter((value) => !tags.some((tag) => tag.body === value));
   const exact = representations.find((item) => item.class === "EXACT" && item.authoritative === true);
   const verifiedExact = Boolean(exact && exact.placement === "present" && exact.verified === true);
-  const exactState = verifiedExact ? "Verified exact bytes" : exact?.placement === "missing" || exact?.verified === false ? "Exact copy is missing or failed verification" : exact ? "Exact copy is present but not verified" : "No authoritative exact copy reported";
+  const exactState = representationsStatus === "loading" ? "Checking service" : representationsStatus === "error" ? "Unavailable" : verifiedExact ? "Verified exact bytes" : exact?.placement === "missing" || exact?.verified === false ? "Exact copy is missing or failed verification" : exact ? "Exact copy is present but not verified" : "No authoritative exact copy reported";
+  const assuranceLabel = representationsStatus === "loading" ? "Checking service" : representationsStatus === "error" ? "Unavailable" : verifiedExact ? "VERIFIED" : exact ? "UNVERIFIED" : "CATALOGED";
+  const detailStatus = (state: DetailResourceStatus) => state === "loading" ? t("Checking service") : state === "error" ? t("Unavailable") : "";
+  const canMutateAnnotations = annotationMutationEnabled && annotationStatus === "ready";
   return <div className="details">
     <button className="detail-back text-button" onClick={onBack}><ArrowLeft size={15} />{t("Back to results")}</button>
-    <div className="detail-title"><span className="file-icon large"><FileSearch size={23} /></span><div className="detail-title-copy"><p className="eyebrow">{t("CONTENT ITEM")}</p><h2>{hit.name || t("Untitled subject")}</h2><small>{formatEntryType(hit.entry_type, t)}</small></div><span className={`assurance-seal ${verifiedExact ? "" : "warning"}`}><ShieldCheck size={16} />{t(verifiedExact ? "VERIFIED" : exact ? "UNVERIFIED" : "CATALOGED")}</span></div>
+    <div className="detail-title"><span className="file-icon large"><FileSearch size={23} /></span><div className="detail-title-copy"><p className="eyebrow">{t("CONTENT ITEM")}</p><h2>{hit.name || t("Untitled subject")}</h2><small>{formatEntryType(hit.entry_type, t)}</small></div><span className={`assurance-seal ${verifiedExact ? "" : "warning"}`}><ShieldCheck size={16} />{t(assuranceLabel)}</span></div>
     <div className="identity-band"><div className="identity-label"><span>{t("CONTENT WEAVE")}</span><small>{abbreviateIdentity(hit.content_id)}</small></div><IdentityWeave value={hit.content_id || hit.subject_ref} t={t} /></div>
     <dl className="facts"><div><dt>{t("Original path")}</dt><dd>{hit.path || t("Not recorded")}</dd></div><div><dt>{t("Content identity (SHA-256 + length)")}</dt><dd className="mono">{hit.content_id || t("Not available in this result")}</dd></div><div><dt>{t("Protection")}</dt><dd><span className={`inline-state ${verifiedExact ? "" : "warning"}`}>{verifiedExact ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}{t(exactState)}</span></dd></div>{exact && <div><dt>{t("Logical size")}</dt><dd>{formatBytes(exact.decoded_length)}</dd></div>}</dl>
     <div className="detail-section tags-section"><div className="section-heading"><h3>{t("Tags")}</h3><span>{tags.length + systemTags.length}</span></div>
-      <div className="tag-cloud">{systemTags.map((value) => <span className="tag-chip system" title={t("System field")} key={value}><Hash size={12} />{value}</span>)}{tags.map((tag) => <span className="tag-chip user" key={tag.annotation_id}><Tag size={12} />{tag.body}<button title={t("Remove tag")} aria-label={t("Remove tag {{tag}}", { tag: tag.body })} onClick={() => onDeleteTag(tag)} disabled={busy}><X size={12} /></button></span>)}</div>
-      <div className="tag-composer"><input list="restoreweave-tag-vocabulary" aria-label={t("New tag")} value={tagDraft} onChange={(event) => onTagDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && tagDraft.trim()) { event.preventDefault(); onAddTag(); } }} placeholder={t("Add or reuse a tag")} /><datalist id="restoreweave-tag-vocabulary">{suggestions.map((value) => <option value={value} key={value} />)}</datalist><button className="primary-button compact" onClick={onAddTag} disabled={busy || !tagDraft.trim()}><Plus size={14} />{t("Add tag")}</button></div>
+      {annotationStatus !== "ready" ? <p className="muted" role="status">{detailStatus(annotationStatus)}</p> : <div className="tag-cloud">{systemTags.map((value) => <span className="tag-chip system" title={t("System field")} key={value}><Hash size={12} />{value}</span>)}{tags.map((tag) => <span className="tag-chip user" key={tag.annotation_id}><Tag size={12} />{tag.body}<button title={t("Remove tag")} aria-label={t("Remove tag {{tag}}", { tag: tag.body })} onClick={() => onDeleteTag(tag)} disabled={busy || !canMutateAnnotations}><X size={12} /></button></span>)}{!tags.length && !systemTags.length && <span className="muted">{t("No tags yet.")}</span>}</div>}
+      <div className="tag-composer"><input list="restoreweave-tag-vocabulary" aria-label={t("New tag")} value={tagDraft} onChange={(event) => onTagDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && tagDraft.trim() && canMutateAnnotations) { event.preventDefault(); onAddTag(); } }} placeholder={t("Add or reuse a tag")} disabled={!canMutateAnnotations} /><datalist id="restoreweave-tag-vocabulary">{suggestions.map((value) => <option value={value} key={value} />)}</datalist><button className="primary-button compact" onClick={onAddTag} disabled={busy || !canMutateAnnotations || !tagDraft.trim()}><Plus size={14} />{t("Add tag")}</button></div>
     </div>
     <div className="detail-section notes-section"><div className="section-heading"><h3>{t("Notes")}</h3><span>{notes.length}</span></div>
-      <div className="notes-list">{notes.length ? notes.map((note) => editingNoteID === note.annotation_id ? <div className="note-row editing" key={note.annotation_id}><textarea autoFocus aria-label={t("Edit note")} value={editingBody} onChange={(event) => onEditBody(event.target.value)} /><div className="note-actions"><button className="text-button" onClick={onCancelEdit} disabled={busy}>{t("Cancel")}</button><button className="primary-button compact" onClick={() => onSaveEdit(note)} disabled={busy || !editingBody.trim()}><Check size={14} />{t("Save")}</button></div></div> : <div className="note-row" key={note.annotation_id}><p>{note.body}</p><div className="note-meta"><span>{formatNoteDate(note.updated_at, locale, t)} · {t("revision {{revision}}", { revision: note.revision })}</span><span className="note-icon-actions"><button className="note-edit" title={t("Edit note")} aria-label={t("Edit note")} onClick={() => onEdit(note)} disabled={busy}><Pencil size={13} /></button><button className="note-edit danger" title={t("Delete note")} aria-label={t("Delete note")} onClick={() => onDeleteNote(note)} disabled={busy}><Trash2 size={13} /></button></span></div></div>) : <p className="muted">{t("No notes yet.")}</p>}</div>
-      <div className="note-composer"><textarea aria-label={t("New note")} value={noteDraft} onChange={(event) => onDraft(event.target.value)} placeholder={t("Add useful context about this file")} /><button className="primary-button compact" onClick={onAdd} disabled={busy || !noteDraft.trim()}><Plus size={14} />{t("Add note")}</button></div>
+      <div className="notes-list">{annotationStatus !== "ready" ? <p className="muted" role="status">{detailStatus(annotationStatus)}</p> : notes.length ? notes.map((note) => editingNoteID === note.annotation_id ? <div className="note-row editing" key={note.annotation_id}><textarea autoFocus aria-label={t("Edit note")} value={editingBody} onChange={(event) => onEditBody(event.target.value)} disabled={!canMutateAnnotations} /><div className="note-actions"><button className="text-button" onClick={onCancelEdit} disabled={busy}>{t("Cancel")}</button><button className="primary-button compact" onClick={() => onSaveEdit(note)} disabled={busy || !canMutateAnnotations || !editingBody.trim()}><Check size={14} />{t("Save")}</button></div></div> : <div className="note-row" key={note.annotation_id}><p>{note.body}</p><div className="note-meta"><span>{formatNoteDate(note.updated_at, locale, t)} · {t("revision {{revision}}", { revision: note.revision })}</span><span className="note-icon-actions"><button className="note-edit" title={t("Edit note")} aria-label={t("Edit note")} onClick={() => onEdit(note)} disabled={busy || !canMutateAnnotations}><Pencil size={13} /></button><button className="note-edit danger" title={t("Delete note")} aria-label={t("Delete note")} onClick={() => onDeleteNote(note)} disabled={busy || !canMutateAnnotations}><Trash2 size={13} /></button></span></div></div>) : <p className="muted">{t("No notes yet.")}</p>}</div>
+      <div className="note-composer"><textarea aria-label={t("New note")} value={noteDraft} onChange={(event) => onDraft(event.target.value)} placeholder={t("Add useful context about this file")} disabled={!canMutateAnnotations} /><button className="primary-button compact" onClick={onAdd} disabled={busy || !canMutateAnnotations || !noteDraft.trim()}><Plus size={14} />{t("Add note")}</button></div>
     </div>
-    {descriptions.length > 0 && <div className="detail-section"><h3>{t("Description")}</h3><p className="description">{descriptions[0].title || descriptions[0].kind || t("Description available")}</p></div>}
+    <div className="detail-section"><h3>{t("Description")}</h3>{descriptionsStatus !== "ready" ? <p className="muted" role="status">{detailStatus(descriptionsStatus)}</p> : descriptions.length > 0 ? <p className="description"><strong>{descriptionKindLabel(descriptions[0].kind, t)}</strong>{descriptions[0].title ? ` · ${descriptions[0].title}` : ""}</p> : <p className="muted">{t("No description yet.")}</p>}</div>
     <div className="detail-footer"><span><ShieldCheck size={14} />{t("Recovery remains independent of search indexes")}</span></div>
   </div>;
 }
-function PlanCard({ plan, busy, t, onApply }: { plan: any; busy: boolean; t: Translator; onApply: () => void }) {
+function PlanCard({ plan, busy, coreStorageReady, t, onApply }: { plan: any; busy: boolean; coreStorageReady: boolean; t: Translator; onApply: () => void }) {
   const blocked = plan.blocked_entries?.length ?? 0;
   const decisions = Array.isArray(plan.protection_decisions) ? plan.protection_decisions : [];
   const warnings: string[] = Array.isArray(plan.warnings) ? (plan.warnings as unknown[]).filter((warning): warning is string => typeof warning === "string" && Boolean(warning.trim())) : [];
@@ -703,10 +861,10 @@ function PlanCard({ plan, busy, t, onApply }: { plan: any; busy: boolean; t: Tra
     {warnings.length > 0 && <div className="plan-warning" role="status"><div className="plan-warning-title"><AlertCircle size={15} /><strong>{t("Exact bytes are saved; derived processing is unavailable.")}</strong></div><ul>{warnings.map((warning: string, index: number) => <li key={`${warning}-${index}`}>{warning}</li>)}</ul></div>}
     {decisions.length > 0 && <details className="plan-files"><summary><FileText size={15} /><span>{t("Per-file protection decisions")}</span><b>{decisions.length}</b><ChevronRight size={14} /></summary><div className="plan-file-list">{decisions.map((decision: any, index: number) => <div className="plan-file" key={`${decision.relative_path || "entry"}-${index}`}><div className="plan-file-heading"><strong title={decision.relative_path}>{decision.relative_path || t("Unnamed entry")}</strong><span className="plan-file-mode">{decision.mode || "STORE_EXACT"}</span></div><div className="plan-file-meta"><span>{t("Outcome")}: {decision.planned_outcome || t("Not reported")}</span><span>{t("Reason")}: {decision.reason_code || t("Not reported")}</span></div>{decision.expected_content_id && <small className="mono">{t("Content identity")}: {decision.expected_content_id} · {formatBytes(Number(decision.expected_logical_bytes ?? 0))}</small>}</div>)}</div></details>}
     {blocked > 0 && <details className="plan-files blocked-files"><summary><AlertCircle size={15} /><span>{t("Blocked entries")}</span><b>{blocked}</b><ChevronRight size={14} /></summary><div className="plan-file-list">{plan.blocked_entries.map((entry: any, index: number) => <div className="plan-file" key={`${entry.relative_path || "entry"}-${index}`}><div className="plan-file-heading"><strong title={entry.relative_path}>{entry.relative_path || t("Unnamed entry")}</strong><span className="plan-file-mode">{entry.mode || t("Not reported")}</span></div><div className="plan-file-meta"><span>{t("Outcome")}: {entry.planned_outcome || t("Not reported")}</span><span>{t("State")}: {entry.state || t("Not reported")}</span></div><small>{entry.reason_code || t("Not reported")}{entry.message ? ` · ${entry.message}` : ""}</small></div>)}</div></details>}
-    {plan.executable && !applied ? <button className="primary-button" onClick={onApply} disabled={busy}>{t(busy ? "Saving content..." : "Save exact copy")}</button> : <p className="muted">{t(blocked > 0 ? "Resolve blocked entries before confirming." : "This plan has already been applied.")}</p>}
+    {plan.executable && !applied ? <button className="primary-button" onClick={onApply} disabled={busy || !coreStorageReady}>{t(busy ? "Saving content..." : "Save exact copy")}</button> : <p className="muted">{t(blocked > 0 ? "Resolve blocked entries before confirming." : "This plan has already been applied.")}</p>}
   </div>;
 }
-function RestoreCard({ plan, busy, t, onApply }: { plan: any; busy: boolean; t: Translator; onApply: () => void }) { return <div className="plan-card"><div className="plan-title"><div><p className="eyebrow">{t("REVIEW RESTORE")}</p><h3>{t(plan.state || "READY")}</h3></div><ArchiveRestore size={21} /></div><div className="plan-stats"><span><b>{plan.files ?? 0}</b>{t("files")}</span><span><b>{formatBytes(plan.bytes ?? 0)}</b>{t("verified output")}</span></div><div className="plan-outcomes"><span>{t("EXACT BYTES")}</span></div>{plan.executable && plan.state !== "SUCCEEDED" ? <button className="primary-button" onClick={onApply} disabled={busy}>{t(busy ? "Restoring..." : "Confirm restore")}</button> : <p className="muted">{t("Restore is not executable.")}</p>}</div>; }
+function RestoreCard({ plan, busy, coreStorageReady, t, onApply }: { plan: any; busy: boolean; coreStorageReady: boolean; t: Translator; onApply: () => void }) { return <div className="plan-card"><div className="plan-title"><div><p className="eyebrow">{t("REVIEW RESTORE")}</p><h3>{t(plan.state || "READY")}</h3></div><ArchiveRestore size={21} /></div><div className="plan-stats"><span><b>{plan.files ?? 0}</b>{t("files")}</span><span><b>{formatBytes(plan.bytes ?? 0)}</b>{t("verified output")}</span></div><div className="plan-outcomes"><span>{t("EXACT BYTES")}</span></div>{plan.executable && plan.state !== "SUCCEEDED" ? <button className="primary-button" onClick={onApply} disabled={busy || !coreStorageReady}>{t(busy ? "Restoring..." : "Confirm restore")}</button> : <p className="muted">{t("Restore is not executable.")}</p>}</div>; }
 function SettingsPanel({ section, configData, draft, loading, dirty, lexicalReady, semanticReady, semanticBundleReady, semanticBundleRestartRequired, semanticInstallAvailable, searchRebuildAvailable, semanticInstall, searchRebuild, statusData, workspaceID, locale, t, onLocale, onSection, onClose, onField, onRepositoryProfile, onReload, onSave, onInstallSemanticBundle, onRebuildSearch }: { section: SettingsSection; configData: any; draft: any; loading: boolean; dirty: boolean; lexicalReady: boolean; semanticReady: boolean; semanticBundleReady: boolean; semanticBundleRestartRequired: boolean; semanticInstallAvailable: boolean; searchRebuildAvailable: boolean; semanticInstall: ActionFeedback; searchRebuild: ActionFeedback; statusData: any; workspaceID: string; locale: Locale; t: Translator; onLocale: (locale: Locale) => void; onSection: (section: SettingsSection) => void; onClose: () => void; onField: (section: string, field: string, value: unknown) => void; onRepositoryProfile: (profile: string) => void; onReload: () => void; onSave: () => void; onInstallSemanticBundle: () => void; onRebuildSearch: () => void }) {
   const sections: Array<{ id: SettingsSection; label: string; icon: ReactNode }> = [
     { id: "storage", label: t("Storage & protection"), icon: <HardDrive size={17} /> },
@@ -780,6 +938,46 @@ function IdentityWeave({ value, t, compact = false }: { value?: string; t: Trans
 function formatBytes(value: number) { if (!value) return "0 B"; if (value < 1024) return `${value} B`; if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`; return `${(value / 1024 / 1024).toFixed(1)} MB`; }
 function looksLikeRemoteLocator(value: string) { return /^[a-z][a-z0-9+.-]*:\/\//i.test(value.trim()); }
 function formatEntryType(value: string | undefined, t: Translator) { return t(value ? value.replaceAll("_", " ") : "FILE"); }
+// Search provenance can contain extracted or generated text close to the
+// backend's payload limit. Keep the browser projection small while retaining
+// the complete segment in the API response and its immutable identifiers.
+const MATCHED_SEGMENT_RENDER_LIMIT = 3;
+const MATCHED_TEXT_PREVIEW_CODE_POINTS = 280;
+function previewUnicodeText(value: string | undefined, limit = MATCHED_TEXT_PREVIEW_CODE_POINTS) {
+  const text = value?.trim() ?? "";
+  const codePointLimit = Math.max(1, Math.floor(limit));
+  const codePoints = Array.from(text);
+  return codePoints.length > codePointLimit ? `${codePoints.slice(0, codePointLimit).join("")}…` : text;
+}
+function descriptionKindLabel(kind: string | undefined, t: Translator) {
+  const normalized = kind?.trim().toUpperCase();
+  const labels: Record<string, string> = {
+    USER: "User description",
+    IMPORTED: "Imported description",
+    EXTRACTED: "Extracted description",
+    AI_SUMMARY: "AI summary",
+    AI_ANALYSIS: "AI analysis",
+  };
+  if (normalized && labels[normalized]) return t(labels[normalized]);
+  return normalized ? `${t("Unknown description kind")}: ${normalized}` : t("Description source unavailable");
+}
+function searchSegmentSourceLabel(segment: SearchSegment, t: Translator) {
+  const sourceType = segment.source_type?.trim().toUpperCase();
+  const kind = segment.kind?.trim().toUpperCase();
+  if (sourceType === "ANNOTATION" && kind === "NOTE") return t("User note");
+  if (sourceType === "ARTIFACT" && kind === "EXTRACT") return t("Extracted content");
+  if (sourceType === "DESCRIPTION") return descriptionKindLabel(kind, t);
+  if (sourceType === "FILENAME" || kind === "FILENAME") return t("Filename");
+  const rawLabel = [segment.source_type?.trim(), segment.kind?.trim()].filter(Boolean).join(" / ");
+  return rawLabel || t("Matched segment");
+}
+function searchSegmentMetadata(segment: SearchSegment, t: Translator) {
+  const metadata: string[] = [];
+  if (segment.producer?.trim()) metadata.push(`${t("Producer")}: ${segment.producer.trim()}`);
+  if (segment.language?.trim()) metadata.push(`${t("Language")}: ${segment.language.trim()}`);
+  if (typeof segment.accepted === "boolean") metadata.push(segment.accepted ? t("Accepted") : t("Not accepted"));
+  return metadata;
+}
 function formatFacetValue(hit: SearchHit) {
   if (hit.entry_type === "DIRECTORY" || hit.entry_type === "SYMLINK") return "";
   const name = hit.name || hit.path?.split(/[\\/]/).at(-1) || "";

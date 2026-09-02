@@ -10,10 +10,12 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/ailiheizi/restoreweave/server/internal/repository"
 	"github.com/ailiheizi/restoreweave/server/internal/scanner"
+	"github.com/ailiheizi/restoreweave/server/internal/search"
 	"github.com/ailiheizi/restoreweave/server/internal/store/sqlite"
 )
 
@@ -27,6 +29,79 @@ type payloadPlacementFailureRepo struct{ *repository.Dir }
 type invalidSavingsReceiptRepo struct{ *repository.Dir }
 
 type contradictorySavingsReceiptRepo struct{ *repository.Dir }
+
+func TestIngestPersistsDetectionFactsAndExcludesReadState(t *testing.T) {
+	ctx := context.Background()
+	source := t.TempDir()
+	// The .zip suffix intentionally conflicts with the PDF magic bytes. Both
+	// evidence lines must remain searchable as durable detector facts.
+	if err := os.WriteFile(filepath.Join(source, "report.zip"), []byte("%PDF-1.7\nbody"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "document.pdf"), []byte("%PDF-1.7\nbody"), 0o600); err != nil {
+		t.Fatalf("write PDF source: %v", err)
+	}
+	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "catalog.sqlite"), sqlite.Options{})
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	repo, err := repository.OpenDir(filepath.Join(t.TempDir(), "repository"))
+	if err != nil {
+		t.Fatalf("open repository: %v", err)
+	}
+	indexer := &search.Indexer{Store: store, Engine: &search.Engine{Dir: filepath.Join(t.TempDir(), "index")}}
+	result, err := (&Service{Store: store, Repo: repo, Indexer: indexer}).Ingest(ctx, source)
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	entries, err := store.ListNamespaceSubtree(ctx, result.WorkspaceID, result.RootID, "")
+	if err != nil {
+		t.Fatalf("list namespace: %v", err)
+	}
+	var file sqlite.NamespaceEntry
+	for _, node := range entries {
+		if node.Entry.DisplayName == "report.zip" {
+			file = node.Entry
+			break
+		}
+	}
+	if file.ID == "" || file.ObservationID == "" {
+		t.Fatalf("ingested file entry = %+v", file)
+	}
+	evidence, err := store.ListDetectionEvidence(ctx, result.WorkspaceID, file.ObservationID)
+	if err != nil || len(evidence) < 2 {
+		t.Fatalf("detection evidence = %+v, err=%v", evidence, err)
+	}
+	kinds := map[string]bool{}
+	suffixRaw, magicRaw := false, false
+	for _, row := range evidence {
+		kinds[row.EvidenceKind] = true
+		if row.DetectorID == "" || row.DetectorDigest == "" {
+			t.Fatalf("incomplete durable detection row = %+v", row)
+		}
+		suffixRaw = suffixRaw || strings.Contains(string(row.Evidence), "suffix:.zip")
+		magicRaw = magicRaw || strings.Contains(string(row.Evidence), "magic:pdf-header")
+	}
+	if !kinds["SUFFIX"] || !kinds["MAGIC"] || !suffixRaw || !magicRaw {
+		t.Fatalf("suffix/magic evidence kinds = %+v", kinds)
+	}
+	coverage, err := indexer.Coverage(ctx, result.WorkspaceID)
+	if err != nil || !coverage.Fields[search.AxisDetection] {
+		t.Fatalf("detection coverage = %+v, err=%v", coverage, err)
+	}
+	if _, hits, err := indexer.Query(ctx, search.QueryRequest{WorkspaceID: result.WorkspaceID, Text: "application/pdf", Axes: []string{search.AxisDetection}}); err != nil || len(hits) != 1 {
+		t.Fatalf("MIME detection query hits=%d err=%v", len(hits), err)
+	}
+	if _, hits, err := indexer.Query(ctx, search.QueryRequest{WorkspaceID: result.WorkspaceID, Text: "suffix:zip", Axes: []string{search.AxisDetection}}); err != nil || len(hits) != 1 {
+		t.Fatalf("suffix detection query hits=%d err=%v", len(hits), err)
+	}
+	if _, hits, err := indexer.Query(ctx, search.QueryRequest{WorkspaceID: result.WorkspaceID, Text: "COMPLETE", Axes: []string{search.AxisDetection}}); err != nil {
+		t.Fatalf("read-state query: %v", err)
+	} else if len(hits) != 0 {
+		t.Fatalf("read state leaked into detection axis: %+v", hits)
+	}
+}
 
 func (r *invalidSavingsReceiptRepo) PlaceExact(ctx context.Context, contentID string, body io.Reader) (repository.Receipt, error) {
 	receipt, err := r.Dir.PlaceExact(ctx, contentID, body)

@@ -16,16 +16,16 @@ configure
 -> inspect and protect content
 -> retain names, facts, descriptions, and recovery references
 -> search lexical + structured + semantic information
--> select a SavedView
+-> select a LinkGroup or SavedView
 -> freeze an ExportManifest
 -> materialize and verify output
 -> restore exact bytes when needed
 ```
 
 Original paths are provenance and recovery projections. Organization belongs
-to stable subjects, tags, descriptions, relations, and saved views. Normal
-workflows must not require users to know workspace, root, entry, artifact, or
-other internal IDs.
+to stable subjects, tags, descriptions, minimal link groups, relations, and
+saved views. Normal workflows must not require users to know workspace, root,
+entry, artifact, or other internal IDs.
 
 If a proposed change neither improves this loop nor closes one of its recovery
 or safety gates, keep it outside the core queue.
@@ -54,6 +54,18 @@ or safety gates, keep it outside the core queue.
   facts for user tags; deterministic type and format facets remain system
   fields. Machine classification must be explicit, attributable, previewed,
   and confirmed before it changes user-visible tags.
+- The only planned MVP grouping primitive is a minimal `LinkGroup`: one stable
+  group subject plus a current map from safe group-relative paths to stable
+  file links. A file may appear in multiple groups without copying bytes.
+  Changes update the current map; the group has no user-visible versions or
+  revision chain. When a fixed point in time is needed, `ExportManifest`
+  freezes the selected file versions separately. Group descriptions, tags,
+  notes, search, and export reuse the existing subject mechanisms. Membership
+  is not ownership and never authorizes byte deletion. A missing member stays
+  visible as missing/unavailable, and an empty group remains until explicitly
+  deleted. The initial profile has file members only: no nested groups, roles,
+  dependency graph, or automatic AI grouping. Richer Collections remain
+  deferred.
 - The operational catalog and every search index are rebuildable projections.
   Repository objects plus authenticated portable recovery records are the
   recovery authority.
@@ -123,9 +135,11 @@ the stated development scope. It is not release-qualified. Work in this order:
 Phase 4 and Phase 5 may start in parallel only after the Phase 3 portable
 record shapes are frozen. Phase 4 supplies real ONNX/BGE + zvec, complete
 search fields, segment provenance, and fused query. Phase 5 measures and
-qualifies simple recoverable storage savings. Phase 6 supplies SavedView and
-ExportManifest ergonomics. Phase 7 supplies packaging, migration, backup,
-upgrade, performance, and full release qualification.
+qualifies simple recoverable storage savings. Phase 6 supplies minimal
+LinkGroup, SavedView, and ExportManifest ergonomics. This documentation
+decision does not authorize LinkGroup schema or API implementation before the
+Phase 4 and Phase 5 gates close. Phase 7 supplies packaging, migration,
+backup, upgrade, performance, and full release qualification.
 
 The following remain outside the core queue:
 
@@ -136,6 +150,8 @@ The following remain outside the core queue:
   `/api/v1` adapter and browser client may call the typed dispatcher, but they
   must not add a second policy, job, catalog, or recovery state machine;
 - new acoustic, graph, multimodal, or other index dimensions;
+- richer Collections, nested groups, dependency graphs, roles, ratings, or
+  automatic grouping beyond the minimal planned LinkGroup;
 - RWKV, Transformer, arithmetic, or other neural codec implementations;
 - automatic external download/reacquisition, source deletion, or destructive
   garbage collection.

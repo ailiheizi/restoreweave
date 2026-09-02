@@ -95,7 +95,7 @@ type daemonOptions struct {
 	apiToken               string
 }
 
-func configureSemanticBinding(ctx context.Context, resolved rwconfig.ResolvedConfig, store *sqlite.Store, bundleRoot string) (controlplane.DispatcherOption, func() error, error) {
+func configureSemanticBinding(ctx context.Context, resolved rwconfig.ResolvedConfig, store *sqlite.Store, bundleRoot string, operatorOverride bool) (controlplane.DispatcherOption, func() error, error) {
 	if strings.TrimSpace(bundleRoot) == "" {
 		return nil, nil, nil
 	}
@@ -108,7 +108,7 @@ func configureSemanticBinding(ctx context.Context, resolved rwconfig.ResolvedCon
 	if strings.TrimSpace(resolved.Config.Semantic.VectorBackend) != "zvec" {
 		return nil, nil, fmt.Errorf("semantic.vector_backend %q is not compatible with the admitted zvec bundle", resolved.Config.Semantic.VectorBackend)
 	}
-	bundle, err := search.LoadSemanticBundle(bundleRoot)
+	bundle, err := loadSemanticBundleAdmission(bundleRoot, operatorOverride)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -171,6 +171,24 @@ func configureSemanticBinding(ctx context.Context, resolved rwconfig.ResolvedCon
 	return controlplane.WithSemanticIndexerBinding(factory, search.NewZvecGenerationDriver(libraryPath), libraryPath, libraryDigest, manifest), release, nil
 }
 
+// loadSemanticBundleAdmission is the single daemon admission boundary for the
+// model bundle. The configured personal default must match the immutable
+// installer tuple; an explicit --semantic-bundle is the only path that may
+// accept a generic, operator-owned bundle, and its status remains labeled as
+// an override by the caller.
+func loadSemanticBundleAdmission(bundleRoot string, operatorOverride bool) (search.SemanticBundleAdmission, error) {
+	bundle, err := search.LoadSemanticBundle(strings.TrimSpace(bundleRoot))
+	if err != nil {
+		return search.SemanticBundleAdmission{}, err
+	}
+	if !operatorOverride {
+		if err := search.ValidateDefaultSemanticBundleAdmission(bundle); err != nil {
+			return search.SemanticBundleAdmission{}, fmt.Errorf("default semantic bundle admission: %w", err)
+		}
+	}
+	return bundle, nil
+}
+
 func semanticBundleCapability(bundleRoot string, operatorOverride bool) command.Capability {
 	source := "BAAI/bge-small-zh-v1.5"
 	notes := "local semantic bundle is not installed or has not passed integrity admission"
@@ -186,7 +204,7 @@ func semanticBundleCapability(bundleRoot string, operatorOverride bool) command.
 		Source:  source,
 		Notes:   notes,
 	}
-	bundle, err := search.LoadSemanticBundle(strings.TrimSpace(bundleRoot))
+	bundle, err := loadSemanticBundleAdmission(bundleRoot, operatorOverride)
 	if err != nil {
 		return capability
 	}
@@ -313,7 +331,7 @@ func runWithOptions(ctx context.Context, options daemonOptions) error {
 		bundleRoot = filepath.Join(resolved.Config.Paths.Models, search.SemanticBundleBGEProfileID, runtime.GOOS+"-"+runtime.GOARCH)
 	}
 	bundleCapability := semanticBundleCapability(bundleRoot, options.semanticBundleOverride)
-	semanticOption, semanticCleanup, semanticErr := configureSemanticBinding(ctx, resolved, store, bundleRoot)
+	semanticOption, semanticCleanup, semanticErr := configureSemanticBinding(ctx, resolved, store, bundleRoot, options.semanticBundleOverride)
 	if semanticErr != nil {
 		log.Printf("semantic capability unavailable: %v", semanticErr)
 	}

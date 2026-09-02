@@ -886,11 +886,11 @@ Rules:
 
 ## 25. Search and semantic lifecycle
 
-`RW-MVP-1` owns the subject bindings and generation truth for rebuildable local lexical, structured, and semantic indexes over path, metadata, type, checksum, duplicate, common-media metadata, durable tag/note, extracted text, and the pinned local text embedding space. It also owns durable whole-subject tag and plain-text note CRUD plus portable export/import independently of index storage. It does not make any index recovery authority. CLIP, additional vector or multimodal ranking, external enrichment, collections, ratings, relationship graphs, typed segment annotations, and machine-suggestion review remain later or external capabilities.
+`RW-MVP-1` owns the subject bindings and generation truth for rebuildable local lexical, structured, and semantic indexes over path, metadata, type, checksum, duplicate, common-media metadata, durable tag/note, minimal LinkGroup facts, extracted text, and the pinned local text embedding space. It also owns durable whole-subject tag and plain-text note CRUD plus portable export/import independently of index storage. It does not make any index recovery authority. LinkGroup indexing begins only after Phase 6 adds the reviewed group subject-kind authorization and feed. CLIP, additional vector or multimodal ranking, external enrichment, richer Collections, nested groups, roles, ratings, relationship graphs, typed segment annotations, and machine-suggestion review remain later or external capabilities.
 
 Baseline requirements:
 
-- Every indexed document binds a durable subject, snapshot, namespace entry, processor artifact, and index generation.
+- Every indexed document binds a durable subject, index generation, and its authoritative source: snapshot plus namespace entry for file facts, or the current LinkGroup subject and membership mapping for group facts. A group mapping resolves each group-relative path to a stable file `SubjectRef`; it is not a second file identity or a version history. Processor-artifact bindings remain present where a processor produced the indexed material.
 - Search resolves each hit through the current host-owned authorization and namespace layer before returning content or sensitive metadata.
 - Index coverage, failed extraction, stale generations, and rebuild state remain visible.
 - Deleting or rebuilding the index cannot change content identity, namespace, plans, representations, publications, or verification records.

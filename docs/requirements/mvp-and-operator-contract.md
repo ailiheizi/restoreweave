@@ -12,7 +12,7 @@ Where broader documents describe semantic, perceptual, neural, enterprise, or wr
 
 RestoreWeave MVP performs one complete job:
 
-> Connect a heterogeneous local or NAS-mounted tree, identify and process its contents through strong defaults, minimize exact storage, search it through lexical, structured, and local semantic dimensions, freeze export manifests, and prove selected content can be restored on a fresh installation.
+> Connect a heterogeneous local or NAS-mounted tree, identify and process its contents through strong defaults, minimize exact storage, search it through lexical, structured, and local semantic dimensions, keep related files in minimal link groups, freeze export manifests, and prove selected content can be restored on a fresh installation.
 
 The storage, view, export, and embedding defaults in [Content Store, Views, and Export Requirements](content-store-views-and-exports.md) supersede any older wording in this document that treats FUSE as an MVP gate or embeddings as optional. Exact ingest and restore remain independent of the semantic index, but the reference distribution MUST ship the local semantic profile enabled.
 
@@ -35,6 +35,7 @@ preflight source, processors, working space, and repository
 -> build the baseline metadata and content index
 -> index durable tag and note records
 -> perform deterministic sampled-content verification
+-> create or update a minimal file-only LinkGroup when files must remain associated
 -> browse, search, and read the published namespace; materialize exports when a path-shaped result is needed
 -> restore selected paths or the full tree
 -> compare exact bytes and declared filesystem metadata
@@ -66,6 +67,7 @@ The MVP reports repository storage reduction and index overhead precisely. It MU
 | Namespace | Authenticated read-only `SnapshotTree` and bounded `FileAccess`, materialized through explicit export manifests |
 | Search | Bundled hybrid lexical + structured + local semantic generations; the SQLite and zvec schemas are private and rebuildable |
 | Annotations | Durable whole-subject tag and plain-text note CRUD with portable export |
+| Organization | Durable tags and notes plus minimal file-only LinkGroups with current membership mappings and group-relative paths |
 | Interfaces | Human CLI, stable JSON/JSONL, and local read-only stdio MCP |
 | AI | No embedded agent or prompt loop; the reference profile includes a bundled local embedding worker and may use an explicitly configured description/online provider |
 
@@ -162,6 +164,7 @@ The baseline search index covers:
 - Entry type, content class, suffix evidence, magic evidence, and conflicts.
 - Size, times, checksum, duplicate group, and processing state.
 - Durable user-authored tags and note text.
+- LinkGroup name, durable descriptions, tags, notes, and membership lookup.
 - Qualified extracted text.
 - Qualified image, audio, video, document, and container metadata.
 - Warnings, processor provenance, and available exact representation state.
@@ -189,6 +192,48 @@ The baseline supports:
 Repository-private packs, chunks, object keys, and deduplication layout are never the user namespace. `RW-MVP-1` materializes a frozen `ExportManifest` through `SnapshotTree` and `FileAccess` to an explicit destination. RestoreWeave does not implement mount, SMB, NFS, WebDAV, S3, media-server, or alternate filesystem gateways.
 
 An explicitly unprotected entry may remain visible as a decision record, but it has no payload and is never presented as readable or recoverable.
+
+### 8.1 Minimal LinkGroup
+
+`RW-MVP-1` includes one deliberately small grouping primitive. A `LinkGroup`
+is a stable group subject with one current mapping of file members. Each member
+maps a safe group-relative path to a stable file `SubjectRef`; the mapping does
+not pin a file version or create a group history. When a source file changes,
+the link continues to identify that file subject and displays the latest or
+last available content.
+
+The contract is:
+
+- one file may occur in many groups without another payload placement;
+- one directory explicitly added as a group becomes a deterministic member
+  mapping whose relative paths preserve the directory structure;
+- adding, removing, or renaming a member atomically updates the current map;
+- the current map is the only membership authority, and reverse membership is
+  derived from it;
+- the group is a normal subject for durable descriptions, tags, and notes;
+  Phase 6 extends host authorization and the existing lexical and semantic
+  provider feed for this new subject kind rather than adding an index
+  dimension;
+- freezing a group creates an `ExportManifest` that resolves its current
+  members and freezes concrete file versions and representations for that
+  export; later group edits do not change the manifest;
+- deleting a group or member link never deletes a file, weakens its protection
+  record, or authorizes garbage collection;
+- missing or unhealthy members remain visible and are reported individually;
+  group recovery cannot claim success while a required member is unavailable.
+
+The initial profile has file members only. Nested groups, member roles,
+dependency graphs, ratings, AI-generated membership, repository packing, and a
+second group database are explicitly excluded. A code repository is therefore
+ordinary exact file subjects plus one LinkGroup mapping preserving paths such
+as `go.mod`, `server/main.go`, and `web/src/main.tsx`; identical bytes reused
+by another repository still have one exact physical identity. An empty group
+remains until the operator explicitly deletes it.
+
+The group descriptor and current member mapping are durable user facts. They
+MUST enter an authenticated portable current-state record before this
+capability is admitted, and old namespace, annotation, and portable-fact
+records MUST retain their original meaning.
 
 ## 9. Capture consistency and plan basis
 
@@ -356,7 +401,7 @@ The following are important product directions but not dependencies of the first
 - Learned or AI file identification.
 - OCR and ASR beyond the qualified default extraction set.
 - Distributed vector stores such as Milvus, multimodal retrieval beyond the default local text profile, and external knowledge enrichment.
-- Collections, ratings, relationship graphs, recovery-intent services, and machine-suggested annotation workflows.
+- Richer Collections beyond the minimal file-only LinkGroup, including nested groups, roles, ratings, relationship graphs, recovery-intent services, and machine-suggested grouping or annotation workflows.
 - Alternate repository engines and multiple failure-independent placements.
 - Lossless class-specific codecs.
 - Perceptual image, audio, or video representations.
@@ -411,6 +456,9 @@ Staged semantic capabilities must use the same subjects, processor provenance, i
 35. Capture qualification replaces each ancestor in turn with a symlink, renamed directory, bind mount, remounted share, and different filesystem object; removes or substitutes snapshot lifecycle protection before consumer start; and races regular files with FIFO or device-like objects under a deadline. The capture either remains bound to the originally validated object or blocks explicitly, never reads the replacement, never escapes the configured scope, and never publishes an unsafe observation. A final-component-only no-follow implementation fails qualification.
 36. A filesystem watcher or journal is only a change hint. Non-recursive coverage, overflow, reset, rollback, truncation, loss, uncertain continuity, or use on an unqualified NFS, SMB, or FUSE source invalidates the incremental checkpoint and requires a complete baseline before absence can become deletion evidence.
 37. A snapshot-backed capture remains publishable only while its recorded root, mount, filesystem or volume identity, snapshot identity, read-only state, retention hold or deletion protection, and traversal properties revalidate for every required consumer.
+38. An explicit directory-to-LinkGroup operation accounts for every selected file, preserves safe group-relative paths, and publishes one current member mapping. The same file may be present in two groups while its exact payload is placed only once; changing or deleting either group does not change the file identity, protection record, or placement. Missing members remain visible and an empty group remains until explicit deletion.
+39. A LinkGroup can be resolved into an `ExportManifest` whose membership, output-relative paths, and concrete file versions are frozen for that export. Path traversal, duplicate output paths, missing file subjects, and unhealthy members fail closed before a successful group export or restore claim. Later group edits do not change an existing manifest.
+40. After removal of the operational catalog and every search index, a compatible reader imports the authenticated LinkGroup descriptor and current member mapping, resolves each member's existing recovery reference, and reconstructs the same current group while reporting missing or unavailable members. No existing publication or portable-fact schema is reinterpreted to obtain this result.
 
 ## 16. Success metrics and release gate
 
@@ -432,6 +480,7 @@ Staged semantic capabilities must use the same subjects, processor provenance, i
 - Exact physical storage reduction is measured across representative heterogeneous datasets and attributed separately to duplicate grouping, compression, and backend reuse.
 - At least 80 percent complete a managed ingest and exact restore without project-team assistance.
 - At least 80 percent can create, export, re-import, and find a tag or note without a semantic provider.
+- At least 80 percent can create, update, export, and recover a minimal LinkGroup without understanding internal IDs or confusing the group with a copied directory.
 - At least 80 percent successfully rebuild the baseline index or recover after loss of the operational catalog using documented procedures.
 
 ### 16.3 Operational targets

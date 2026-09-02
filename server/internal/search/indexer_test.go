@@ -6,12 +6,84 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/ailiheizi/restoreweave/server/internal/store/sqlite"
 	"github.com/ailiheizi/restoreweave/server/testutil"
 )
+
+func TestSemanticQueryCannotRestoreReadinessFromPartialHits(t *testing.T) {
+	ctx := context.Background()
+	store := testutil.OpenStore(t, filepath.Join(t.TempDir(), "catalog.sqlite"))
+	seed := testutil.SeedNamespace(t, store)
+	manifest := testZvecManifest()
+	driver := &integrationSemanticGenerationDriver{}
+	indexer := &Indexer{
+		Store: store, Engine: &Engine{Dir: t.TempDir()}, ConfigDigest: manifest.ConfigDigest,
+		LexicalProfileDigest: ProfileDigest(DimensionLexical, LexicalProfileV1), SemanticManifest: manifest,
+		SemanticProvider: integrationSemanticProvider{}, SemanticZvec: driver,
+		SemanticLibraryPath: "/private/explicit/libzvec_c_api.dylib", SemanticLibraryDigest: "sha256:" + strings.Repeat("0", 64),
+	}
+	if _, err := indexer.Rebuild(ctx, seed.WorkspaceID, "snapshot:semantic-query-gate", seed.RootID); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	generation, err := store.LatestIndexGeneration(ctx, seed.WorkspaceID, DimensionSemantic)
+	if err != nil {
+		t.Fatalf("latest semantic generation: %v", err)
+	}
+	// Add an unbound backend row. A query may still return valid rows, but this
+	// local hit must not re-authorize the tampered generation.
+	driver.tamper(generation.DBPath, ZvecSegment{SubjectID: seed.FileEntryID, SegmentID: "unknown-segment", Vector: []float32{1, 0, 0, 0}})
+	if _, _, err := indexer.Query(ctx, QueryRequest{WorkspaceID: seed.WorkspaceID, Dimension: DimensionSemantic, Text: "seed"}); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("partial semantic query error = %v, want ErrUnavailable", err)
+	}
+	if indexer.semanticIndexReady.Load() || IndexerReadiness(indexer).SemanticReal {
+		t.Fatal("partial semantic query restored semantic readiness")
+	}
+}
+
+func TestSemanticQueryUsesFrozenGenerationCoverageCache(t *testing.T) {
+	ctx := context.Background()
+	store := testutil.OpenStore(t, filepath.Join(t.TempDir(), "catalog.sqlite"))
+	seed := testutil.SeedNamespace(t, store)
+	manifest := testZvecManifest()
+	driver := &integrationSemanticGenerationDriver{}
+	indexer := &Indexer{
+		Store: store, Engine: &Engine{Dir: t.TempDir()}, ConfigDigest: manifest.ConfigDigest,
+		LexicalProfileDigest: ProfileDigest(DimensionLexical, LexicalProfileV1), SemanticManifest: manifest,
+		SemanticProvider: integrationSemanticProvider{}, SemanticZvec: driver,
+		SemanticLibraryPath: "/private/explicit/libzvec_c_api.dylib", SemanticLibraryDigest: "sha256:" + strings.Repeat("0", 64),
+	}
+	if _, err := indexer.Rebuild(ctx, seed.WorkspaceID, "snapshot:semantic-frozen", seed.RootID); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	generation, err := store.LatestIndexGeneration(ctx, seed.WorkspaceID, DimensionSemantic)
+	if err != nil {
+		t.Fatalf("latest semantic generation: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, _, err := indexer.Query(ctx, QueryRequest{WorkspaceID: seed.WorkspaceID, GenerationID: generation.ID, Dimension: DimensionSemantic, Text: "seed"}); err != nil {
+			t.Fatalf("query %d: %v", i, err)
+		}
+	}
+	if calls := driver.coverageProbeCalls(); calls != 1 {
+		t.Fatalf("coverage probe calls after cached queries = %d, want 1", calls)
+	}
+	annotationID := mustSearchID(t, sqlite.IDPrefixAnnotation)
+	if err := store.Update(ctx, func(tx *sqlite.Tx) error {
+		return tx.InsertAnnotation(ctx, &sqlite.Annotation{ID: annotationID, WorkspaceID: seed.WorkspaceID, SubjectRef: seed.FileEntryID, Kind: sqlite.AnnotationNote, Body: "new note after frozen generation", Revision: 1})
+	}); err != nil {
+		t.Fatalf("insert later note: %v", err)
+	}
+	if _, _, err := indexer.Query(ctx, QueryRequest{WorkspaceID: seed.WorkspaceID, GenerationID: generation.ID, Dimension: DimensionSemantic, Text: "seed"}); err != nil {
+		t.Fatalf("query after later note: %v", err)
+	}
+	if calls := driver.coverageProbeCalls(); calls != 1 {
+		t.Fatalf("coverage probe calls after later note = %d, want 1", calls)
+	}
+}
 
 func TestIndexerFeedsDurableFactsProtectionAndDescriptions(t *testing.T) {
 	ctx := context.Background()

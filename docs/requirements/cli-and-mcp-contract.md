@@ -687,7 +687,21 @@ An exact open fails with `NO_EXACT_REPRESENTATION` or another typed reason if th
 
 `annotation.export` produces an authenticated bundle containing subject bindings, exact revisions, provenance, and tombstones without repository credentials. `annotation.import` verifies the bundle, resolves compatible subjects, rejects revision forks unless an explicit conflict policy is supplied, and never depends on a search index.
 
-Collections, ratings, relationship graphs, typed segment annotations, recovery-intent services, and machine-suggestion review remain later profiles.
+The minimal file-only `LinkGroup` is the MVP grouping primitive defined by the
+content-store contract. It is planned for Phase 6 and is not implemented by
+the current command ABI. A group has one current membership map from
+group-relative paths to stable file `SubjectRef` values; adding, removing, or
+renaming a member updates that current state atomically. It has no
+user-visible version number, revision chain, predecessor, successor, or
+membership history. When an exact point-in-time result is required,
+`ExportManifest` freezes the selected file versions at export time. Richer
+Collections, nested groups, roles, ratings, relationship graphs, typed
+segment annotations, recovery-intent services, and machine-suggestion review
+remain later profiles. A missing or unavailable member remains in the current
+map and is shown as unavailable; it is never silently dropped. An empty group
+continues to exist until the user explicitly deletes the group. Deleting a
+group removes only its membership and group subject, never the member files or
+their repository objects, and never authorizes garbage collection.
 
 ### 9.6 Durable descriptions
 

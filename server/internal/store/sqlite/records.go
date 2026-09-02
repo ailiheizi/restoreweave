@@ -502,23 +502,67 @@ func (s *Store) GetDetectionEvidence(
 	ctx context.Context,
 	workspaceID, evidenceID string,
 ) (DetectionEvidence, error) {
-	var record DetectionEvidence
-	var confidence sql.NullFloat64
-	var evidenceJSON string
-	var started, finished int64
-	err := s.db.QueryRowContext(ctx, `
+	return scanDetectionEvidence(s.db.QueryRowContext(ctx, `
 SELECT detection_evidence_id, workspace_id, observation_id, detector_id,
        detector_digest, evidence_kind, candidate_format, candidate_mime,
        confidence, execution_class, evidence_json, evidence_digest,
        sandbox_policy_hash, started_at_ns, finished_at_ns
 FROM detection_evidence
-WHERE workspace_id = ? AND detection_evidence_id = ?`, workspaceID, evidenceID).Scan(
+WHERE workspace_id = ? AND detection_evidence_id = ?`, workspaceID, evidenceID))
+}
+
+// ListDetectionEvidence returns durable detector facts, optionally scoped to
+// one observation. ReadState is intentionally not part of this projection:
+// callers must use actual detector evidence when constructing detection axes.
+func (s *Store) ListDetectionEvidence(ctx context.Context, workspaceID, observationID string) ([]DetectionEvidence, error) {
+	if err := requireID("workspace id", workspaceID); err != nil {
+		return nil, err
+	}
+	query := `
+SELECT detection_evidence_id, workspace_id, observation_id, detector_id,
+       detector_digest, evidence_kind, candidate_format, candidate_mime,
+       confidence, execution_class, evidence_json, evidence_digest,
+       sandbox_policy_hash, started_at_ns, finished_at_ns
+FROM detection_evidence WHERE workspace_id = ?`
+	args := []any{workspaceID}
+	if strings.TrimSpace(observationID) != "" {
+		if err := requireID("observation id", observationID); err != nil {
+			return nil, err
+		}
+		query += ` AND observation_id = ?`
+		args = append(args, observationID)
+	}
+	query += ` ORDER BY observation_id, started_at_ns, detection_evidence_id`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list detection evidence: %w", err)
+	}
+	defer rows.Close()
+	var records []DetectionEvidence
+	for rows.Next() {
+		record, err := scanDetectionEvidence(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate detection evidence: %w", err)
+	}
+	return records, nil
+}
+
+func scanDetectionEvidence(scanner rowScanner) (DetectionEvidence, error) {
+	var record DetectionEvidence
+	var confidence sql.NullFloat64
+	var evidenceJSON string
+	var started, finished int64
+	if err := scanner.Scan(
 		&record.ID, &record.WorkspaceID, &record.ObservationID, &record.DetectorID,
 		&record.DetectorDigest, &record.EvidenceKind, &record.CandidateFormat,
 		&record.CandidateMIME, &confidence, &record.ExecutionClass, &evidenceJSON,
 		&record.EvidenceDigest, &record.SandboxPolicyHash, &started, &finished,
-	)
-	if err != nil {
+	); err != nil {
 		return record, rowError("detection evidence", err)
 	}
 	if confidence.Valid {

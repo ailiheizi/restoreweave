@@ -177,6 +177,7 @@ func (rebuildSemanticProvider) Embed(_ context.Context, req search.SemanticEmbed
 type rebuildSemanticZvec struct {
 	mu               sync.Mutex
 	membershipByPath map[string]map[search.ZvecCoverageIdentity]struct{}
+	coverageByPath   map[string][]search.ZvecCoverageIdentity
 }
 
 func (*rebuildSemanticZvec) ZvecReady(string, string, search.EmbeddingGenerationManifest) bool {
@@ -189,12 +190,25 @@ func (d *rebuildSemanticZvec) Build(_ context.Context, spec search.ZvecGeneratio
 	if d.membershipByPath == nil {
 		d.membershipByPath = make(map[string]map[search.ZvecCoverageIdentity]struct{})
 	}
+	if d.coverageByPath == nil {
+		d.coverageByPath = make(map[string][]search.ZvecCoverageIdentity)
+	}
 	membership := make(map[search.ZvecCoverageIdentity]struct{}, len(segments))
+	coverage := make([]search.ZvecCoverageIdentity, 0, len(segments))
 	for _, segment := range segments {
-		membership[search.ZvecCoverageIdentity{SubjectID: segment.SubjectID, SegmentID: segment.SegmentID}] = struct{}{}
+		identity := search.ZvecCoverageIdentity{SubjectID: segment.SubjectID, SegmentID: segment.SegmentID}
+		membership[identity] = struct{}{}
+		coverage = append(coverage, identity)
 	}
 	d.membershipByPath[spec.Path] = membership
+	d.coverageByPath[spec.Path] = coverage
 	return search.ZvecGenerationReceipt{Path: spec.Path, LibraryDigest: spec.LibraryDigest, ProfileDigest: spec.ProfileDigest, Dimension: spec.Manifest.Dimension, SegmentCount: len(segments)}, nil
+}
+
+func (d *rebuildSemanticZvec) CoveragePairs(_ context.Context, spec search.ZvecGenerationSpec) ([]search.ZvecCoverageIdentity, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]search.ZvecCoverageIdentity(nil), d.coverageByPath[spec.Path]...), nil
 }
 
 func (d *rebuildSemanticZvec) VerifyMembership(_ context.Context, spec search.ZvecGenerationSpec, candidates []search.ZvecCoverageIdentity) error {

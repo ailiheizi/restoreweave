@@ -19,6 +19,7 @@ The following decisions are frozen for `RW-MVP-1`. Changing one requires an expl
 | Product shape | A content, description, discovery, export, and recovery plane; not a normal writable filesystem or a media application |
 | Organization | Stable subjects, durable facts, tags, descriptions, relations, saved views, and frozen exports; original paths are provenance and a recovery projection |
 | Tag organization | Durable multi-value `Annotation.TAG` facts are the `RW-MVP-1` user taxonomy; deterministic type and format facets remain system facts, and machine suggestions never silently replace user tags |
+| Minimal grouping | A `LinkGroup` is one stable group subject plus one current file-only mapping from group-relative paths to stable file links; it has no group version or history chain, and richer Collections remain deferred |
 | Exact identity | SHA-256 over the complete logical byte stream plus logical length |
 | Default deduplication claim | Exact whole-content deduplication only; repository-private verified chunk deduplication may add savings |
 | Protection default | `STORE_EXACT`; `LINK_ONLY` is explicit, confirmed, visibly unprotected until qualified reacquisition succeeds |
@@ -56,7 +57,7 @@ source trees / application exports / object sources
     -> capture evidence and original-path provenance
     -> exact ContentID and immutable exact representation
     -> optional representations and rebuildable derivatives
-    -> durable tags, notes, relations, and saved queries
+    -> durable tags, notes, minimal link groups, relations, and saved queries
     -> frozen ExportManifest
     -> directory / archive / object prefix / protocol facade / foreign tool
 ~~~
@@ -68,6 +69,13 @@ latest source tree. Original paths remain visible as provenance and MAY be
 offered as a secondary browse projection for recovery-oriented work. A normal
 library workflow MUST NOT require the user to navigate source directories or
 know internal workspace, root, entry, or subject identifiers.
+
+When related files must remain a coherent unit, the default organization
+primitive is a minimal `LinkGroup`, not a replacement directory tree. A source
+directory may be explicitly captured into a group while retaining its
+relative paths, but the source namespace remains provenance and recovery
+projection. Group membership adds logical references only; it does not copy,
+move, own, compress, or otherwise reinterpret member bytes.
 
 For `RW-MVP-1`, user taxonomy reuses durable multi-value `Annotation.TAG`
 facts. The set of live tag values used in a workspace MAY be projected as the
@@ -107,6 +115,7 @@ The core MUST distinguish these layers:
 | `NamespaceEntry` | A name, metadata, and relation observed in one source or snapshot | Authoritative provenance and recovery projection |
 | `Annotation` | Versioned user or system-authored tag, note, rating, progress, or other declared fact | Durable; authority is recorded per fact |
 | `Relation` | A typed edge between subjects or records, with provenance and confidence | Durable when admitted; never byte identity |
+| `LinkGroup` | A stable group subject and its current mapping from safe group-relative paths to stable file subjects | Durable organization fact; not ownership, protection policy, byte identity, or a historical snapshot |
 | `SavedView` | A named dynamic query and presentation policy | Durable query, dynamic membership |
 | `ExportManifest` | A frozen set of subjects, selected representations, output names, and a canonical digest | Durable, reproducible output intent |
 | `Placement` | Evidence that a representation or portable record exists in one repository | Durable storage evidence, not logical identity |
@@ -121,7 +130,8 @@ A `Subject` MAY have many source paths, many annotations, many representations, 
 The logical layers above do not require one physical database per layer. The
 personal-use layout SHOULD use one configured SQLite catalog for subjects,
 namespace entries, content identities, representations, protection records,
-annotations, descriptions, recovery references, GC references, and ordinary
+annotations, descriptions, LinkGroups and their current members, recovery
+references, GC references, and ordinary
 rebuildable search tables. File bytes and admitted representations remain in
 the configured content repository because they need streaming, placement,
 compression, and verification independent of SQLite row size.
@@ -442,9 +452,98 @@ Similarity MAY help a user review near-duplicates. It MUST NOT automatically del
 
 The default storage policy is intentionally simple: SHA-256 identity, whole-content duplicate elimination, and a mature lossless repository codec. Content-defined chunking MAY be added inside the qualified repository profile. RWKV/Transformer codecs are opt-in later profiles and are never silently selected by the optimizer.
 
-## 7. Saved views and exports
+## 7. Link groups, saved views, and exports
 
-### 7.1 SavedView
+### 7.1 LinkGroup
+
+A `LinkGroup` answers one question: which file links belong together, and at
+which relative paths should they be shown? It consists of one stable group
+`SubjectRef` and one complete current mapping:
+
+```text
+safe group-relative path -> stable file SubjectRef
+```
+
+That is the entire membership model. A LinkGroup has no group version number,
+revision object, predecessor/successor chain, member role, user ordering, or
+independent history. Creating, adding, removing, or renaming members updates
+the current mapping atomically in the configured catalog. “Groups containing
+this file” is a reverse projection of that mapping and MUST NOT become a
+second writable authority.
+
+The link identifies the stable file subject; it does not pin a
+`FileVersionId`, `SnapshotId`, content digest, or representation. When that
+file subject receives an admitted update, the live group continues to point
+to the same subject and shows the latest or last available admitted file state
+that the ordinary subject resolver can provide. If no file state can be
+resolved or read, the link remains in the group with an explicit
+`MISSING`/`UNAVAILABLE` state; it MUST NOT silently disappear. An empty group
+also remains present until the user explicitly deletes the group.
+
+Group-relative paths preserve associations such as a code repository's
+`go.mod`, `server/main.go`, and `web/src/main.tsx`, but they are presentation
+and materialization inputs, not subject or byte identity. They MUST be
+relative, traversal-safe, and unique under the group-path canonicalization
+profile. An `ExportManifest` MUST additionally recheck target-specific case,
+encoding, reserved-name, and path-length collisions before materialization.
+
+A file may appear in multiple groups without another repository placement.
+Two distinct file subjects with the same `ContentIdentity` remain distinct
+links while the repository reuses their exact bytes. A group never owns a
+member or changes its protection state.
+
+The group itself is a normal durable subject. Its name is descriptor data; its
+tags and notes use `Annotation`, and its user-authored or imported semantic
+material uses `DescriptionDocument` and `SemanticSegment`. Phase 6 extends the
+host-owned subject registry, authorization, and replayable feed so the
+existing lexical, structured, and semantic provider contracts can index group
+facts without a new index dimension; the current namespace-only feed is not
+this capability. Machine-produced group summaries, descriptions, or
+membership proposals are deferred beyond the initial LinkGroup profile.
+Embeddings, model output, and similarity MUST NOT add or remove members.
+Initial group semantics are UTF-8 names/descriptions plus existing tags and
+notes only; there is no group-owned binary attachment or authoritative
+`.rwgroup` content file.
+
+An explicit “add directory as a group” action is only a convenience for
+building the current mapping from admitted files while preserving relative
+paths. It does not make directories into members or silently omit unreadable
+entries. The initial profile does not admit nested groups, member roles,
+dependency edges, ratings, generated membership, or a second collection
+store.
+
+A LinkGroup is neither a `SavedView` nor an `ExportManifest`:
+
+- `LinkGroup` is an explicitly maintained current set of stable file links;
+- `SavedView` is a dynamic query whose result may change;
+- `ExportManifest` freezes one evaluation of the current LinkGroup, one view
+  evaluation, or an explicit selection together with representations, output
+  names, policy, and verification work.
+
+Freezing a LinkGroup MUST resolve every current file link and copy the resolved
+stable subject, exact file version, source snapshot, selected representation,
+and safe relative path into an `ExportManifest`. An unavailable member remains
+visible and prevents a complete export claim; it is never silently omitted.
+The current manifest shape supports a legacy single-component output and
+snapshot-local entry handle; it is not
+reinterpreted as a stable group subject, `FileVersionId`, or multi-component
+relative path. Phase 6 MUST introduce and migrate to a versioned successor
+that binds those resolved values and a traversal-safe output path. Later
+changes to the live group or its file subjects cannot alter that frozen
+manifest.
+
+Deleting a group is an explicit catalog operation. It MUST NOT delete a file,
+weaken its `ProtectionRecord`, retire a representation, or authorize garbage
+collection. LinkGroup descriptors and the complete current member mapping are
+authenticated portable user facts. A portable backup records one complete
+current group state, not a group history. Shipping the feature requires a
+reviewed record that can rebuild that state without SQLite or any index and
+can resolve each member through its existing recovery references. It MUST NOT
+reinterpret frozen namespace, annotation, recovery, or portable-fact records.
+Until that record, reader, migration, and executable round-trip evidence
+exist, the capability status is `planned`, not implemented.
+
+### 7.2 SavedView
 
 A `SavedView` is a dynamic query. It MUST bind:
 
@@ -458,9 +557,9 @@ A `SavedView` is a dynamic query. It MUST bind:
 
 Examples include `tag:novel AND language:zh`, `duplicate_count > 1`, or `note contains "grandmother"`. Re-running a saved view MAY return different subjects as annotations or index generations change. A saved view alone is not a reproducible export and is not a garbage-collection root.
 
-### 7.2 ExportManifest
+### 7.3 ExportManifest
 
-An `ExportManifest` freezes one view evaluation or explicit selection. It MUST include:
+An `ExportManifest` freezes one evaluation of a LinkGroup's current mapping, one view evaluation, or an explicit selection. It MUST include:
 
 - immutable subject and source-revision references;
 - the selected representation for each output;
@@ -476,7 +575,7 @@ The manifest, not a live query, is the unit of plan, review, apply, retry, verif
 
 Path-shaped output is therefore a materialization result, not the primary catalog. RestoreWeave MUST NOT implement a mount API or kernel-filesystem adapter. External tools MAY mount or share a restored directory or separately consume authorized export/read contracts, but that behavior is outside the product.
 
-### 7.3 Output integration boundary
+### 7.4 Output integration boundary
 
 The core MUST initially expose output integration through stable data contracts rather than a privileged plugin that can query private catalog tables:
 
@@ -629,6 +728,15 @@ GC roots include:
 
 A `SavedView` is not a root by itself because its membership is dynamic. An operator MAY create a retention policy that periodically freezes its result into a retained manifest or explicit pins.
 
+A `LinkGroup` records organization and is not a protection policy, retention
+root, or deletion authority. Its existence does not upgrade an unprotected
+member, and removing a link or deleting the group does not make a protected
+member collectible. A future retention policy MAY freeze the group's current
+resolved contents into a retained `ExportManifest`; only that admitted record
+changes byte-root accounting. The group record, its current mapping, and its
+subject-bound descriptions/annotations remain ordinary durable catalog facts;
+there is no LinkGroup history to retain.
+
 Indexes, embeddings, thumbnails, and other rebuildable derivatives MAY be collected independently when no retained manifest requires their exact bytes. User-authored annotations MUST NOT disappear because an index generation is deleted.
 
 ## 12. Default matrix
@@ -645,7 +753,7 @@ Indexes, embeddings, thumbnails, and other rebuildable derivatives MAY be collec
 | Baseline search | Hybrid lexical + structured + semantic query broker | Acoustic, graph, multimodal, alternate vector spaces |
 | Embedding provider | Isolated ONNX Runtime 1.29.x worker with pinned `BAAI/bge-small-zh-v1.5` profile | Another qualified local or remote processor profile |
 | Vector store | In-process zvec v0.6.x through `zvec-go`, one local directory per generation | Flat scan, another embedded ANN store, Qdrant, or Milvus later |
-| Organization | Tags, annotations, relations, saved views | Original path as provenance/recovery projection |
+| Organization | Tags, annotations, minimal file-only LinkGroups, relations, saved views | Original path as provenance/recovery projection; richer Collections later |
 | Output | Frozen `ExportManifest` materialized on demand | Directory, archive, object/protocol adapter; mounting remains external |
 | Source deletion | Disabled | Separately qualified reviewed migration profile |
 | Destructive GC | Disabled until root accounting is qualified | Policy-controlled mark and sweep with audit |
@@ -659,7 +767,8 @@ ingest an explicit source
 -> prove exact ContentID and repository placement
 -> search or filter through the default fused query broker (with lexical/structured fallback if semantic generation is degraded)
 -> add durable tags or notes
--> save a dynamic view
+-> optionally create or update a minimal LinkGroup for files that belong together
+-> save a dynamic view or select a LinkGroup
 -> freeze an ExportManifest
 -> materialize or stream the requested set
 -> verify the export or restore exact bytes
@@ -684,7 +793,8 @@ This is the canonical checkout-status matrix. Other plans may add evidence, but 
 | Local ONNX/BGE encoder | implemented and tested for the opt-in worker/component profile | The supervised worker admits the pinned bundle and produces real vectors. Focused tests cover the fixed development installer, and the real supervised ONNX/BGE + zvec daemon/CLI semantic E2E passes in the provisioned Darwin arm64 environment (with the corresponding opt-in Linux arm64 evidence). The browser adapter build/E2E covers honest semantic-unavailable degradation; no browser install/restart/rebuild/real-query evidence is claimed. Supported offline packaging and release qualification remain open |
 | In-process zvec generation/query | implemented and tested for the opt-in component profile | Real zvec build/open/query and daemon generation-loss/rebuild evidence passes in the provisioned Darwin arm64 supervised E2E (with corresponding opt-in Linux arm64 evidence); fixture dimensions do not count as zvec |
 | Fused default search | partial | Lexical + structured + real semantic fusion is wired and covered by the provisioned supervised daemon E2E; profile switching preserves old generations and durable descriptions. The browser adapter build/E2E remains useful when semantic search is unavailable by exposing an honest degraded state. The development installer can provision the fixed bundle, but supported packaging/release qualification remain open |
-| Saved views and frozen export manifests | implemented and tested for the stated local scope | `rw view save/get/list/evaluate` and `rw export plan/apply/verify` work end-to-end with exact receipts; release qualification remains |
+| Minimal file-only LinkGroup | planned | The current-link mapping, relative-path, missing/empty-group, semantic reuse, export, GC, and portable-recovery boundaries are documented; no catalog schema, public operation, subject-kind/search authorization, group-aware export successor, browser workflow, portable current-state record, or executable acceptance evidence exists yet |
+| Saved views and frozen export manifests | partial | `rw view save/get/list/evaluate` and the legacy flat-output `rw export plan/apply/verify` work end-to-end with exact receipts. Export v1 retains a snapshot-local entry handle and single-component output name; stable-subject/file-version binding, multi-component group paths, successor migration, and release qualification remain open |
 | Inbox/OpenSubsonic/OPDS | retired historical adapters | Their implementation has been removed; they do not define or advance core completion |
 | FUSE/mount/network filesystem | closed non-goal | External tools consume exports or authorized reads |
 | OpenList fork/core dependency | closed non-goal | Interoperation may be considered only outside core authority |
@@ -696,7 +806,7 @@ The recovery closure is further hardened by cross-process publication fencing. P
 
 `recovery.import` and `recovery.token.export` are now wired. `recovery.import` verifies a `recovery.export` bundle against an independently retained trust anchor, cross-checks the commit/prepared binding and generation lineage, and admits the closure either catalog-free (clean-install reader over `OpenProfileReadOnly`) or by reconciling the SQLite projection when a store is available. `recovery.token.export` emits the deterministic `org.restoreweave.recovery-token.v1` proof envelope over one subject's recovery reference: schema, snapshot, subject, reference id, expected identity/length, recipe digest, publication commit ref, trust-anchor ref, optional expiry, and a digest over the canonical JSON of all other fields. A metadata-only or explicitly-unprotected subject has no recovery path and fails closed with `ErrNoRecoveryPath`.
 
-Saved views and export manifests are implemented for the stated local scope. `rw view save/get/list/evaluate` manages revisioned dynamic queries (`SavedView`), and `view.evaluate` runs the query through the search engine with the view's structured fields as typed filters. `rw export plan/apply/verify` freezes one view evaluation (or explicit subject set) into an immutable `ExportManifest` with a canonical digest, then materializes exact bytes to an explicit destination via no-follow restore and verifies the destination path-set, lengths, and SHA-256 values against the manifest. `export.apply`/`verify` reference the frozen manifest, never the live view; re-applying the same manifest is idempotent, and unsafe (non-empty or symlink) destinations fail closed. One real daemon/CLI process test now covers configured exact ingest, durable description and annotation writes, typed lexical search with segment provenance, SavedView evaluation, manifest freeze, materialization and verification, recovery-reference/trust-anchor export, catalog/signing-material removal, and clean-install exact restore. This is integration evidence for the current development/candidate profiles, not Phase 6 or release qualification. A mechanism-separated savings report (`MeasureSavings`) reports logical, duplicate, compression, physical, overhead, and net-savings bytes independently for both in-tree profiles.
+Saved views and export manifests are implemented for the stated local scope. `rw view save/get/list/evaluate` manages revisioned dynamic queries (`SavedView`), and `view.evaluate` runs the query through the search engine with the view's structured fields as typed filters. `rw export plan/apply/verify` freezes one view evaluation (or explicit subject set) into an immutable `ExportManifest` with a canonical digest, then materializes exact bytes to an explicit empty destination via no-follow restore and verifies the destination path-set, lengths, and SHA-256 values against the manifest. `export.apply`/`verify` reference the frozen manifest, never the live view; repeat verification is deterministic, while apply refuses a populated or symlink destination rather than overwriting it. One real daemon/CLI process test now covers configured exact ingest, durable description and annotation writes, typed lexical search with segment provenance, SavedView evaluation, manifest freeze, materialization and verification, recovery-reference/trust-anchor export, catalog/signing-material removal, and clean-install exact restore. This is integration evidence for the current development/candidate profiles, not Phase 6 or release qualification. A mechanism-separated savings report (`MeasureSavings`) reports logical, duplicate, compression, physical, overhead, and net-savings bytes independently for both in-tree profiles.
 
 The lexical/structured search feed now covers the complete baseline fields with typed structured filters, per-description segment provenance, and an honest per-field coverage report. `search.query` accepts `entry_type`, `size`/`mtime` facets, `content_id`, `duplicate_group`, `protection_mode`, `language`, and `suffix` constraints and returns matched segment provenance for description hits. Coverage is measured from an actually built generation; absent fields are reported as absent. Disposable generations bind the resolved config, provider profile, semantic space, snapshot, namespace root, and workspace; mismatches and legacy unbound generations fail closed. The embedding-generation manifest contract binds runtime, model, tokenizer, preprocessing, pooling, normalization, element type, dimension, vector schema, semantic space, distance, index/query configuration, provider, and config digests, and rejects incomplete manifests. With an explicitly admitted local BGE bundle, the daemon now constructs the real semantic binding, publishes and queries zvec generations from durable segments, reports the real capability only after worker/index evidence, and degrades after generation loss until a later rebuild restores it; the opt-in Linux arm64 daemon test for publication, semantic query, generation loss, degraded capability, and rebuild passed in the provisioned environment. This is not release qualification or a packaged default; without the bundle, the semantic dimension reports `SEMANTIC_INDEX_UNAVAILABLE` and fixtures remain non-default.
 
@@ -726,7 +836,7 @@ Release blockers follow one dependency graph, not a priority list that optional 
 2. The admitted clean-install reader/import and independently retained trust-anchor workflow is implemented and tested with real daemon/CLI processes on Darwin and Linux arm64. This does not constitute packaging, independent-failure-domain, or release qualification.
 3. Cross-process fencing/lease, typed unknown-outcome reconciliation, and raw/zstd corruption and relocation behavior are implemented and tested for the admitted development profile. Production repository qualification remains Phase 5.
 4. After items 1-3, run two gates in parallel: qualify one lossless production repository with complete logical/duplicate/compression/physical/index/model/net-savings measurements; and package the real local ONNX/BGE worker plus zvec while completing lexical/structured fields, typed filters, segment provenance, coverage, model-provider admission, online-egress controls, and host-owned fusion.
-5. After both parallel gates pass, complete and qualify saved views, frozen export manifests, materialize/verify, and the ordinary user loop without internal IDs.
+5. After both parallel gates pass, implement the reviewed current-state record for minimal LinkGroups, then complete and qualify LinkGroups, saved views, frozen export manifests, materialize/verify, and the ordinary user loop without internal IDs.
 6. Run native install, migration, upgrade, backup, performance, and complete `RW-MVP-1` acceptance.
 
 New facades, protocol methods, media applications, mount work, OpenList integration, multimodal dimensions, and neural codecs do not enter this queue. They cannot be used as substitutes for any blocker above.

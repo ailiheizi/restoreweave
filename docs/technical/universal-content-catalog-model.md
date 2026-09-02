@@ -35,7 +35,7 @@ The names below are intentionally distinct. A file path, a conceptual work, a by
 | Type | Meaning | Typical examples |
 | --- | --- | --- |
 | `AssetRef` | Optional stable user-facing continuity identity across accepted renames, moves, or versions | One book, album, film, game collection, project, or unknown item |
-| `SubjectRef` | Canonical typed address used by search, annotations, access, and relations; it includes a subject kind, identifier, and revision | `namespace_entry`, `file_version`, `virtual_member`, `collection_revision`, `segment`, `artifact` |
+| `SubjectRef` | Canonical typed address used by search, annotations, access, and relations; it includes a subject kind and identifier. A LinkGroup member uses the stable `file` kind, not a `FileVersionRef` or group revision. | `file`, `file_version`, `link_group`, `segment`, `artifact` |
 | `NamespaceEntryRef` | One path position in one immutable snapshot namespace | `/Inbox/old.zip` in snapshot `S7` |
 | `FileVersionRef` | One captured file state, including exact content and filesystem metadata | The bytes and metadata observed during capture `C19` |
 | `ContentRef` | One exact logical byte stream, identified by a digest domain and length | SHA-256 plus logical length |
@@ -50,27 +50,39 @@ The names below are intentionally distinct. A file path, a conceptual work, a by
 | `IndexGenerationRef` | One immutable build of one projection provider | FTS generation 12, audio feature generation 3 |
 | `ExperiencePackRef` | A signed/versioned bundle of schemas, capabilities, projections, and client metadata | Audio pack `v1`, Reader pack `v1` |
 
-### 2.1 Asset continuity versus subject revision
+### 2.1 Asset continuity versus file version
 
-`AssetRef` is a convenience for a user-facing concept, not proof that two observations are the same bytes. It may link a sequence of `SubjectRef` revisions after an explicit continuity policy accepts the relationship. For example, a book's EPUB replacement, an album's remastered track, and a game's new install revision can share an `AssetRef` while retaining different `ContentRef` values and recovery records.
+`AssetRef` is a convenience for a user-facing concept, not proof that two
+observations are the same bytes. A stable file-kind `SubjectRef` addresses the
+logical file subject; immutable `FileVersionRef` and `SnapshotId` values
+address its captured states. An `AssetRef` may also associate several otherwise distinct
+subjects after an explicit continuity policy accepts the relationship. For
+example, a book's EPUB replacement, an album's remastered track, and a game's
+new install revision can share an `AssetRef` while retaining different
+`ContentRef` values and recovery records. The MVP `LinkGroup` remains a
+current map of stable file subjects and does not acquire a revision model from
+these richer continuity mechanisms.
 
 If continuity is uncertain, the core creates separate assets and an attributed `POSSIBLE_SAME_AS` relation. A processor or embedding distance cannot silently merge them. Exact byte identity remains solely a `ContentRef` fact.
 
 ### 2.2 Subject kinds
 
-The `SubjectRef` union is open but host-versioned. The initial useful kinds are:
+The `SubjectRef` union is open but host-versioned. The MVP-visible kinds needed
+by the common subject model are:
 
 ```text
-asset
 namespace_entry
+file
 file_version
-virtual_member
-collection
-collection_revision
+link_group
 segment
 artifact
 source_binding
 ```
+
+`asset`, `virtual_member`, `collection`, and `collection_revision` remain
+later-profile subject kinds. In particular, `collection_revision` MUST NOT be
+used to give the MVP `LinkGroup` a revision or history model.
 
 An index row, repository object key, filename, model output, or display URL is never a subject kind. Presentation adapters resolve those implementation details back to an authorized subject before disclosure.
 
@@ -245,4 +257,3 @@ Do not implement all experiences in the core process before the first vertical s
 8. A game/application resolver can explain component and dependency state but cannot execute or retrieve content without a separately qualified profile.
 9. A unified query returns stable subjects or segments and identifies provider generations, stale fields, and approximate matches.
 10. A clean installation can restore exact content without any experience pack, index, model, or UI.
-

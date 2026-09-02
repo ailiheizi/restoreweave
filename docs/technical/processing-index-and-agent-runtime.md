@@ -273,7 +273,16 @@ A `QueryProvider` MAY combine lexical, structured, vector, and media-specific si
 
 ## 11. User annotations and external enrichment
 
-The MVP persists durable tags, notes, description revisions, and their ordered semantic segments attached to stable subjects. The authoritative record stores author/producer, kind, time, revision, visibility, acceptance, source spans, and provenance. Processor suggestions and external metadata remain separate from operator-confirmed annotations. Collections, ratings, corrections, aliases, and relationship graphs are later catalog capabilities and must not be required by the baseline lexical schema.
+The MVP persists durable tags, notes, description revisions, their ordered
+semantic segments, and minimal file-only LinkGroup current mappings attached
+to stable subjects. The authoritative record stores author/producer, kind,
+time, visibility, acceptance, source spans, and provenance for durable facts;
+a LinkGroup mapping itself is only current state, not historical state.
+Processor suggestions and external metadata
+remain separate from operator-confirmed annotations. Richer Collections,
+nested groups, roles, ratings, corrections, aliases, and relationship graphs
+are later catalog capabilities and must not be required by the baseline
+lexical schema.
 
 An enrichment processor may query an external service only under a declared egress grant. It stores the queried identifier, source, retrieval time, response digest or retained artifact, license and expiry information where applicable, and confidence. External metadata can improve discovery but cannot authorize omission or replace source bytes.
 

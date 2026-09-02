@@ -35,7 +35,7 @@ The reference experience SHOULD make good default decisions automatically and ex
 
 RestoreWeave core owns the following stable semantics:
 
-- Logical identity for sources, source views, namespace entries, file versions, exact content, chunks, representations, snapshots, operations, plans, policies, placements, and index generations.
+- Logical identity for sources, source views, namespace entries, file versions, exact content, chunks, representations, LinkGroups, snapshots, operations, plans, policies, placements, and index generations.
 - Immutable accepted decisions, including classification decisions that drive dispatch and fidelity decisions that select a representation.
 - Provenance for observations, classifications, extracted facts, fingerprints, transformations, validations, placements, annotations, and migrations.
 - Recovery and fidelity contracts.
@@ -43,6 +43,7 @@ RestoreWeave core owns the following stable semantics:
 - Final acceptance of validation and placement evidence.
 - Portable publication records and clean-recovery semantics.
 - Original namespace reconstruction and authoritative representation selection.
+- Atomic LinkGroup current-membership acceptance without byte ownership or deletion authority.
 - Capability grants to extensions, clients, and gateways.
 
 The core is authoritative because these meanings must survive algorithm upgrades, plugin replacement, repository migration, index rebuilds, and loss of operational projections.
@@ -98,6 +99,7 @@ The core MUST distinguish at least the following identities:
 | `ContentId` / `ContentRef` | Exact byte identity using the required cryptographic digest profile. `ContentRef` is the catalog vocabulary; `ContentId` remains the kernel identifier field. |
 | `ChunkId` | Exact byte identity under a named chunking profile |
 | `RepresentationId` / `RepresentationRef` | Raw or derived bytes and their decoder/fidelity contract. `RepresentationRef` is the catalog vocabulary; `RepresentationId` remains the identifier field. |
+| `LinkGroupId` | One stable file-only group subject whose current mapping connects canonical group-relative paths to stable file `SubjectRef` values; it has no user-visible version history. |
 | `SavedViewId` | One revisioned dynamic query and presentation policy; membership is evaluated, not frozen. |
 | `ExportManifestId` | One immutable subject/representation/output-name set with a canonical digest. |
 | `SnapshotId` | One committed namespace with selected representations and policy state |
@@ -510,7 +512,15 @@ Continuation binds the exact generation, query digest, authorization scope, sort
 
 Whole-subject user tags and plain-text notes are required durable semantic data in `RW-MVP-1`. They bind stable subjects, carry authorship, visibility, revision, and tombstone provenance, support optimistic CRUD and portable export/import, and enter the portable closure according to policy.
 
-Collections, ratings, relationship graphs, typed segment annotations, accepted machine suggestions, and recovery-intent services are later profile capabilities. When enabled, they follow the same durable subject and provenance rules.
+The minimal file-only `LinkGroup` defined and planned by the MVP-defining documents is
+the narrow exception: it reuses a stable subject and one current membership
+mapping, and introduces no separate authority or store. A member maps a
+group-relative path to a stable file `SubjectRef`; changes replace the current
+mapping atomically rather than creating a user-visible group version history.
+Richer Collections, nested groups, member roles, ratings, relationship graphs,
+typed segment annotations, accepted machine suggestions, and recovery-intent
+services are later profile capabilities. When enabled, they follow the same
+durable subject and provenance rules.
 
 Machine-generated captions, transcripts, embeddings, thumbnails, summaries, and classifications are derived records. They MAY be retained when their cost, uniqueness, or reproducibility matters, but search-store rows and rank scores remain non-authoritative.
 
@@ -615,6 +625,7 @@ The minimum distribution MUST provide:
 - At least one qualified placement backend with durable receipts, readback, and reconciliation.
 - Baseline metadata and text extraction and search.
 - Durable tag and note CRUD plus portable annotation export/import.
+- Minimal file-only LinkGroups with current membership mappings and portable recovery.
 - `SnapshotTree` and `FileAccess` browse and restore, plus export-manifest materialization. No mount service is part of the product.
 - Portable commit and recovery-reference export.
 - Component digests, decoder inventory, and license inventory.
@@ -650,6 +661,7 @@ The first conforming product MUST satisfy all of the following:
 20. **CKI-AC-20 — Safe lifecycle:** No last required representation, portable record, placement, or decoder becomes collection-eligible while a committed snapshot depends on it.
 21. **CKI-AC-21 — Adapter equivalence:** CLI, initial read-only MCP, and any later REST or WebUI adapter produce equivalent core commands, authority checks, results, and events for every operation they share.
 22. **CKI-AC-22 — Reproducible materialization:** A frozen `ExportManifest` binds subjects, selected representations, output names, and a digest; applying it to an explicit destination returns per-item receipts and verification evidence. Optional mount adapters do not own identity or retention.
+23. **CKI-AC-23 — Minimal LinkGroup consistency:** One current group mapping connects traversal-safe relative paths to stable file subjects, can be resolved into an `ExportManifest` that freezes concrete file versions for that export, and can be reconstructed from authenticated portable records without SQLite or indexes. The same bytes remain one exact placement across groups, and membership mutation or deletion never mutates or deletes a member file. Missing members remain visible and empty groups remain until explicit deletion.
 
 The default semantic profile requires the pinned local text-embedding `Processor`, a zvec `IndexProvider` generation, and a `QueryProvider` invoked against that exact `IndexGenerationRef` only after compatibility is validated. None becomes a recovery dependency. Additional CLIP-like and multimodal profiles are later release gates.
 

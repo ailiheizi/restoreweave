@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -49,10 +50,19 @@ type Indexer struct {
 	// generation looking healthy or silently serve it with an unhealthy
 	// provider. A later successful rebuild clears the latch.
 	semanticUnavailable atomic.Bool
-	// semanticIndexReady is evidence that a real zvec generation was built or
-	// opened and queried successfully. Provider embedding alone is insufficient.
+	// semanticIndexReady is evidence that a real generation passed complete
+	// coverage verification for the current profile/binding. Provider embedding
+	// or a local query result alone is insufficient.
 	semanticIndexReady atomic.Bool
 	semanticFailure    atomic.Value
+
+	// semanticVerified records immutable backend coverage evidence per
+	// generation. It is process-local and disposable: durable generation
+	// metadata remains the recovery/index authority, while this cache avoids
+	// re-enumerating a frozen collection for every query.
+	semanticVerifiedMu sync.RWMutex
+	semanticVerified   map[string]semanticGenerationReceipt
+	semanticVerifyMu   sync.Mutex
 
 	// EnableFixtureDimensions is test/qualification-only wiring for the
 	// deterministic acoustic and embedding fixtures. Production readiness must
@@ -60,6 +70,70 @@ type Indexer struct {
 	EnableFixtureDimensions bool
 
 	mu sync.Mutex
+}
+
+type semanticGenerationReceipt struct {
+	GenerationID   string
+	DBPath         string
+	ConfigDigest   string
+	ProfileDigest  string
+	SemanticSpace  string
+	LibraryPath    string
+	LibraryDigest  string
+	IdentityCount  int
+	IdentityDigest string
+}
+
+func (idx *Indexer) cachedSemanticGeneration(generation sqlite.IndexGeneration) (int, bool) {
+	if idx == nil || strings.TrimSpace(generation.ID) == "" {
+		return 0, false
+	}
+	idx.semanticVerifiedMu.RLock()
+	receipt, ok := idx.semanticVerified[generation.ID]
+	idx.semanticVerifiedMu.RUnlock()
+	if !ok || receipt.DBPath != generation.DBPath || receipt.ConfigDigest != generation.ConfigDigest ||
+		receipt.ProfileDigest != generation.ProviderProfileDigest || receipt.SemanticSpace != generation.SemanticSpace ||
+		receipt.LibraryPath != idx.SemanticLibraryPath || receipt.LibraryDigest != idx.SemanticLibraryDigest {
+		return 0, false
+	}
+	// Re-read the immutable receipt on every fast-path use. This preserves the
+	// no-full-enumeration query performance contract while ensuring a changed,
+	// truncated, or rebound sidecar cannot keep a cached generation healthy.
+	identities, identityDigest, libraryDigest, err := readSemanticGenerationReceipt(generation)
+	if err != nil || len(identities) != receipt.IdentityCount || identityDigest != receipt.IdentityDigest || libraryDigest != idx.SemanticLibraryDigest {
+		return 0, false
+	}
+	return receipt.IdentityCount, true
+}
+
+func (idx *Indexer) cacheSemanticGeneration(generation sqlite.IndexGeneration, identities []ZvecCoverageIdentity) {
+	if idx == nil || strings.TrimSpace(generation.ID) == "" {
+		return
+	}
+	idx.semanticVerifiedMu.Lock()
+	if idx.semanticVerified == nil {
+		idx.semanticVerified = make(map[string]semanticGenerationReceipt)
+	}
+	idx.semanticVerified[generation.ID] = semanticGenerationReceipt{
+		GenerationID: generation.ID, DBPath: generation.DBPath, ConfigDigest: generation.ConfigDigest,
+		ProfileDigest: generation.ProviderProfileDigest, SemanticSpace: generation.SemanticSpace,
+		LibraryPath: idx.SemanticLibraryPath, LibraryDigest: idx.SemanticLibraryDigest,
+		IdentityCount: len(identities), IdentityDigest: semanticCoverageDigest(identities),
+	}
+	idx.semanticVerifiedMu.Unlock()
+}
+
+func (idx *Indexer) revokeSemanticGeneration(generationID string) {
+	if idx == nil || strings.TrimSpace(generationID) == "" {
+		return
+	}
+	idx.semanticVerifiedMu.Lock()
+	delete(idx.semanticVerified, generationID)
+	idx.semanticVerifiedMu.Unlock()
+	// Readiness belongs to the currently selected/latest generation. A failed
+	// query of a pinned generation must never be able to resurrect capability
+	// from some other (possibly stale) receipt.
+	idx.semanticIndexReady.Store(false)
 }
 
 func (idx *Indexer) profileDigest(dimension string) string {
@@ -209,6 +283,7 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 	}
 	currentSubjects := make(map[string]struct{}, len(nodes))
 	byID := make(map[string]sqlite.NamespaceEntry, len(nodes))
+	entriesByObservation := make(map[string]sqlite.NamespaceEntry, len(nodes))
 	// rootsByID is the immutable namespace scope captured by this generation.
 	// Do not resolve provenance through the current latest projection: a pinned
 	// generation must remain readable after a later publication replaces one of
@@ -232,12 +307,21 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 	if _, ok := rootsByID[namespaceRootID]; !ok {
 		return generation, fmt.Errorf("primary namespace root %q is outside generation scope", namespaceRootID)
 	}
+	generationSnapshotRef := snapshotRef
+	if primaryRoot := rootsByID[namespaceRootID]; strings.TrimSpace(primaryRoot.SnapshotRef) != "" {
+		// Bind the generation to the snapshot actually captured by its primary
+		// root. The rebuild trigger label is not authoritative provenance.
+		generationSnapshotRef = primaryRoot.SnapshotRef
+	}
 	for index := range nodes {
 		entry := nodes[index].Entry
 		if strings.TrimSpace(entry.SubjectRef) == "" {
 			entry.SubjectRef = entry.ID
 		}
 		byID[entry.ID] = entry
+		if entry.ObservationID != "" {
+			entriesByObservation[entry.ObservationID] = entry
+		}
 		currentSubjects[entry.SubjectRef] = struct{}{}
 		if _, ok := rootsByID[entry.RootID]; !ok {
 			return generation, fmt.Errorf("namespace entry %q is outside generation root scope", entry.ID)
@@ -265,6 +349,10 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 		artifacts[index].SubjectRef = canonicalSubject(artifacts[index].SubjectRef)
 	}
 	metadataFacts, err := idx.Store.ListMetadataFacts(ctx, workspaceID, "")
+	if err != nil {
+		return generation, err
+	}
+	detectionEvidence, err := idx.Store.ListDetectionEvidence(ctx, workspaceID, "")
 	if err != nil {
 		return generation, err
 	}
@@ -299,6 +387,7 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 	notesBySubject := map[string][]string{}
 	extractedBySubject := map[string][]string{}
 	metadataBySubject := map[string][]string{}
+	detectionBySubject := map[string][]string{}
 	protectionBySubject := map[string][]string{}
 	processingBySubject := map[string][]string{}
 	representationsByContent := map[string][]string{}
@@ -356,6 +445,22 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 		subjectRef := canonicalSubject(fact.SubjectRef)
 		metadataBySubject[subjectRef] = append(metadataBySubject[subjectRef],
 			fact.Namespace, fact.Key, string(fact.Value), fact.ValueType)
+	}
+	for _, evidence := range detectionEvidence {
+		entry, ok := entriesByObservation[evidence.ObservationID]
+		if !ok {
+			continue
+		}
+		subjectRef := canonicalSubject(entry.SubjectRef)
+		if _, ok := currentSubjects[subjectRef]; !ok {
+			continue
+		}
+		// Include only durable detector fields. In particular, the observation
+		// ReadState is not a detection claim and must never feed this axis.
+		detectionBySubject[subjectRef] = append(detectionBySubject[subjectRef],
+			evidence.DetectorID, evidence.DetectorDigest, evidence.EvidenceKind,
+			evidence.CandidateFormat, evidence.CandidateMIME,
+			string(evidence.Evidence), evidence.EvidenceDigest)
 	}
 	for _, protection := range protections {
 		subjectRef := canonicalSubject(protection.SubjectRef)
@@ -480,13 +585,6 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 			}
 			segmentsJSON = string(encoded)
 		}
-		detection := ""
-		if entry.ObservationID != "" {
-			observation, obsErr := idx.Store.GetObservation(ctx, workspaceID, entry.ObservationID)
-			if obsErr == nil {
-				detection = observation.ReadState
-			}
-		}
 		doc := Document{
 			SubjectID:       entry.SubjectRef,
 			Path:            displayPath(byID, entry),
@@ -503,7 +601,7 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 			Notes:           strings.Join(notesBySubject[entry.SubjectRef], " "),
 			Descriptions:    strings.Join(descriptionsBySubject[entry.SubjectRef], " "),
 			Extracted:       strings.Join(extractedBySubject[entry.SubjectRef], " "),
-			Detection:       detection,
+			Detection:       strings.Join(detectionBySubject[entry.SubjectRef], " "),
 			Processing:      strings.Join(processingBySubject[entry.SubjectRef], " "),
 			Representations: strings.Join(representationsByContent[entry.ContentID], " "),
 			Language:        subjectLanguage(descriptionsBySubject[entry.SubjectRef]),
@@ -530,7 +628,7 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 	generation = sqlite.IndexGeneration{
 		ID:                    generationID,
 		WorkspaceID:           workspaceID,
-		SnapshotRef:           snapshotRef,
+		SnapshotRef:           generationSnapshotRef,
 		NamespaceRootID:       namespaceRootID,
 		DBPath:                dbPath,
 		Dimension:             DimensionLexical,
@@ -580,6 +678,28 @@ func (idx *Indexer) SemanticFailure() string {
 	return failure
 }
 
+// semanticGenerationMatchesLatestFeed binds the default semantic broker to
+// the same durable lexical feed that is current after restart. Pinned
+// historical generations remain addressable explicitly; only the implicit
+// latest semantic lane is gated by this current-feed authority.
+func (idx *Indexer) semanticGenerationMatchesLatestFeed(ctx context.Context, generation sqlite.IndexGeneration) error {
+	if idx == nil || idx.Store == nil {
+		return ErrUnavailable
+	}
+	lexical, err := idx.Store.LatestIndexGeneration(ctx, generation.WorkspaceID, DimensionLexical)
+	if err != nil {
+		return fmt.Errorf("latest lexical generation: %w", err)
+	}
+	if lexical.WorkspaceID != generation.WorkspaceID || lexical.SnapshotRef != generation.SnapshotRef || lexical.NamespaceRootID != generation.NamespaceRootID || !generationBindingMatches(idx, lexical, DimensionLexical) {
+		return errors.New("semantic generation does not match latest lexical feed")
+	}
+	return nil
+}
+
+func semanticRequiresCurrentFeed(idx *Indexer) bool {
+	return idx != nil && idx.SemanticManifest != (EmbeddingGenerationManifest{}) && idx.SemanticManifest.SemanticSpace == SemanticBundleBGESemanticSpace
+}
+
 // WarmSemanticGeneration reopens the latest disposable zvec generation after
 // a daemon restart. Readiness is granted only after its persisted bindings
 // match the current model/config profile and the native driver opens it.
@@ -595,44 +715,17 @@ func (idx *Indexer) WarmSemanticGeneration(ctx context.Context, workspaceID stri
 	if !generationBindingMatches(idx, generation, DimensionSemantic) {
 		return fmt.Errorf("%w: semantic generation binding mismatch", ErrUnavailable)
 	}
-	if _, err := semanticNamespaceEntries(ctx, idx.Store, generation); err != nil {
+	if semanticRequiresCurrentFeed(idx) {
+		if err := idx.semanticGenerationMatchesLatestFeed(ctx, generation); err != nil {
+			return fmt.Errorf("%w: %v", ErrUnavailable, err)
+		}
+	}
+	if err := validateSemanticGenerationMapping(ctx, idx.Store, generation); err != nil {
 		return fmt.Errorf("%w: semantic generation root mapping: %v", ErrUnavailable, err)
 	}
-	membershipVerifier, ok := idx.SemanticZvec.(ZvecGenerationMembershipVerifier)
-	if !ok {
-		return fmt.Errorf("%w: semantic backend does not provide generation membership verification", ErrUnavailable)
-	}
-	spec := ZvecGenerationSpec{
-		Path: generation.DBPath, LibraryPath: idx.SemanticLibraryPath,
-		LibraryDigest: idx.SemanticLibraryDigest,
-		ProfileDigest: idx.SemanticManifest.CanonicalDigest(), Manifest: idx.SemanticManifest,
-	}
-	opened, err := idx.SemanticZvec.Open(ctx, spec)
-	if err != nil {
-		return fmt.Errorf("%w: open semantic generation: %v", ErrUnavailable, err)
-	}
-	if err := opened.Close(); err != nil {
-		return fmt.Errorf("%w: close semantic generation: %v", ErrUnavailable, err)
-	}
-	var pairs []ZvecCoverageIdentity
-	switch probe := idx.SemanticZvec.(type) {
-	case interface {
-		CoveragePairs(context.Context, ZvecGenerationSpec) ([]ZvecCoverageIdentity, error)
-	}:
-		pairs, err = probe.CoveragePairs(ctx, spec)
-	case semanticCoveragePairMethodProbe:
-		pairs, err = probe.Coverage(ctx, spec)
-	default:
-		return fmt.Errorf("%w: semantic backend does not provide generation identity coverage", ErrUnavailable)
-	}
-	if err != nil || len(pairs) == 0 {
-		if err == nil {
-			err = errors.New("generation identity coverage is empty")
-		}
-		return fmt.Errorf("%w: semantic generation identity coverage: %v", ErrUnavailable, err)
-	}
-	if err := membershipVerifier.VerifyMembership(ctx, spec, pairs); err != nil {
-		return fmt.Errorf("%w: semantic generation membership: %v", ErrUnavailable, err)
+	if err := idx.ensureSemanticGenerationVerified(ctx, generation); err != nil {
+		idx.semanticIndexReady.Store(false)
+		return err
 	}
 	idx.semanticUnavailable.Store(false)
 	idx.semanticFailure.Store("")
@@ -882,8 +975,7 @@ func (idx *Indexer) rebuildSemantic(ctx context.Context, workspaceID, snapshotRe
 	if idx.SemanticProvider == nil || idx.SemanticZvec == nil {
 		return generation, ErrUnavailable
 	}
-	membershipVerifier, ok := idx.SemanticZvec.(ZvecGenerationMembershipVerifier)
-	if !ok {
+	if _, ok := idx.SemanticZvec.(ZvecGenerationMembershipVerifier); !ok {
 		return generation, fmt.Errorf("%w: semantic backend does not provide generation membership verification", ErrUnavailable)
 	}
 	manifest := idx.SemanticManifest
@@ -922,16 +1014,9 @@ func (idx *Indexer) rebuildSemantic(ctx context.Context, workspaceID, snapshotRe
 	if err != nil {
 		return generation, err
 	}
-	request := SemanticEmbeddingRequest{Purpose: SemanticEmbeddingDocument, GenerationID: generationID, Manifest: manifest, Inputs: inputs}
-	if err := validateSemanticEmbeddingRequest(request); err != nil {
-		return generation, err
-	}
-	results, err := idx.SemanticProvider.Embed(ctx, request)
+	results, err := embedSemanticDocumentBatches(ctx, idx.SemanticProvider, manifest, generationID, inputs)
 	if err != nil {
 		return generation, fmt.Errorf("%w: provider: %v", ErrUnavailable, err)
-	}
-	if err := validateSemanticEmbeddingResults(request, results); err != nil {
-		return generation, err
 	}
 	zvecSegments := make([]ZvecSegment, 0, len(results))
 	for _, result := range results {
@@ -947,25 +1032,117 @@ func (idx *Indexer) rebuildSemantic(ctx context.Context, workspaceID, snapshotRe
 		idx.semanticIndexReady.Store(false)
 		return generation, fmt.Errorf("%w: build generation: %v", ErrUnavailable, err)
 	}
+	if err := validateSemanticBuildReceipt(receipt, spec, len(zvecSegments)); err != nil {
+		idx.semanticIndexReady.Store(false)
+		return generation, fmt.Errorf("%w: %v", ErrUnavailable, err)
+	}
 	candidates := make([]ZvecCoverageIdentity, 0, len(zvecSegments))
 	for _, segment := range zvecSegments {
 		candidates = append(candidates, ZvecCoverageIdentity{SubjectID: segment.SubjectID, SegmentID: segment.SegmentID})
 	}
-	if err := membershipVerifier.VerifyMembership(ctx, spec, candidates); err != nil {
+	actualCoverage, err := idx.verifySemanticGenerationCoverage(ctx, spec, candidates)
+	if err != nil {
 		idx.semanticIndexReady.Store(false)
-		return generation, fmt.Errorf("%w: semantic generation membership: %v", ErrUnavailable, err)
+		return generation, err
+	}
+	if err := openCloseSemanticGeneration(ctx, idx.SemanticZvec, spec); err != nil {
+		idx.semanticIndexReady.Store(false)
+		return generation, fmt.Errorf("%w: built semantic generation lifecycle: %v", ErrUnavailable, err)
+	}
+	semanticSnapshotRef := snapshotRef
+	if primaryRoot, rootErr := idx.Store.GetNamespaceRoot(ctx, workspaceID, namespaceRootID); rootErr == nil && strings.TrimSpace(primaryRoot.SnapshotRef) != "" {
+		// The semantic generation's primary root binding is its immutable
+		// snapshot authority. Rebuild callers may pass a publication trigger
+		// label that is not the root snapshot itself.
+		semanticSnapshotRef = primaryRoot.SnapshotRef
 	}
 	generation = sqlite.IndexGeneration{
-		ID: generationID, WorkspaceID: workspaceID, SnapshotRef: snapshotRef, NamespaceRootID: namespaceRootID,
+		ID: generationID, WorkspaceID: workspaceID, SnapshotRef: semanticSnapshotRef, NamespaceRootID: namespaceRootID,
 		DBPath: receipt.Path, Dimension: DimensionSemantic, ConfigDigest: manifest.ConfigDigest,
 		ProviderProfileDigest: manifest.CanonicalDigest(), SemanticSpace: manifest.SemanticSpace,
 	}
+	if strings.TrimSpace(generation.DBPath) == "" {
+		generation.DBPath = spec.Path
+	}
+	if err := writeSemanticGenerationReceipt(generation, idx.SemanticLibraryDigest, actualCoverage); err != nil {
+		idx.semanticIndexReady.Store(false)
+		return generation, fmt.Errorf("%w: write generation receipt: %v", ErrUnavailable, err)
+	}
 	if err := idx.Store.InsertIndexGenerationWithRoots(ctx, &generation, rootIDs); err != nil {
 		idx.semanticIndexReady.Store(false)
+		_ = os.Remove(semanticGenerationReceiptPath(generation.DBPath))
 		return sqlite.IndexGeneration{}, err
 	}
+	idx.cacheSemanticGeneration(generation, actualCoverage)
 	idx.semanticIndexReady.Store(true)
 	return generation, nil
+}
+
+func validateSemanticBuildReceipt(receipt ZvecGenerationReceipt, spec ZvecGenerationSpec, segmentCount int) error {
+	if receipt.Path != spec.Path || receipt.LibraryDigest != spec.LibraryDigest || receipt.ProfileDigest != spec.ProfileDigest ||
+		receipt.Dimension != spec.Manifest.Dimension || receipt.SegmentCount != segmentCount {
+		return errors.New("semantic build receipt does not match requested generation")
+	}
+	return nil
+}
+
+// embedSemanticDocumentBatches keeps each provider request within the worker
+// contract's single-language boundary. A rebuilt generation can legitimately
+// contain filename facts (und) and durable descriptions (for example, zh) at
+// the same time; combining those inputs would make the real BGE worker reject
+// the complete rebuild. Inputs are also bounded to the provider's request
+// limit, then results are restored to the deterministic input order.
+func embedSemanticDocumentBatches(ctx context.Context, provider SemanticEmbeddingProvider, manifest EmbeddingGenerationManifest, generationID string, inputs []SemanticTextInput) ([]SemanticVector, error) {
+	if provider == nil {
+		return nil, ErrSemanticProviderUnavailable
+	}
+	if len(inputs) == 0 {
+		return nil, ErrSemanticProviderUnavailable
+	}
+	const maxBatchSize = 256
+	byLanguage := make(map[string][]SemanticTextInput)
+	order := make(map[string]int, len(inputs))
+	for position, input := range inputs {
+		language := strings.TrimSpace(input.Language)
+		if language == "" {
+			language = "und"
+		}
+		input.Language = language
+		byLanguage[language] = append(byLanguage[language], input)
+		order[input.SegmentID] = position
+	}
+	languages := make([]string, 0, len(byLanguage))
+	for language := range byLanguage {
+		languages = append(languages, language)
+	}
+	sort.Strings(languages)
+	results := make([]SemanticVector, 0, len(inputs))
+	for _, language := range languages {
+		group := byLanguage[language]
+		for start := 0; start < len(group); start += maxBatchSize {
+			end := start + maxBatchSize
+			if end > len(group) {
+				end = len(group)
+			}
+			batchInputs := group[start:end]
+			request := SemanticEmbeddingRequest{Purpose: SemanticEmbeddingDocument, GenerationID: generationID, Manifest: manifest, Inputs: batchInputs}
+			if err := validateSemanticEmbeddingRequest(request); err != nil {
+				return nil, err
+			}
+			batchResults, err := provider.Embed(ctx, request)
+			if err != nil {
+				return nil, err
+			}
+			if err := validateSemanticEmbeddingResults(request, batchResults); err != nil {
+				return nil, err
+			}
+			results = append(results, batchResults...)
+		}
+	}
+	sort.SliceStable(results, func(i, j int) bool {
+		return order[results[i].SegmentID] < order[results[j].SegmentID]
+	})
+	return results, nil
 }
 
 // SemanticTextInput predates generic durable text sources and retains the
@@ -978,14 +1155,37 @@ func semanticSourceRevision(segment SegmentRef) string {
 	return segment.SourceID
 }
 
-func (idx *Indexer) querySemantic(ctx context.Context, generation sqlite.IndexGeneration, text string) ([]Hit, error) {
-	idx.semanticIndexReady.Store(false)
+func (idx *Indexer) querySemantic(ctx context.Context, generation sqlite.IndexGeneration, text string) (result []Hit, err error) {
+	// Querying does not revoke other verified generations. A failed query only
+	// drops this generation's receipt through the deferred failure path.
+	querySucceeded := false
+	var opened ZvecGeneration
+	defer func() {
+		if opened != nil {
+			if closeErr := opened.Close(); closeErr != nil {
+				result = nil
+				err = fmt.Errorf("%w: close generation: %v", ErrUnavailable, closeErr)
+				querySucceeded = false
+			}
+		}
+		if !querySucceeded {
+			idx.revokeSemanticGeneration(generation.ID)
+		}
+	}()
 	if idx.SemanticProvider == nil || idx.SemanticZvec == nil {
 		return nil, ErrUnavailable
 	}
 	manifest := idx.SemanticManifest
 	if err := manifest.Validate(); err != nil {
 		return nil, ErrUnavailable
+	}
+	spec := ZvecGenerationSpec{
+		Path: generation.DBPath, LibraryPath: idx.SemanticLibraryPath, LibraryDigest: idx.SemanticLibraryDigest,
+		ProfileDigest: manifest.CanonicalDigest(), Manifest: manifest,
+	}
+	if err := idx.ensureSemanticGenerationVerified(ctx, generation); err != nil {
+		idx.semanticIndexReady.Store(false)
+		return nil, err
 	}
 	request := SemanticEmbeddingRequest{Purpose: SemanticEmbeddingQuery, GenerationID: generation.ID, Manifest: manifest, Inputs: []SemanticTextInput{{SegmentID: "query", Language: "und", Text: text}}}
 	if err := validateSemanticEmbeddingRequest(request); err != nil {
@@ -1001,16 +1201,14 @@ func (idx *Indexer) querySemantic(ctx context.Context, generation sqlite.IndexGe
 	if len(results) != 1 {
 		return nil, ErrUnavailable
 	}
-	spec := ZvecGenerationSpec{
-		Path: generation.DBPath, LibraryPath: idx.SemanticLibraryPath, LibraryDigest: idx.SemanticLibraryDigest,
-		ProfileDigest: manifest.CanonicalDigest(), Manifest: manifest,
-	}
-	opened, err := idx.SemanticZvec.Open(ctx, spec)
+	opened, err = idx.SemanticZvec.Open(ctx, spec)
 	if err != nil {
 		idx.semanticIndexReady.Store(false)
 		return nil, fmt.Errorf("%w: open generation: %v", ErrUnavailable, err)
 	}
-	defer opened.Close()
+	if opened == nil {
+		return nil, fmt.Errorf("%w: semantic backend returned a nil generation", ErrUnavailable)
+	}
 	membershipVerifier, ok := idx.SemanticZvec.(ZvecGenerationMembershipVerifier)
 	if !ok {
 		return nil, fmt.Errorf("%w: semantic backend does not provide generation membership verification", ErrUnavailable)
@@ -1019,6 +1217,11 @@ func (idx *Indexer) querySemantic(ctx context.Context, generation sqlite.IndexGe
 	if err != nil {
 		idx.semanticIndexReady.Store(false)
 		return nil, err
+	}
+	entries, err := semanticNamespaceEntries(ctx, idx.Store, generation)
+	if err != nil {
+		idx.semanticIndexReady.Store(false)
+		return nil, fmt.Errorf("%w: semantic namespace provenance: %v", ErrUnavailable, err)
 	}
 	candidates := make([]ZvecCoverageIdentity, 0, len(hits))
 	for _, hit := range hits {
@@ -1030,12 +1233,8 @@ func (idx *Indexer) querySemantic(ctx context.Context, generation sqlite.IndexGe
 	if err := membershipVerifier.VerifyMembership(ctx, spec, candidates); err != nil {
 		return nil, fmt.Errorf("%w: semantic generation membership: %v", ErrUnavailable, err)
 	}
-	result := make([]Hit, 0, len(hits))
+	result = make([]Hit, 0, len(hits))
 	bySubject := make(map[string]int, len(hits))
-	entries, err := semanticNamespaceEntries(ctx, idx.Store, generation)
-	if err != nil {
-		return nil, fmt.Errorf("%w: semantic namespace provenance: %v", ErrUnavailable, err)
-	}
 	for _, hit := range hits {
 		if strings.HasPrefix(hit.SegmentID, sqlite.IDPrefixAnnotation+"_") {
 			annotationID := hit.SegmentID
@@ -1126,7 +1325,7 @@ func (idx *Indexer) querySemantic(ctx context.Context, generation sqlite.IndexGe
 		bySubject[hit.SubjectID] = len(result)
 		result = append(result, Hit{SubjectID: hit.SubjectID, Segments: []SegmentRef{projectedSegment}})
 	}
-	idx.semanticIndexReady.Store(true)
+	querySucceeded = true
 	return result, nil
 }
 
@@ -1397,6 +1596,16 @@ func (idx *Indexer) Query(ctx context.Context, req QueryRequest) (sqlite.IndexGe
 		// it. Do not let an internal caller use a valid index from another
 		// workspace merely because it knows the generation ID.
 		return generation, nil, ErrUnavailable
+	}
+	if dimension == DimensionSemantic && semanticRequiresCurrentFeed(idx) {
+		if err := validateSemanticGenerationMapping(ctx, idx.Store, generation); err != nil {
+			return generation, nil, fmt.Errorf("%w: semantic generation root mapping: %v", ErrUnavailable, err)
+		}
+		if strings.TrimSpace(req.GenerationID) == "" {
+			if err := idx.semanticGenerationMatchesLatestFeed(ctx, generation); err != nil {
+				return generation, nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
+			}
+		}
 	}
 	var hits []Hit
 	switch dimension {
