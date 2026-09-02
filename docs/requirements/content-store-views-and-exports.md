@@ -29,6 +29,7 @@ The following decisions are frozen for `RW-MVP-1`. Changing one requires an expl
 | Default semantic profile | Bundled local ONNX/BGE encoder plus in-process zvec; no Docker Compose or separate vector service |
 | Semantic degradation | Exact ingest, verification, restore, and lexical/structured search continue, but the installation reports `SEMANTIC_INDEX_UNAVAILABLE` and is not a qualified default experience |
 | Long-form knowledge | User, imported, extracted, and generated descriptions are durable versioned documents; vectors are disposable projections of their segments |
+| User-facing free text | The WebUI presents notes and descriptive text in one `Notes` surface; source/provenance labels are secondary and do not create another user concept |
 | Description generation | Description storage and indexing are core; model-generated descriptions are explicit, on-demand work through a selected `DESCRIBE_SUBJECT` profile, not an automatic ingest dependency or a second bundled model hidden behind the embedding choice |
 | Online models | Explicit replacement profiles with egress and credential policy; never required for the personal-use default |
 | Output | A dynamic `SavedView` freezes into an immutable `ExportManifest`, which is materialized or streamed on demand |
@@ -596,6 +597,14 @@ File names and extracted bytes are necessary but not sufficient for the catalog.
 - source artifact or source-binding references and covered source spans;
 - model/provider/profile digest when generated;
 - confidence, coverage, acceptance state, predecessor revision, and timestamps.
+
+This durable distinction is invisible as a second product concept. The WebUI
+MUST project user notes, imported or extracted text, and model-produced text
+into the same `Notes` surface. It MAY show a small source, acceptance, or
+editability label on each row, but MUST NOT copy a description into
+`Annotation.NOTE` just to make it visible there. The separate record shapes,
+revision chains, and provenance remain authoritative for search, recovery, and
+audit.
 
 The complete description body MUST be retained in the content/recovery data plane or an admitted artifact placement. It MUST NOT exist only in a vector store. User descriptions and model descriptions are separate revisions; a model result never overwrites a user fact. A generated description is evidence or interpretation, not a recovery claim.
 

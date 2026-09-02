@@ -16,7 +16,7 @@ The ordinary loop is:
 ```text
 configure
 -> inspect and protect content
--> retain names, facts, Notes, Descriptions, and recovery references
+-> retain names, facts, one Notes surface, and recovery references
 -> search lexical + structured + semantic information
 -> save a view and freeze an ExportManifest
 -> materialize and verify output
@@ -39,6 +39,7 @@ indexes may implement work behind those contracts; they do not redefine it.
 | Operational metadata | Keep one configured catalog; do not add a second live metadata database without a demonstrated need |
 | Recovery authority | Repository objects plus authenticated portable recovery records and an independently retained trust anchor |
 | Personal semantic profile | Pinned local BGE/ONNX + in-process zvec; no Qdrant, Milvus, or Compose dependency |
+| User-facing free-form text | One `Notes` surface in the browser; durable `Annotation.NOTE` and `DescriptionDocument` records remain separate for provenance, revision, and recovery |
 | Garbage collection | Non-destructive reachability planning only; no deletion executor |
 | Source deletion | Disabled; any future capacity release requires a reviewed migration profile and human approval |
 | Filesystem gateways | No built-in FUSE, SMB, NFS, WebDAV, S3, or mount product |
@@ -58,8 +59,9 @@ model.
   revalidation, idempotent replay, and visible blocked/degraded outcomes.
 - Exact SHA-256 identity, whole-file duplicate placement, exact readback, and
   original-path recovery projection.
-- Durable revisioned Notes, tags, Descriptions, semantic segments, and basic
-  text/audio-tag/EPUB extraction.
+- Durable revisioned Notes and tags, provenance-preserving Descriptions and
+  semantic segments, and basic text/audio-tag/EPUB extraction. The browser
+  presents the free-form text through one Notes surface.
 - Complete stated lexical/structured search fields and filters, source-bearing
   segment hits, and real provisioned BGE/ONNX + zvec fusion with honest
   degradation.

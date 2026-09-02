@@ -50,7 +50,7 @@ These foundations are not release completion. In particular, fixture embeddings 
 | 1 | Protection and portable facts | 0 | `STORE_EXACT`, `STORE_EXACT_WITH_EXTERNAL_FALLBACK`, `LINK_ONLY`, and `METADATA_ONLY` decisions produce canonical, honest outcomes | Clean manifest preserves names, metadata, and recovery state |
 | 2 | Plan/review/apply integrity | 1 | Preview is non-mutating; apply is digest-bound and idempotent | Stale or altered plans fail closed |
 | 3 | Recovery closure | 1, 2 | A clean machine can verify and restore without SQLite or indexes | Signed closure/publication and corruption tests pass |
-| 4 | Descriptions and complete discovery | 1, 3 | Users can search filename, metadata, text, tags, notes, descriptions, and semantic meaning | Structured coverage and segment provenance are complete |
+| 4 | Descriptions and complete discovery | 1, 3 | Users can search filename, metadata, text, tags, and descriptive text (shown in one Notes surface) plus semantic meaning | Structured coverage and segment provenance are complete |
 | 5 | Simple qualified storage savings | 2, 3 | Real physical savings are measured and recoverable | Repository codec/dedup qualification passes |
 | 6 | Link groups, export, and operator ergonomics | 2, 3, 4, 5 | Users keep related file links together, select by group or view, and export without internal IDs | LinkGroup/view -> manifest -> materialize -> verify passes |
 | 7 | Release hardening | 3, 4, 5, 6 | Native personal-use installation and upgrade path | Full `RW-MVP-1` acceptance passes |
@@ -294,6 +294,13 @@ The Phase 3 recovery-closure gate is implemented and tested for the admitted dev
 ### 8.1 Durable description model
 
 Use a versioned `DescriptionDocument` rather than overloading `Annotation.NOTE` or `ProcessorArtifact.Body`. Kinds include user-authored, imported, extracted, AI summary, and AI analysis. Each revision records language, body digest, source artifacts/spans, producer/model profile, confidence/coverage, visibility, acceptance, predecessor, and timestamps. Structured facts such as language, edition, platform, characters, or game metadata belong in a namespaced `MetadataBundle` with per-field provenance; they are not silently flattened into prose.
+
+This is an internal storage and provenance distinction, not a second user
+interface concept. The browser presents all of these free-form texts through
+one `Notes` surface. It must not add a separate Description page, setting, or
+search mode, and it must not duplicate model text as an `Annotation.NOTE` only
+for display. Source, acceptance, and editability may remain visible as small
+labels within that surface.
 
 Long descriptions are split into ordered `SemanticSegment` records. Segment embeddings point back to the document revision and subject, and search results return the matched segment and provenance.
 

@@ -175,6 +175,17 @@ The UI SHOULD organize the product around these tasks:
 - Navigate every result to its authoritative namespace entry, versions, annotations, and content access.
 - Let authorized users create tags, notes, collections, and corrections without conflating them with processor suggestions.
 
+The WebUI presents all subject-bound free-form text through one `Notes` surface.
+User-authored notes and imported, extracted, or model-produced descriptive
+records may remain distinct in the durable data layer when their provenance or
+recovery evidence requires it, but that distinction is a secondary source
+label rather than a second user-facing concept. There MUST NOT be a separate
+Description page, setting, search mode, or duplicate copy of the same text
+solely for presentation. Source labels, acceptance state, and editability MAY
+be shown inside the Notes surface; model generation remains explicit and never
+overwrites a user's note. This is a presentation rule and does not rename the
+`DescriptionDocument` or `Annotation.NOTE` command contracts.
+
 ### 5.4 Processing and extensions
 
 - Show installed processors, repository drivers, index providers, and query providers with versions and health.

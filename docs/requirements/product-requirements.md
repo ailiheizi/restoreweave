@@ -459,6 +459,13 @@ The baseline search experience must cover:
 - Extracted text and common media metadata where a qualified default extractor succeeded.
 - Processing status, warnings, provenance, and available representations.
 
+The ordinary user-facing free-form text concept is one `Notes` surface. It
+combines direct `Annotation.NOTE` content with imported, extracted, or
+model-produced `DescriptionDocument` text while showing source and acceptance
+labels where useful. Those durable records remain separate internally for
+revision, provenance, indexing, export, and recovery; this rule does not add a
+second Description page, setting, or search mode.
+
 The reference distribution ships a bundled hybrid `IndexProvider` and `QueryProvider` implementation. The default broker fuses lexical, structured, and local semantic generations and returns stable subjects with per-dimension provenance. Indexes are derived and rebuildable; loss of an index cannot remove recovery information or user-authored annotations.
 
 The public discovery model must permit later alternate lexical, vector, hybrid, graph, CLIP, acoustic, multimodal, and external-knowledge providers. Those providers may return scores and evidence but cannot change recovery contracts. The default local embedding provider uses the profile in [Content Store, Views, and Export Requirements](content-store-views-and-exports.md); replacing it creates a new generation and never changes exact identity.

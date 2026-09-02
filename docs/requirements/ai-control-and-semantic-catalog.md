@@ -48,6 +48,12 @@ This baseline is a real product feature, not a placeholder for later semantic se
 
 `RW-MVP-1` supports durable whole-subject tags, plain-text notes, versioned `DescriptionDocument` revisions, source-aligned `SemanticSegment` records, and the minimal file-only LinkGroup current state defined by the content-store contract. AI description generation is optional and on-demand; user-authored and imported descriptions do not depend on a model. Later catalog profiles may add ratings, corrections, aliases, richer Collections, relationships, and richer typed segments such as a page, time range, image region, archive member, source symbol, or media track.
 
+These are backend record kinds, not separate daily UI concepts. The browser
+shows direct notes and descriptive text together in one `Notes` surface, with
+source, producer, acceptance, and editability labels as applicable. A machine
+result remains attributed evidence and is never copied into `Annotation.NOTE`
+only to populate that surface.
+
 Operator-authored semantics are durable user data. They MUST:
 
 - Remain attached to stable subject or collection identities when paths or placements change.

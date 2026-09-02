@@ -174,6 +174,31 @@ func TestProcessorRetryWorkerTakesOverExpiredLeaseAndStopsAtLimit(t *testing.T) 
 	if processor.retryCalls != 2 || processor.lastFence != 3 {
 		t.Fatalf("retry calls=%d last fence=%d", processor.retryCalls, processor.lastFence)
 	}
+	attempts, err := fixture.store.ListProcessorAttempts(context.Background(), result.WorkspaceID, result.SnapshotRef)
+	if err != nil || len(attempts) != 3 {
+		t.Fatalf("exhausted retry attempts = %+v, err=%v", attempts, err)
+	}
+	if attempts[2].Status != "FAILED" || attempts[2].FenceToken != 3 {
+		t.Fatalf("exhausted retry terminal attempt = %+v", attempts[2])
+	}
+	closures, err := fixture.service.ListProcessorAttemptClosures(context.Background(), result.SnapshotRef)
+	if err != nil || len(closures) != 3 || closures[2].Closure.ClosureSequence != 3 || closures[2].Closure.AttemptCount != 3 {
+		t.Fatalf("exhausted retry closure chain = %+v, err=%v", closures, err)
+	}
+	if err := fixture.service.runProcessorRetryBatch(context.Background(), processor, options); err != nil {
+		t.Fatal(err)
+	}
+	if processor.retryCalls != 2 {
+		t.Fatalf("retry worker reran exhausted job: calls=%d", processor.retryCalls)
+	}
+	destination := filepath.Join(t.TempDir(), "restore")
+	if _, err := fixture.service.Restore(context.Background(), result.SnapshotRef, destination); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := os.ReadFile(filepath.Join(destination, "retry-limit.txt"))
+	if err != nil || string(payload) != "retry limit" {
+		t.Fatalf("restored exhausted retry payload = %q, err=%v", payload, err)
+	}
 }
 
 func TestProcessorRetryWorkerResumesQueuedJobAfterCatalogReopen(t *testing.T) {

@@ -49,6 +49,12 @@ or safety gates, keep it outside the core queue.
 - User, imported, extracted, and model-produced descriptions are durable,
   versioned content. AI description generation is an explicit, on-demand
   `DESCRIBE_SUBJECT` operation and is not an implicit ingest dependency.
+- The user-facing free-form text concept is one `Notes` surface. User-authored,
+  imported, extracted, and model-produced text is shown there with an optional
+  source label; do not add a separate Description screen, setting, or search
+  concept. Keep the durable source records distinct when provenance, acceptance,
+  or recovery evidence needs them, but do not copy AI text into a second
+  `Annotation.NOTE` merely for presentation.
 - Daily organization is content-first and multi-tag-first. Source directories
   remain provenance and recovery projections. Reuse durable `Annotation.TAG`
   facts for user tags; deterministic type and format facets remain system

@@ -705,7 +705,19 @@ their repository objects, and never authorizes garbage collection.
 
 ### 9.6 Durable descriptions
 
-Descriptions are separate from short `NOTE` annotations. `description.create` accepts one subject, kind (`USER`, `IMPORTED`, `EXTRACTED`, `AI_SUMMARY`, or `AI_ANALYSIS`), UTF-8 body, language, title, source and producer references, confidence/coverage, visibility, acceptance state, optional predecessor, and provenance metadata. A successor is a new immutable record; it never overwrites its predecessor, and one predecessor cannot silently fork into two successors.
+Descriptions are separate durable records from short `NOTE` annotations. This is
+an internal source, revision, and provenance distinction, not two user-facing
+concepts: the browser presents both through one `Notes` surface and may show
+the record kind, producer, acceptance state, or editability as a secondary
+label. `description.create` accepts one subject, kind (`USER`, `IMPORTED`,
+`EXTRACTED`, `AI_SUMMARY`, or `AI_ANALYSIS`), UTF-8 body, language, title,
+source and producer references, confidence/coverage, visibility, acceptance
+state, optional predecessor, and provenance metadata. A successor is a new
+immutable record; it never overwrites its predecessor, and one predecessor
+cannot silently fork into two successors. Do not copy model text into a
+`NOTE` annotation only for presentation, and do not add a separate Description
+screen, setting, or search mode. The `description.*` and `note.*` command
+contracts remain distinct for clients that need their full durable semantics.
 
 The current reference command accepts at most 16 MiB of UTF-8 text and splits it at UTF-8-safe sentence or whitespace boundaries into ordered segments of at most 1024 source bytes where practical. Every segment retains a digest and `[start_byte,end_byte)` source span. `description.list` defaults to 100 summaries and accepts a limit from 1 to 1000; summaries exclude body and segment text. `description.get` returns one full revision and its segments.
 

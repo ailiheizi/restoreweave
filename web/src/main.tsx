@@ -197,7 +197,6 @@ function App() {
   }), [activeTags, facetFilteredItems, tagsBySubject]);
   const hasSystemFacets = Boolean(activeSystemFacets.type || activeSystemFacets.format || activeSystemFacets.dedup);
   const hasActiveFilters = activeTags.length > 0 || hasSystemFacets;
-  const filterSummary = useMemo(() => [...activeTags, activeSystemFacets.type ? `type:${formatEntryType(activeSystemFacets.type, t)}` : "", activeSystemFacets.format ? `format:${activeSystemFacets.format}` : "", activeSystemFacets.dedup ? `dedup:${formatDedupFacet(activeSystemFacets.dedup, t)}` : ""].filter(Boolean).join(" + "), [activeSystemFacets, activeTags, t]);
   const tagVocabulary = useMemo(() => [...new Set(workspaceTags.map((tag) => tag.body?.trim()).filter((value): value is string => Boolean(value)))].sort((left, right) => left.localeCompare(right, locale)), [locale, workspaceTags]);
   const isConnected = status === "Connected";
   const isUnavailable = status === "Unavailable";
@@ -542,7 +541,10 @@ function App() {
     const requests = await Promise.allSettled([
       command("annotation.list", { workspace_id: workspaceID, subject_ref: subjectRef }),
       command("representation.list", { workspace_id: workspaceID, subject_ref: subjectRef }),
-      command("description.list", { workspace_id: workspaceID, subject_ref: subjectRef }),
+      // Keep enough history to resolve the current note in the normal case.
+      // If the server reports a longer chain, we fail closed below instead of
+      // presenting an old revision as current.
+      command("description.list", { workspace_id: workspaceID, subject_ref: subjectRef, limit: 1000 }),
     ]);
     // A late response from a previous subject must never populate the current
     // inspector. The subject check is intentional in addition to the token:
@@ -551,15 +553,42 @@ function App() {
     const annotationResult = subjectBoundDetailCollection(requests[0], "annotations", subjectRef);
     const representationResult = subjectBoundDetailCollection(requests[1], "representations", subjectRef);
     const descriptionResult = subjectBoundDetailCollection(requests[2], "documents", subjectRef);
+    const descriptionTruncated = requests[2].status === "fulfilled" && requests[2].value.data?.truncated === true;
+    const descriptionState: DetailResourceStatus = descriptionTruncated ? "error" : descriptionResult.status;
     setDetailState({
       subjectRef,
       annotations: annotationResult.status,
       representations: representationResult.status,
-      descriptions: descriptionResult.status,
+      descriptions: descriptionState,
     });
     setAnnotations(annotationResult.items);
     setRepresentations(representationResult.items);
-    setDescriptions(descriptionResult.items);
+    // Keep summary rows out of the visible Notes list until their bodies have
+    // been read. This prevents a title or a transient placeholder from
+    // looking like the actual note text.
+    setDescriptions([]);
+    if (descriptionState !== "ready" || descriptionResult.items.length === 0) return;
+    // description.list deliberately returns bounded summaries. Hydrate the
+    // bodies for this one subject so the single Notes view shows the actual
+    // text while keeping the list endpoint small for broader callers. User
+    // notes are already visible while these extra reads are in flight.
+    const hydrated = await Promise.allSettled(descriptionResult.items.map((item) => command("description.get", {
+      workspace_id: workspaceID,
+      description_document_id: item.description_document_id,
+    })));
+    if (detailRequestRef.current !== requestToken || detailSubjectRef.current !== subjectRef) return;
+    const descriptionItems = descriptionResult.items.map((summary, index) => {
+      const result = hydrated[index];
+      if (result?.status === "fulfilled" && result.value.status === "SUCCEEDED") {
+        const document = result.value.data?.document;
+        if (document?.subject_ref?.trim() === subjectRef) return document;
+      }
+      return { ...summary, body_unavailable: true };
+    });
+    setDescriptions(descriptionItems);
+    setDetailState((current) => current.subjectRef === subjectRef && detailSubjectRef.current === subjectRef
+      ? { ...current, descriptions: "ready" }
+      : current);
   }
   function detailIsCurrent(subjectRef: string, requestToken = detailRequestRef.current) {
     return detailRequestRef.current === requestToken && detailSubjectRef.current === subjectRef;
@@ -716,7 +745,7 @@ function App() {
       <a className="brand" href="/" aria-label={t("RestoreWeave home")}><span className="brand-mark"><ShieldCheck size={19} /></span><span>RestoreWeave</span></a>
       <form className="global-search" onSubmit={runSearch}>
         <Search size={17} aria-hidden="true" />
-        <input aria-label={t("Search content library")} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("Search names, paths, metadata, tags, notes, descriptions, and extracted text...")} disabled={!isConnected || !catalogHealthy} />
+        <input aria-label={t("Search content library")} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("Search names, paths, metadata, tags, notes, and extracted text...")} disabled={!isConnected || !catalogHealthy} />
         <button type="submit" disabled={busy || !query.trim() || !isConnected || !catalogHealthy}>{busy ? <LoaderCircle className="spin" size={16} /> : t("Search")}</button>
       </form>
       <div className="top-actions">
@@ -743,7 +772,7 @@ function App() {
           <div className="system-facet-group"><span>{t("Format")}</span>{systemFacets.formats.length ? systemFacets.formats.map((facet) => <button type="button" key={facet.value} className={`system-facet ${activeSystemFacets.format === facet.value ? "active" : ""}`} aria-pressed={activeSystemFacets.format === facet.value} onClick={() => toggleSystemFacet("format", facet.value)}><span>{facet.value}</span><b>{facet.count}</b></button>) : <small className="facet-unavailable">{t("No file formats")}</small>}</div>
           <div className="system-facet-group"><span>{t("Dedup")}</span>{systemFacets.dedup.map((facet) => <button type="button" key={facet.value} className={`system-facet ${activeSystemFacets.dedup === facet.value ? "active" : ""}`} aria-pressed={activeSystemFacets.dedup === facet.value} onClick={() => toggleSystemFacet("dedup", facet.value)}><span>{formatDedupFacet(facet.value, t)}</span><b>{facet.count}</b></button>)}</div>
         </div>
-        {hasActiveFilters && <p className="filter-summary">{t("Active filters")}: {filterSummary}</p>}
+        {hasActiveFilters && <div className="filter-summary" aria-label={t("Active filters")}><span className="filter-summary-label">{t("Active filters")}:</span>{activeTags.map((tag) => <button type="button" className="active-filter" key={tag} onClick={() => toggleTagFilter(tag)} aria-label={t("Remove tag filter {{tag}}", { tag })}><Tag size={11} />{tag}<X size={11} /></button>)}{hasSystemFacets && <span className="filter-summary-system">{[activeSystemFacets.type ? `type:${formatEntryType(activeSystemFacets.type, t)}` : "", activeSystemFacets.format ? `format:${activeSystemFacets.format}` : "", activeSystemFacets.dedup ? `dedup:${formatDedupFacet(activeSystemFacets.dedup, t)}` : ""].filter(Boolean).join(" + ")}</span>}<button type="button" className="filter-summary-clear" onClick={clearLibraryFilters}>{t("Clear filters")}</button></div>}
       </section>}
       {(sources.length > 0 || sourceProjection.state === "DEGRADED") && <details className="source-manager">
         <summary><HardDrive size={14} /><span>{t("Sources")}</span><small>{sourceProjection.state === "DEGRADED" ? t("Source status unavailable") : t("{{count}} configured", { count: sources.length })}</small><ChevronRight size={14} /></summary>
@@ -753,7 +782,7 @@ function App() {
       {(viewMode === "content" || viewMode === "tag") && browseRoots.length > 0 && <details className="source-disclosure"><summary><Folder size={14} /><span>{t("Browse source paths")}</span><small>{t("Source paths are provenance")}</small><ChevronRight size={14} /></summary><div className="source-switcher" aria-label={t("Source paths")}>{browseRoots.map((root) => { const label = sourceButtonLabel(root, browseRoots, t); const path = root.source_path?.trim(); return <button type="button" key={root.root_id} title={path || label} aria-label={path ? t("Browse source {{name}} at {{path}}", { name: root.name || t("Source path"), path }) : label} onClick={() => void navigateLibrary("", [], root.root_id)}><Folder size={14} />{label}</button>; })}</div></details>}
       {viewMode === "path" && browseRootID && <nav className="breadcrumbs" aria-label={t("Source paths")}><button title={t("Source paths")} aria-label={t("Source path root")} onClick={() => void navigateLibrary("", [])}><Home size={14} /></button>{browseCrumbs.map((crumb, index) => <span key={crumb.entry_id}><ChevronRight size={13} /><button onClick={() => void navigateLibrary(crumb.entry_id || crumb.subject_ref, browseCrumbs.slice(0, index + 1))}>{crumb.name}</button></span>)}</nav>}
       {isConnected && !coreStorageReady ? <div className="notice error" role="alert"><AlertCircle size={16} />{coreStorageMessage}</div> : isUnavailable ? <div className="service-offline" role="alert"><span><Server size={18} /></span><div><strong>{t("RestoreWeave service is unavailable")}</strong><small>{t("Start the service, then refresh this page. Saved content has not been changed.")}</small></div><button className="secondary-button compact" onClick={() => void refresh()}><RefreshCw size={15} />{t("Retry")}</button></div> : notice && <div className={`notice ${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"}>{notice.kind === "error" ? <AlertCircle size={16} /> : notice.kind === "warning" ? <Sparkles size={16} /> : <Check size={16} />}{notice.text}<button aria-label={t("Dismiss notice")} onClick={() => setNotice(undefined)}><X size={14} /></button></div>}
-      {hits.length ? <div className="result-list">{hits.map((hit, index) => <ResultRow key={hit.subject_ref ?? index} hit={hit} tags={hit.subject_ref ? tagsBySubject.get(hit.subject_ref) ?? [] : []} selected={selected?.subject_ref === hit.subject_ref} t={t} onSelect={() => void (viewMode === "path" ? openLibraryEntry(hit) : loadDetails(hit))} />)}</div> : <div className="empty-state"><span className="vault-sigil"><ShieldCheck size={35} /></span><h2>{t(showFirstSource ? "Start by adding a source" : showConfiguredSourceEmpty ? "Source configured, no saved content yet" : viewMode === "search" ? "No matches found" : viewMode === "tag" ? activeTags.length ? "No content matches these tags" : hasSystemFacets ? "No content matches these filters" : "No content matches these tags" : viewMode === "path" ? "This source path is empty" : "No content yet")}</h2><p>{t(showFirstSource ? "Add a server folder, review what will be stored, then confirm." : showConfiguredSourceEmpty ? "Recheck creates a reviewable plan. Existing saved content is not changed until you confirm." : viewMode === "search" ? "Try another name, path, metadata value, tag, note, description, or extracted phrase." : viewMode === "tag" ? activeTags.length ? "Choose fewer tags to broaden the result." : hasSystemFacets ? "Adjust or clear the system filters." : "Choose fewer tags to broaden the result." : viewMode === "path" ? "No captured items are recorded at this source path." : "Saved content will appear here independent of its original folders.")}</p>{showFirstSource && <button className="primary-button" onClick={() => openAdd()} disabled={!coreStorageReady}><Plus size={16} />{t("Add source")}</button>}</div>}
+      {hits.length ? <div className="result-list">{hits.map((hit, index) => <ResultRow key={hit.subject_ref ?? index} hit={hit} tags={hit.subject_ref ? tagsBySubject.get(hit.subject_ref) ?? [] : []} activeTags={activeTags} selected={selected?.subject_ref === hit.subject_ref} t={t} onSelect={() => void (viewMode === "path" ? openLibraryEntry(hit) : loadDetails(hit))} onTagFilter={toggleTagFilter} />)}</div> : <div className="empty-state"><span className="vault-sigil"><ShieldCheck size={35} /></span><h2>{t(showFirstSource ? "Start by adding a source" : showConfiguredSourceEmpty ? "Source configured, no saved content yet" : viewMode === "search" ? "No matches found" : viewMode === "tag" ? activeTags.length ? "No content matches these tags" : hasSystemFacets ? "No content matches these filters" : "No content matches these tags" : viewMode === "path" ? "This source path is empty" : "No content yet")}</h2><p>{t(showFirstSource ? "Add a server folder, review what will be stored, then confirm." : showConfiguredSourceEmpty ? "Recheck creates a reviewable plan. Existing saved content is not changed until you confirm." : viewMode === "search" ? "Try another name, path, metadata value, tag, note, or extracted phrase." : viewMode === "tag" ? activeTags.length ? "Choose fewer tags to broaden the result." : hasSystemFacets ? "Adjust or clear the system filters." : "Choose fewer tags to broaden the result." : viewMode === "path" ? "No captured items are recorded at this source path." : "Saved content will appear here independent of its original folders.")}</p>{showFirstSource && <button className="primary-button" onClick={() => openAdd()} disabled={!coreStorageReady}><Plus size={16} />{t("Add source")}</button>}</div>}
     </section>{(selected || hits.length > 0) && <aside className="detail-column">{selected ? <Details hit={selected} annotations={annotations} representations={representations} descriptions={descriptions} annotationStatus={detailState.annotations} representationsStatus={detailState.representations} descriptionsStatus={detailState.descriptions} annotationMutationEnabled={annotationStorageReady && detailState.subjectRef === selected.subject_ref?.trim() && detailSubjectRef.current === selected.subject_ref?.trim() && detailState.annotations === "ready"} noteDraft={noteDraft} tagDraft={tagDraft} tagVocabulary={tagVocabulary} editingNoteID={editingNoteID} editingBody={editingBody} busy={busy} t={t} locale={locale} onBack={() => { detailRequestRef.current += 1; detailSubjectRef.current = ""; setDetailState({ subjectRef: "", annotations: "idle", representations: "idle", descriptions: "idle" }); setSelected(undefined); }} onDraft={setNoteDraft} onTagDraft={setTagDraft} onAddTag={() => void saveTag()} onDeleteTag={(tag) => void deleteTag(tag)} onAdd={() => void saveNote("", noteDraft)} onEdit={(note) => { setEditingNoteID(note.annotation_id); setEditingBody(note.body); }} onDeleteNote={(note) => void deleteNote(note)} onEditBody={setEditingBody} onSaveEdit={(note) => void saveNote(note.annotation_id, editingBody, note.revision, note.subject_ref)} onCancelEdit={() => { setEditingNoteID(""); setEditingBody(""); }} /> : <div className="detail-placeholder"><span className="inspection-mark"><Hash size={25} /></span><p className="eyebrow">{t("INSPECTOR")}</p><h2>{t("Select an item")}</h2><p>{t("Details, exact-storage status, tags, and notes appear here.")}</p></div>}</aside>}</main>
     {addOpen && <div className="drawer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) closeAdd(); }}><aside className="drawer source-drawer" role="dialog" aria-modal="true" aria-label={t(recheckSourceRef ? "Recheck source" : "Add source")}><div className="drawer-header"><div><p className="eyebrow">{t(recheckSourceRef ? "RECHECK SOURCE" : "NEW SOURCE")}</p><h2>{t(recheckSourceRef ? "Recheck source" : "Add source")}</h2></div><button className="icon-button" aria-label={t("Close add source")} onClick={closeAdd}><X size={17} /></button></div><p className="drawer-copy">{t(recheckSourceRef ? "Inspect this source again. Review the changes, then confirm to publish a new snapshot." : "Choose a server folder and preview its exact storage plan. Saving starts only after you confirm.")}</p>{isUnavailable ? <div className="drawer-inline-warning" role="alert"><AlertCircle size={15} />{t("Start the RestoreWeave service before previewing this source.")}</div> : !coreStorageReady ? <div className="drawer-inline-warning" role="alert"><AlertCircle size={15} />{coreStorageMessage}</div> : notice && <div className={`notice drawer-notice ${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"}>{notice.kind === "error" ? <AlertCircle size={16} /> : notice.kind === "warning" ? <Sparkles size={16} /> : <Check size={16} />}{notice.text}</div>}<div className="source-kind"><span className="source-kind-icon"><HardDrive size={19} /></span><div><strong>{t("Server folder")}</strong><small>{t("Local disk or mounted storage visible to RestoreWeave")}</small></div><em>{t("Supported now")}</em></div><div className="source-route" aria-label={t("Source storage route")}><div><span>{t("Read from")}</span><strong title={source.trim()}>{source.trim() || t("Enter a server path")}</strong><small>{t("Source files stay in place")}</small></div><ChevronRight size={17} /><div><span>{t("Store unique bytes in")}</span><strong title={repositoryPath}>{repositoryPath}</strong><small>{t("Exact whole-file deduplication")}</small></div></div><form className="stack-form" onSubmit={makePlan}><label>{t("Path on RestoreWeave host")}<input autoFocus value={source} onChange={(event) => { setSource(event.target.value); setPlan(undefined); }} placeholder={t("/data/to-add")} aria-invalid={sourceLooksRemote || undefined} /><small className="path-helper"><Server size={13} />{t("Use a local or mounted server path. This browser does not upload files or fetch URLs.")}</small>{sourceLooksRemote && <small className="source-inline-error"><AlertCircle size={13} />{t("Enter a server path, not a URL.")}</small>}</label><button className="primary-button" disabled={busy || isUnavailable || !coreStorageReady || !source.trim() || sourceLooksRemote}>{busy ? t("Inspecting...") : t("Preview storage plan")}</button></form><p className="planning-note">{t("Planning records the source and plan in the catalog, but does not write file bytes or publish a snapshot until you confirm.")}</p>{plan && <PlanCard plan={plan} busy={busy} coreStorageReady={coreStorageReady} t={t} onApply={() => void applyPlan()} />}</aside></div>}
     {settingsOpen && <SettingsPanel section={settingsSection} configData={configData} draft={configDraft} loading={configLoading} dirty={configDirty} lexicalReady={lexicalReady} semanticReady={semanticReady} semanticBundleReady={semanticBundleReady} semanticBundleRestartRequired={semanticBundleRestartRequired} semanticInstallAvailable={semanticInstallAvailable} searchRebuildAvailable={searchRebuildAvailable} semanticInstall={semanticInstall} searchRebuild={searchRebuild} statusData={statusData} workspaceID={workspaceID} locale={locale} t={t} onLocale={setLocale} onSection={setSettingsSection} onClose={closeSettings} onField={setConfigField} onRepositoryProfile={setRepositoryProfile} onReload={reloadSettings} onSave={() => void saveSettings()} onInstallSemanticBundle={() => void installSemanticBundle()} onRebuildSearch={() => void rebuildSearch()} />}
@@ -761,12 +790,14 @@ function App() {
   </div>;
 }
 
-function ResultRow({ hit, tags, selected, t, onSelect }: { hit: SearchHit; tags: string[]; selected: boolean; t: Translator; onSelect: () => void }) {
+function ResultRow({ hit, tags, activeTags, selected, t, onSelect, onTagFilter }: { hit: SearchHit; tags: string[]; activeTags: string[]; selected: boolean; t: Translator; onSelect: () => void; onTagFilter: (tag: string) => void }) {
   const directory = hit.entry_type === "DIRECTORY";
   const matchedSegments = (hit.segments ?? []).filter((segment) => Boolean(segment.matched_text?.trim()));
   const visibleSegments = matchedSegments.slice(0, MATCHED_SEGMENT_RENDER_LIMIT);
   const hiddenSegmentCount = matchedSegments.length - visibleSegments.length;
-  return <button className={`result-row ${selected ? "selected" : ""}`} onClick={onSelect}><span className="file-icon">{directory ? <Folder size={20} /> : <FileSearch size={19} />}</span><span className="result-copy"><strong>{hit.name || t("Untitled subject")}</strong><small>{hit.path || (hit.entry_type ? formatEntryType(hit.entry_type, t) : t("Protected content item"))}{hit.logical_size != null && !directory ? ` · ${formatBytes(hit.logical_size)}` : ""}</small>{tags.length > 0 && <span className="row-tags" aria-label={t("Tags")}>{tags.map((tag) => <span className="row-tag" key={tag}><Tag size={10} />{tag}</span>)}</span>}{visibleSegments.map((segment, index) => { const metadata = searchSegmentMetadata(segment, t); const segmentKey = `${segment.semantic_segment_id || segment.source_id || segment.source_type || "segment"}-${segment.ordinal ?? index}-${index}`; return <span className="row-tags" aria-label={t("Matched segment provenance")} key={segmentKey}><span className="row-tag">{searchSegmentSourceLabel(segment, t)}</span><span className="row-tag">{previewUnicodeText(segment.matched_text)}</span>{metadata.map((value) => <span className="row-tag" key={value}>{value}</span>)}</span>; })}{hiddenSegmentCount > 0 && <span className="row-tags" aria-label={t("Matched segment provenance")}><span className="row-tag">{t("{{count}} more matched segments", { count: hiddenSegmentCount })}</span></span>}</span>{!directory && <IdentityWeave value={hit.content_id || hit.subject_ref} compact t={t} />}<span className="result-kind">{formatEntryType(hit.entry_type, t)}</span><ChevronRight className="row-arrow" size={17} /></button>;
+  const title = hit.name || t("Untitled subject");
+  const path = hit.path || (hit.entry_type ? formatEntryType(hit.entry_type, t) : t("Protected content item"));
+  return <div className={`result-row ${selected ? "selected" : ""}`} role="group" aria-label={title} onClick={onSelect}><span className="file-icon">{directory ? <Folder size={20} /> : <FileSearch size={19} />}</span><span className="result-copy"><button type="button" className="result-open-copy" onClick={(event) => { event.stopPropagation(); onSelect(); }}><strong>{title}</strong><small>{path}{hit.logical_size != null && !directory ? ` · ${formatBytes(hit.logical_size)}` : ""}</small></button>{tags.length > 0 && <span className="row-tags" aria-label={t("Tags")}>{tags.map((tag) => { const active = activeTags.includes(tag); return <button type="button" className={`row-tag user-filter ${active ? "active" : ""}`} aria-pressed={active} title={t(active ? "Remove tag filter {{tag}}" : "Filter by tag {{tag}}", { tag })} aria-label={t(active ? "Remove tag filter {{tag}}" : "Filter by tag {{tag}}", { tag })} key={tag} onClick={(event) => { event.stopPropagation(); onTagFilter(tag); }}><Tag size={10} />{tag}</button>; })}</span>}{visibleSegments.map((segment, index) => { const metadata = searchSegmentMetadata(segment, t); const segmentKey = `${segment.semantic_segment_id || segment.source_id || segment.source_type || "segment"}-${segment.ordinal ?? index}-${index}`; return <span className="row-tags" aria-label={t("Matched segment provenance")} key={segmentKey}><span className="row-tag">{searchSegmentSourceLabel(segment, t)}</span><span className="row-tag">{previewUnicodeText(segment.matched_text)}</span>{metadata.map((value) => <span className="row-tag" key={value}>{value}</span>)}</span>; })}{hiddenSegmentCount > 0 && <span className="row-tags" aria-label={t("Matched segment provenance")}><span className="row-tag">{t("{{count}} more matched segments", { count: hiddenSegmentCount })}</span></span>}</span>{!directory && <IdentityWeave value={hit.content_id || hit.subject_ref} compact t={t} />}<span className="result-kind">{formatEntryType(hit.entry_type, t)}</span><ChevronRight className="row-arrow" size={17} /></div>;
 }
 
 function SourceCard({ source, locale, t, busy, coreStorageReady, onView, onRecheck }: { source: SourceSummary; locale: Locale; t: Translator; busy: boolean; coreStorageReady: boolean; onView: () => void; onRecheck: () => void }) {
@@ -810,6 +841,24 @@ function sourceButtonLabel(root: BrowseRoot, roots: BrowseRoot[], t: Translator)
 
 function Details({ hit, annotations, representations, descriptions, annotationStatus, representationsStatus, descriptionsStatus, annotationMutationEnabled, noteDraft, tagDraft, tagVocabulary, editingNoteID, editingBody, busy, t, locale, onBack, onDraft, onTagDraft, onAddTag, onDeleteTag, onAdd, onEdit, onDeleteNote, onEditBody, onSaveEdit, onCancelEdit }: { hit: SearchHit; annotations: any[]; representations: any[]; descriptions: any[]; annotationStatus: DetailResourceStatus; representationsStatus: DetailResourceStatus; descriptionsStatus: DetailResourceStatus; annotationMutationEnabled: boolean; noteDraft: string; tagDraft: string; tagVocabulary: string[]; editingNoteID: string; editingBody: string; busy: boolean; t: Translator; locale: Locale; onBack: () => void; onDraft: (value: string) => void; onTagDraft: (value: string) => void; onAddTag: () => void; onDeleteTag: (tag: any) => void; onAdd: () => void; onEdit: (note: any) => void; onDeleteNote: (note: any) => void; onEditBody: (value: string) => void; onSaveEdit: (note: any) => void; onCancelEdit: () => void }) {
   const notes = annotations.filter((item) => item.kind === "NOTE" && !item.tombstoned);
+  // A successor replaces a previous generated/imported note in the daily
+  // view. The complete revision chain remains durable in the catalog.
+  const supersededDescriptionIDs = new Set(descriptions.map((item) => item.predecessor_id).filter(Boolean));
+  const currentDescriptions = descriptions.filter((item) => !item.tombstoned && !supersededDescriptionIDs.has(item.description_document_id));
+  const descriptionNotes = currentDescriptions.map((item) => {
+    const body = typeof item.body === "string" && item.body.trim()
+      ? item.body
+      : typeof item.title === "string" && item.title.trim()
+        ? item.title
+        : t("Note content unavailable");
+    return {
+      ...item,
+      body,
+      sourceLabel: descriptionKindLabel(item.kind, t),
+      descriptionOnly: true,
+    };
+  });
+  const combinedNotes = [...notes, ...descriptionNotes];
   const tags = annotations.filter((item) => item.kind === "TAG" && !item.tombstoned);
   const systemTags = deriveSystemTags(hit);
   const suggestions = tagVocabulary.filter((value) => !tags.some((tag) => tag.body === value));
@@ -819,6 +868,25 @@ function Details({ hit, annotations, representations, descriptions, annotationSt
   const assuranceLabel = representationsStatus === "loading" ? "Checking service" : representationsStatus === "error" ? "Unavailable" : verifiedExact ? "VERIFIED" : exact ? "UNVERIFIED" : "CATALOGED";
   const detailStatus = (state: DetailResourceStatus) => state === "loading" ? t("Checking service") : state === "error" ? t("Unavailable") : "";
   const canMutateAnnotations = annotationMutationEnabled && annotationStatus === "ready";
+  const noteMeta = (note: any) => {
+    if (note.descriptionOnly) {
+      const parts = [note.sourceLabel || t("Imported note")];
+      if (note.accepted === false) parts.push(t("Not accepted"));
+      if (note.revision) parts.push(t("revision {{revision}}", { revision: note.revision }));
+      if (note.updated_at) parts.push(formatNoteDate(note.updated_at, locale, t));
+      if (note.body_unavailable) parts.push(t("Body unavailable"));
+      return parts.join(" · ");
+    }
+    return `${formatNoteDate(note.updated_at, locale, t)} · ${t("revision {{revision}}", { revision: note.revision })}`;
+  };
+  const renderNote = (note: any) => {
+    const noteID = note.annotation_id || note.description_document_id || `${note.kind || "note"}-${note.revision || note.body}`;
+    const editable = !note.descriptionOnly;
+    if (editable && editingNoteID === note.annotation_id) {
+      return <div className="note-row editing" key={noteID}><textarea autoFocus aria-label={t("Edit note")} value={editingBody} onChange={(event) => onEditBody(event.target.value)} disabled={!canMutateAnnotations} /><div className="note-actions"><button className="text-button" onClick={onCancelEdit} disabled={busy}>{t("Cancel")}</button><button className="primary-button compact" onClick={() => onSaveEdit(note)} disabled={busy || !canMutateAnnotations || !editingBody.trim()}><Check size={14} />{t("Save")}</button></div></div>;
+    }
+    return <div className={`note-row ${note.descriptionOnly ? "source-note" : ""}`} key={noteID}><p>{note.body}</p><div className="note-meta"><span>{noteMeta(note)}</span>{editable && <span className="note-icon-actions"><button className="note-edit" title={t("Edit note")} aria-label={t("Edit note")} onClick={() => onEdit(note)} disabled={busy || !canMutateAnnotations}><Pencil size={13} /></button><button className="note-edit danger" title={t("Delete note")} aria-label={t("Delete note")} onClick={() => onDeleteNote(note)} disabled={busy || !canMutateAnnotations}><Trash2 size={13} /></button></span>}</div></div>;
+  };
   return <div className="details">
     <button className="detail-back text-button" onClick={onBack}><ArrowLeft size={15} />{t("Back to results")}</button>
     <div className="detail-title"><span className="file-icon large"><FileSearch size={23} /></span><div className="detail-title-copy"><p className="eyebrow">{t("CONTENT ITEM")}</p><h2>{hit.name || t("Untitled subject")}</h2><small>{formatEntryType(hit.entry_type, t)}</small></div><span className={`assurance-seal ${verifiedExact ? "" : "warning"}`}><ShieldCheck size={16} />{t(assuranceLabel)}</span></div>
@@ -828,11 +896,16 @@ function Details({ hit, annotations, representations, descriptions, annotationSt
       {annotationStatus !== "ready" ? <p className="muted" role="status">{detailStatus(annotationStatus)}</p> : <div className="tag-cloud">{systemTags.map((value) => <span className="tag-chip system" title={t("System field")} key={value}><Hash size={12} />{value}</span>)}{tags.map((tag) => <span className="tag-chip user" key={tag.annotation_id}><Tag size={12} />{tag.body}<button title={t("Remove tag")} aria-label={t("Remove tag {{tag}}", { tag: tag.body })} onClick={() => onDeleteTag(tag)} disabled={busy || !canMutateAnnotations}><X size={12} /></button></span>)}{!tags.length && !systemTags.length && <span className="muted">{t("No tags yet.")}</span>}</div>}
       <div className="tag-composer"><input list="restoreweave-tag-vocabulary" aria-label={t("New tag")} value={tagDraft} onChange={(event) => onTagDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && tagDraft.trim() && canMutateAnnotations) { event.preventDefault(); onAddTag(); } }} placeholder={t("Add or reuse a tag")} disabled={!canMutateAnnotations} /><datalist id="restoreweave-tag-vocabulary">{suggestions.map((value) => <option value={value} key={value} />)}</datalist><button className="primary-button compact" onClick={onAddTag} disabled={busy || !canMutateAnnotations || !tagDraft.trim()}><Plus size={14} />{t("Add tag")}</button></div>
     </div>
-    <div className="detail-section notes-section"><div className="section-heading"><h3>{t("Notes")}</h3><span>{notes.length}</span></div>
-      <div className="notes-list">{annotationStatus !== "ready" ? <p className="muted" role="status">{detailStatus(annotationStatus)}</p> : notes.length ? notes.map((note) => editingNoteID === note.annotation_id ? <div className="note-row editing" key={note.annotation_id}><textarea autoFocus aria-label={t("Edit note")} value={editingBody} onChange={(event) => onEditBody(event.target.value)} disabled={!canMutateAnnotations} /><div className="note-actions"><button className="text-button" onClick={onCancelEdit} disabled={busy}>{t("Cancel")}</button><button className="primary-button compact" onClick={() => onSaveEdit(note)} disabled={busy || !canMutateAnnotations || !editingBody.trim()}><Check size={14} />{t("Save")}</button></div></div> : <div className="note-row" key={note.annotation_id}><p>{note.body}</p><div className="note-meta"><span>{formatNoteDate(note.updated_at, locale, t)} · {t("revision {{revision}}", { revision: note.revision })}</span><span className="note-icon-actions"><button className="note-edit" title={t("Edit note")} aria-label={t("Edit note")} onClick={() => onEdit(note)} disabled={busy || !canMutateAnnotations}><Pencil size={13} /></button><button className="note-edit danger" title={t("Delete note")} aria-label={t("Delete note")} onClick={() => onDeleteNote(note)} disabled={busy || !canMutateAnnotations}><Trash2 size={13} /></button></span></div></div>) : <p className="muted">{t("No notes yet.")}</p>}</div>
+    <div className="detail-section notes-section"><div className="section-heading"><h3>{t("Notes")}</h3><span>{combinedNotes.length}</span></div>
+      <div className="notes-list">
+        {annotationStatus !== "ready" && <p className="muted" role="status">{detailStatus(annotationStatus)}</p>}
+        {descriptionsStatus === "loading" && <p className="muted" role="status">{t("Loading additional notes...")}</p>}
+        {descriptionsStatus === "error" && <p className="muted" role="status">{t("Some imported or generated notes are unavailable.")}</p>}
+        {(annotationStatus === "ready" || descriptionsStatus === "ready") && combinedNotes.length > 0 && combinedNotes.map(renderNote)}
+        {annotationStatus === "ready" && descriptionsStatus === "ready" && combinedNotes.length === 0 && <p className="muted">{t("No notes yet.")}</p>}
+      </div>
       <div className="note-composer"><textarea aria-label={t("New note")} value={noteDraft} onChange={(event) => onDraft(event.target.value)} placeholder={t("Add useful context about this file")} disabled={!canMutateAnnotations} /><button className="primary-button compact" onClick={onAdd} disabled={busy || !canMutateAnnotations || !noteDraft.trim()}><Plus size={14} />{t("Add note")}</button></div>
     </div>
-    <div className="detail-section"><h3>{t("Description")}</h3>{descriptionsStatus !== "ready" ? <p className="muted" role="status">{detailStatus(descriptionsStatus)}</p> : descriptions.length > 0 ? <p className="description"><strong>{descriptionKindLabel(descriptions[0].kind, t)}</strong>{descriptions[0].title ? ` · ${descriptions[0].title}` : ""}</p> : <p className="muted">{t("No description yet.")}</p>}</div>
     <div className="detail-footer"><span><ShieldCheck size={14} />{t("Recovery remains independent of search indexes")}</span></div>
   </div>;
 }
@@ -869,7 +942,7 @@ function SettingsPanel({ section, configData, draft, loading, dirty, lexicalRead
   const sections: Array<{ id: SettingsSection; label: string; icon: ReactNode }> = [
     { id: "storage", label: t("Storage & protection"), icon: <HardDrive size={17} /> },
     { id: "search", label: t("Search"), icon: <Search size={17} /> },
-    { id: "descriptions", label: t("Descriptions & notes"), icon: <FileText size={17} /> },
+    { id: "descriptions", label: t("Notes"), icon: <FileText size={17} /> },
     { id: "recovery", label: t("Recovery & trust"), icon: <ShieldCheck size={17} /> },
     { id: "service", label: t("Service & access"), icon: <Server size={17} /> },
   ];
@@ -904,8 +977,8 @@ function SettingsPanel({ section, configData, draft, loading, dirty, lexicalRead
               <div className="form-grid two"><ConfigReadonly label={t("Local embedding profile")} value={config.semantic?.local_profile || "bge-small-zh-v1.5"} t={t} /><ConfigReadonly label={t("Vector backend")} value={config.semantic?.vector_backend || "zvec"} t={t} />{semanticMode !== "local" && <><ConfigInput label={t("Online provider profile")} value={config.semantic?.online_profile} placeholder="installed-provider-profile" onChange={(value) => onField("semantic", "online_profile", value)} /><ConfigInput label={t("Credential reference")} value={config.semantic?.online_credential_ref} placeholder="keychain://restoreweave/provider" onChange={(value) => onField("semantic", "online_credential_ref", value)} /><ConfigToggle label={t("Send content without per-request confirmation")} copy={t("Keep off unless this provider and its data policy are explicitly trusted.")} checked={Boolean(config.semantic?.send_content_without_confirmation)} onChange={(value) => onField("semantic", "send_content_without_confirmation", value)} /></>}</div></ConfigGroup>
               {semanticMode === "local" ? <ConfigNotice kind={bundleInstalled ? "info" : "warning"}>{t(semanticInstall.state === "SUCCEEDED" || semanticBundleRestartRequired ? "BGE installed. Restart the service to activate it." : bundleInstalled ? "The verified local BGE bundle is installed. Semantic search becomes ready after a compatible index is opened or rebuilt." : "The local BGE bundle is missing or failed verification. Keyword search and exact recovery remain available.")}</ConfigNotice> : <ConfigNotice kind="warning">{t("Online and hybrid are replacement-profile selections. This build will report semantic search unavailable unless that provider is separately installed and admitted.")}</ConfigNotice>}
             </section>}
-            {section === "descriptions" && <section className="config-section"><ConfigHeading eyebrow={t("DURABLE SEMANTICS")} title={t("Descriptions")} copy={t("Notes and descriptions remain durable facts. Model generation is separate from the embedding model and stays explicit.")} />
-              <ConfigGroup title={t("Description storage")} copy={t("Control durable description revisions and the optional on-demand generation profile.")}><div className="form-grid two"><ConfigToggle label={t("Enable descriptions")} copy={t("Retain user, imported, extracted, and generated description revisions.")} checked={Boolean(config.descriptions?.enabled)} onChange={(value) => { onField("descriptions", "enabled", value); onField("descriptions", "generate", value ? "on_demand" : "disabled"); if (value) onField("descriptions", "retain_full_text", true); }} /><ConfigSelect label={t("Generation")} value={config.descriptions?.generate} onChange={(value) => onField("descriptions", "generate", value)} options={[{ value: "disabled", label: t("Disabled") }, { value: "on_demand", label: t("On demand") }]} disabled={!config.descriptions?.enabled} /><ConfigInput label={t("Provider profile")} value={config.descriptions?.provider_profile} placeholder="optional-describe-profile" onChange={(value) => onField("descriptions", "provider_profile", value)} disabled={!config.descriptions?.enabled || config.descriptions?.generate === "disabled"} /><ConfigInput label={t("Credential reference")} value={config.descriptions?.credential_ref} placeholder="keychain://restoreweave/descriptions" onChange={(value) => onField("descriptions", "credential_ref", value)} disabled={!config.descriptions?.enabled || config.descriptions?.generate === "disabled"} /><ConfigToggle label={t("Retain full text")} copy={t("Required when model-generated descriptions are enabled.")} checked={Boolean(config.descriptions?.retain_full_text)} onChange={(value) => onField("descriptions", "retain_full_text", value)} disabled={config.descriptions?.enabled && config.descriptions?.generate !== "disabled"} /></div></ConfigGroup>
+            {section === "descriptions" && <section className="config-section"><ConfigHeading eyebrow={t("NOTES")} title={t("Notes")} copy={t("Notes remain durable facts; optional AI notes are added only when requested.")} />
+              <ConfigGroup title={t("Notes storage")} copy={t("Your notes are always available; imported, extracted, and AI-created text appears in this same Notes list.")}><div className="form-grid two"><ConfigToggle label={t("Keep additional notes")} copy={t("Keep imported, extracted, and generated text alongside your notes.")} checked={Boolean(config.descriptions?.enabled)} onChange={(value) => { onField("descriptions", "enabled", value); onField("descriptions", "generate", value ? "on_demand" : "disabled"); if (value) onField("descriptions", "retain_full_text", true); }} /><ConfigSelect label={t("Generation")} value={config.descriptions?.generate} onChange={(value) => onField("descriptions", "generate", value)} options={[{ value: "disabled", label: t("Disabled") }, { value: "on_demand", label: t("On demand") }]} disabled={!config.descriptions?.enabled} /><ConfigInput label={t("Provider profile")} value={config.descriptions?.provider_profile} placeholder="optional-describe-profile" onChange={(value) => onField("descriptions", "provider_profile", value)} disabled={!config.descriptions?.enabled || config.descriptions?.generate === "disabled"} /><ConfigInput label={t("Credential reference")} value={config.descriptions?.credential_ref} placeholder="keychain://restoreweave/notes" onChange={(value) => onField("descriptions", "credential_ref", value)} disabled={!config.descriptions?.enabled || config.descriptions?.generate === "disabled"} /><ConfigToggle label={t("Retain full text")} copy={t("Required when model-generated notes are enabled.")} checked={Boolean(config.descriptions?.retain_full_text)} onChange={(value) => onField("descriptions", "retain_full_text", value)} disabled={config.descriptions?.enabled && config.descriptions?.generate !== "disabled"} /></div></ConfigGroup>
             </section>}
             {section === "recovery" && <section className="config-section"><ConfigHeading eyebrow={t("SAFETY CONTRACT")} title={t("Recovery")} copy={t("Recovery settings protect the exact-byte promise and signed portable records.")} />
               <ConfigGroup title={t("Recovery authority")} copy={t("These values define the signed recovery lineage. Change them only as part of a reviewed migration.")}><div className="form-grid two"><ConfigReadonly label={t("Exact fallback")} value={t("Required")} t={t} /><ConfigReadonly label={t("Publication signing")} value={config.recovery?.publication_signing} t={t} /><ConfigInput label={t("Publication domain")} value={config.recovery?.publication_domain} onChange={(value) => onField("recovery", "publication_domain", value)} /><ConfigReadonly label={t("Automatic external reacquisition")} value={t("Disabled in the core profile")} t={t} /></div></ConfigGroup>
@@ -952,14 +1025,14 @@ function previewUnicodeText(value: string | undefined, limit = MATCHED_TEXT_PREV
 function descriptionKindLabel(kind: string | undefined, t: Translator) {
   const normalized = kind?.trim().toUpperCase();
   const labels: Record<string, string> = {
-    USER: "User description",
-    IMPORTED: "Imported description",
-    EXTRACTED: "Extracted description",
-    AI_SUMMARY: "AI summary",
-    AI_ANALYSIS: "AI analysis",
+    USER: "User note",
+    IMPORTED: "Imported note",
+    EXTRACTED: "Extracted note",
+    AI_SUMMARY: "AI note",
+    AI_ANALYSIS: "AI note",
   };
   if (normalized && labels[normalized]) return t(labels[normalized]);
-  return normalized ? `${t("Unknown description kind")}: ${normalized}` : t("Description source unavailable");
+  return normalized ? `${t("Unknown note type")}: ${normalized}` : t("Note source unavailable");
 }
 function searchSegmentSourceLabel(segment: SearchSegment, t: Translator) {
   const sourceType = segment.source_type?.trim().toUpperCase();

@@ -71,6 +71,13 @@ The MVP reports repository storage reduction and index overhead precisely. It MU
 | Interfaces | Human CLI, stable JSON/JSONL, and local read-only stdio MCP |
 | AI | No embedded agent or prompt loop; the reference profile includes a bundled local embedding worker and may use an explicitly configured description/online provider |
 
+The browser has one user-facing `Notes` surface for free-form text. Direct
+notes and imported, extracted, or model-produced descriptions may remain
+separate durable records so their source, revision, acceptance, and recovery
+evidence are preserved; `DescriptionDocument` is not a second user-facing
+page or setting. See [ADR-008](../technical/build-stack-and-architecture-selection.md#adr-008-one-notes-presentation-over-provenance-preserving-text-records)
+in the build-stack decision record.
+
 An independently qualified snapshot-capable `CaptureDriver` may make a stronger point-in-time claim. The generic local or mounted-tree profile remains valid without any native snapshot driver and reports only the consistency it actually achieved.
 
 ## 4. Recovery outcomes and safety floor
