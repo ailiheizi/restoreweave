@@ -27,28 +27,29 @@ import (
 // It only reads the rebuildable SQLite projection; it never fabricates success
 // for operations that have no implementation in this build.
 type Dispatcher struct {
-	store                    *sqlite.Store
-	catalogPath              string
-	socketPath               string
-	configDigest             string
-	indexBinding             search.IndexBinding
-	vectorPath               string
-	semanticBinding          semanticIndexerBinding
-	semanticBundle           command.Capability
-	semanticBundleMu         sync.RWMutex
-	semanticBundleInstallMu  sync.Mutex
-	semanticBundleModelsRoot string
-	semanticBundleInstaller  SemanticBundleInstaller
-	now                      func() time.Time
-	exact                    *exact.Service
-	search                   *search.Indexer
-	fixtureDimensions        bool
-	sessions                 *contentSessions
-	access                   *access.Service
-	recoveryReader           *recoveryReaderState
-	operatorConfig           *operatorConfigState
-	implemented              map[string]bool
-	unimplemented            []string
+	store                          *sqlite.Store
+	catalogPath                    string
+	socketPath                     string
+	configDigest                   string
+	indexBinding                   search.IndexBinding
+	vectorPath                     string
+	semanticBinding                semanticIndexerBinding
+	semanticBundle                 command.Capability
+	semanticBundleMu               sync.RWMutex
+	semanticBundleInstallMu        sync.Mutex
+	semanticBundleModelsRoot       string
+	semanticBundleInstaller        SemanticBundleInstaller
+	semanticBundleArchiveInstaller SemanticBundleArchiveInstaller
+	now                            func() time.Time
+	exact                          *exact.Service
+	search                         *search.Indexer
+	fixtureDimensions              bool
+	sessions                       *contentSessions
+	access                         *access.Service
+	recoveryReader                 *recoveryReaderState
+	operatorConfig                 *operatorConfigState
+	implemented                    map[string]bool
+	unimplemented                  []string
 }
 
 const modelBundleCapabilityKind = "model-bundle"
@@ -77,6 +78,11 @@ type SemanticBundleInstallReceipt struct {
 // daemon supplies the persisted paths.models root and the callback may only
 // install the pinned local BGE/ONNX+zvec profile there.
 type SemanticBundleInstaller func(context.Context, string) (SemanticBundleInstallReceipt, error)
+
+// SemanticBundleArchiveInstaller is the offline counterpart to
+// SemanticBundleInstaller. The archive path is supplied by the operator and
+// the callback remains restricted to the configured models root.
+type SemanticBundleArchiveInstaller func(context.Context, string, string) (SemanticBundleInstallReceipt, error)
 
 // DispatcherOption configures optional exact-lane handlers.
 type DispatcherOption func(*Dispatcher)
@@ -161,6 +167,16 @@ func WithSemanticBundleInstaller(modelsRoot string, installer SemanticBundleInst
 	return func(d *Dispatcher) {
 		d.semanticBundleModelsRoot = strings.TrimSpace(modelsRoot)
 		d.semanticBundleInstaller = installer
+	}
+}
+
+// WithSemanticBundleArchiveInstaller enables archive-backed installs for the
+// same semantic.bundle.install operation. It does not create a second policy
+// or publication path.
+func WithSemanticBundleArchiveInstaller(modelsRoot string, installer SemanticBundleArchiveInstaller) DispatcherOption {
+	return func(d *Dispatcher) {
+		d.semanticBundleModelsRoot = strings.TrimSpace(modelsRoot)
+		d.semanticBundleArchiveInstaller = installer
 	}
 }
 
@@ -548,6 +564,22 @@ func (d *Dispatcher) handleStatusGet(ctx context.Context, env command.Envelope, 
 		repo := &command.RepositoryStatus{
 			Path: d.exact.Repo.Root(), RepositoryProfile: profile.Repository,
 			CompressionProfile: profile.Compression, OK: true,
+			CapacityState: repository.CapacityUnknown,
+		}
+		if reporter, ok := d.exact.Repo.(repository.CapabilityReporter); ok {
+			if health, healthErr := reporter.DescribeHealthAndCapacity(ctx); healthErr == nil {
+				repo.CapacityState = health.CapacityState
+				repo.CapacityTotal = health.CapacityTotal
+				repo.CapacityFree = health.CapacityFree
+				repo.CapacityUsed = health.CapacityUsed
+				repo.CapacityMeasuredAt = health.CapacityMeasuredAt
+				repo.CapacityReason = health.CapacityReason
+			} else {
+				// Capacity is advisory. A probe error must remain visible while
+				// leaving exact save/read availability unchanged.
+				repo.CapacityState = repository.CapacityUnknown
+				repo.CapacityReason = healthErr.Error()
+			}
 		}
 		if manifests, err := d.exact.ListSnapshots(ctx); err != nil {
 			repo.OK = false
@@ -678,6 +710,10 @@ func (d *Dispatcher) handleContentList(ctx context.Context, env command.Envelope
 		}
 	}
 	items := make([]command.ContentItemData, 0, len(entries))
+	indexStatus, err := d.contentIndexStatuses(ctx, input.WorkspaceID, entries)
+	if err != nil {
+		return catalogErrorResult(env, started, err)
+	}
 	for _, entry := range entries {
 		items = append(items, command.ContentItemData{
 			SubjectRef:  entry.SubjectRef,
@@ -687,6 +723,7 @@ func (d *Dispatcher) handleContentList(ctx context.Context, env command.Envelope
 			EntryType:   string(entry.EntryType),
 			ContentID:   entry.ContentID,
 			LogicalSize: entry.LogicalSize,
+			IndexStatus: indexStatus[entry.SubjectRef],
 		})
 	}
 	rootChoices := make([]command.ContentRootData, 0, len(roots))
@@ -709,6 +746,69 @@ func (d *Dispatcher) handleContentList(ctx context.Context, env command.Envelope
 	})
 }
 
+// contentIndexStatuses reads only rebuildable projections. It never creates
+// or updates index state, and a missing projection is reported explicitly.
+func (d *Dispatcher) contentIndexStatuses(ctx context.Context, workspaceID string, entries []sqlite.NamespaceEntry) (map[string]*command.ContentIndexStatus, error) {
+	statuses := make(map[string]*command.ContentIndexStatus, len(entries))
+	lexicalBySubject := map[string]struct{}{}
+	lexicalState := "NOT_BUILT"
+	if d.search != nil && d.search.LexicalUnavailableForWorkspace(workspaceID) {
+		lexicalState = "UNAVAILABLE"
+	} else if generation, generationErr := d.store.LatestIndexGeneration(ctx, workspaceID, search.DimensionLexical); generationErr == nil {
+		if covered, err := search.LexicalSubjectCoverage(ctx, generation); err == nil {
+			lexicalBySubject, lexicalState = covered, "READY"
+		} else {
+			lexicalState = "UNAVAILABLE"
+		}
+	} else if !errors.Is(generationErr, sqlite.ErrNotFound) {
+		lexicalState = "UNAVAILABLE"
+	}
+	semanticBySubject := map[string]struct{}{}
+	semanticState := "UNAVAILABLE"
+	if d.search != nil {
+		if covered, err := d.search.SemanticSubjectCoverage(ctx, workspaceID); err == nil {
+			semanticBySubject, semanticState = covered, "READY"
+		} else if errors.Is(err, sqlite.ErrNotFound) {
+			// The provider/backend is present, but no generation has been
+			// published yet. Keep this distinct from a broken or unavailable
+			// provider so the operator can tell "not analysed" from "failed".
+			if strings.TrimSpace(d.search.SemanticFailure()) != "" {
+				semanticState = "UNAVAILABLE"
+			} else {
+				semanticState = "NOT_BUILT"
+			}
+		} else {
+			semanticState = "UNAVAILABLE"
+		}
+	}
+	annotations, err := d.store.ListAnnotations(ctx, workspaceID, "", false)
+	if err != nil {
+		return nil, err
+	}
+	tagged := make(map[string]bool)
+	for _, annotation := range annotations {
+		if annotation.Kind == sqlite.AnnotationTag {
+			tagged[annotation.SubjectRef] = true
+		}
+	}
+	for _, entry := range entries {
+		tags := "UNMARKED"
+		if tagged[entry.SubjectRef] {
+			tags = "MARKED"
+		}
+		lexical := lexicalState
+		if _, ok := lexicalBySubject[entry.SubjectRef]; !ok && lexicalState == "READY" {
+			lexical = "NOT_BUILT"
+		}
+		semantic := semanticState
+		if _, ok := semanticBySubject[entry.SubjectRef]; !ok && semanticState == "READY" {
+			semantic = "NOT_BUILT"
+		}
+		statuses[entry.SubjectRef] = &command.ContentIndexStatus{Lexical: lexical, Semantic: semantic, Tags: tags}
+	}
+	return statuses, nil
+}
+
 func (d *Dispatcher) handleNamespaceList(ctx context.Context, env command.Envelope, started time.Time) command.Result {
 	var input namespaceListInput
 	if err := decodeInput(env.Input, &input); err != nil {
@@ -729,9 +829,15 @@ func (d *Dispatcher) handleNamespaceList(ctx context.Context, env command.Envelo
 	if err != nil {
 		return catalogErrorResult(env, started, err)
 	}
+	indexStatus, err := d.contentIndexStatuses(ctx, input.WorkspaceID, entries)
+	if err != nil {
+		return catalogErrorResult(env, started, err)
+	}
 	projected := make([]command.NamespaceEntryData, 0, len(entries))
 	for _, entry := range entries {
-		projected = append(projected, projectNamespaceEntry(entry))
+		item := projectNamespaceEntry(entry)
+		item.IndexStatus = indexStatus[entry.SubjectRef]
+		projected = append(projected, item)
 	}
 	return succeeded(env, started, command.NamespaceListData{
 		RootID:   input.RootID,

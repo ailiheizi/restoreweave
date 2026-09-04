@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -32,16 +33,21 @@ type CapabilityProfile struct {
 }
 
 // HealthProfile makes unavailable and unverified states visible to callers.
-// Capacity is deliberately not synthesized for the in-tree profiles until a
-// platform-specific capacity probe is qualified.
+// Capacity is advisory: a platform or filesystem that cannot measure it is
+// reported as UNKNOWN rather than receiving synthesized numbers.
 type HealthProfile struct {
-	Available       bool   `json:"available"`
-	ReaderReady     bool   `json:"reader_ready"`
-	KeyState        string `json:"key_state"`
-	CorruptionState string `json:"corruption_state"`
-	CapacityState   string `json:"capacity_state"`
-	LastVerified    string `json:"last_verified_boundary,omitempty"`
-	Reason          string `json:"reason,omitempty"`
+	Available          bool   `json:"available"`
+	ReaderReady        bool   `json:"reader_ready"`
+	KeyState           string `json:"key_state"`
+	CorruptionState    string `json:"corruption_state"`
+	CapacityState      string `json:"capacity_state"`
+	CapacityTotal      uint64 `json:"capacity_total,omitempty"`
+	CapacityFree       uint64 `json:"capacity_free,omitempty"`
+	CapacityUsed       uint64 `json:"capacity_used,omitempty"`
+	CapacityMeasuredAt string `json:"capacity_measured_at,omitempty"`
+	CapacityReason     string `json:"capacity_reason,omitempty"`
+	LastVerified       string `json:"last_verified_boundary,omitempty"`
+	Reason             string `json:"reason,omitempty"`
 }
 
 // CapabilityReporter is optional on third-party drivers while the narrow
@@ -453,5 +459,17 @@ func describeDirectoryHealth(ctx context.Context, root, profile string) (HealthP
 	}
 	health.Available = true
 	health.ReaderReady = true
+	if total, free, used, capacityErr := probeFilesystemCapacity(ctx, root); capacityErr == nil {
+		health.CapacityState = CapacityAvailable
+		health.CapacityTotal = total
+		health.CapacityFree = free
+		health.CapacityUsed = used
+		health.CapacityMeasuredAt = time.Now().UTC().Format(time.RFC3339)
+	} else {
+		// Capacity is advisory. A platform or filesystem that cannot report it
+		// must remain usable and must never receive guessed numbers.
+		health.CapacityState = CapacityUnknown
+		health.CapacityReason = capacityErr.Error()
+	}
 	return health, nil
 }

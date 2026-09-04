@@ -20,7 +20,7 @@ type SearchSegment = {
   accepted?: boolean;
   language?: string;
 };
-type SearchHit = { subject_ref?: string; entry_id?: string; name?: string; path?: string; entry_type?: string; content_id?: string; logical_size?: number; segments?: SearchSegment[] };
+type SearchHit = { subject_ref?: string; entry_id?: string; name?: string; path?: string; entry_type?: string; content_id?: string; logical_size?: number; segments?: SearchSegment[]; index_status?: { lexical?: string; semantic?: string; tags?: string } };
 type AnnotationRecord = { annotation_id?: string; subject_ref?: string; kind?: string; body?: string; tombstoned?: boolean; revision?: number; updated_at?: string };
 type SnapshotSummary = { snapshot_ref?: string; workspace_id?: string; namespace_root_id?: string };
 type SourceScan = { scan_ref?: string; generation?: number; state?: string; full_traversal?: boolean; started_at?: string; finished_at?: string; entries?: number; regular_files?: number; directories?: number; symlinks?: number; special_files?: number; bytes_hashed?: number; failed_entries?: number; unstable_entries?: number; detection_failures?: number };
@@ -34,7 +34,7 @@ type BrowseCrumb = { subject_ref: string; entry_id: string; name: string };
 type BrowseRoot = { root_id: string; name: string; source_path?: string };
 type SettingsSection = "storage" | "search" | "descriptions" | "recovery" | "service";
 type ViewMode = "content" | "tag" | "path" | "search";
-type SystemFacetState = { type: string; format: string; dedup: string };
+type SystemFacetState = { type: string; format: string; dedup: string; tags: string; index: string };
 const apiBase = "/api/v1";
 const lexicalDimension = "lexical-metadata-fts";
 const semanticDimension = "semantic-embedding";
@@ -97,6 +97,7 @@ function App() {
   const [annotations, setAnnotations] = useState<any[]>([]);
   const [representations, setRepresentations] = useState<any[]>([]);
   const [descriptions, setDescriptions] = useState<any[]>([]);
+  const [descriptionsTruncated, setDescriptionsTruncated] = useState(false);
   const [detailState, setDetailState] = useState<DetailState>({ subjectRef: "", annotations: "idle", representations: "idle", descriptions: "idle" });
   const [statusData, setStatusData] = useState<any>();
   const [capabilities, setCapabilities] = useState<any[]>([]);
@@ -118,7 +119,7 @@ function App() {
   const [tagDraft, setTagDraft] = useState("");
   const [workspaceTags, setWorkspaceTags] = useState<AnnotationRecord[]>([]);
   const [activeTags, setActiveTags] = useState<string[]>([]);
-  const [activeSystemFacets, setActiveSystemFacets] = useState<SystemFacetState>({ type: "", format: "", dedup: "" });
+  const [activeSystemFacets, setActiveSystemFacets] = useState<SystemFacetState>({ type: "", format: "", dedup: "", tags: "", index: "" });
   const [editingNoteID, setEditingNoteID] = useState("");
   const [editingBody, setEditingBody] = useState("");
   const [snapshotRef, setSnapshotRef] = useState("");
@@ -137,6 +138,7 @@ function App() {
     return semanticBundleCapability?.state === "AVAILABLE";
   }, [semanticBundleCapability]);
   const semanticBundleRestartRequired = useMemo(() => semanticBundleReady && /restart required before semantic worker\/index use/i.test(String(semanticBundleCapability?.notes ?? "")), [semanticBundleCapability, semanticBundleReady]);
+  const semanticBundleOperatorProvided = useMemo(() => /operator-provided/i.test(String(semanticBundleCapability?.source ?? "")), [semanticBundleCapability]);
   const semanticInstallAvailable = useMemo(() => capabilities.some((item) => item.kind === "operation" && item.id === "semantic.bundle.install" && item.state === "AVAILABLE"), [capabilities]);
   const searchRebuildAvailable = useMemo(() => capabilities.some((item) => item.kind === "operation" && item.id === "search.rebuild" && item.state === "AVAILABLE"), [capabilities]);
   const tagsBySubject = useMemo(() => {
@@ -163,7 +165,10 @@ function App() {
   const facetFilteredItems = useMemo(() => libraryItems.filter((item) => {
     const format = formatFacetValue(item);
     const dedup = dedupFacetValue(item, identityCounts);
-    return (!activeSystemFacets.type || item.entry_type === activeSystemFacets.type) && (!activeSystemFacets.format || format === activeSystemFacets.format) && (!activeSystemFacets.dedup || dedup === activeSystemFacets.dedup);
+    const tagState = item.index_status?.tags;
+    const indexStates = [item.index_status?.lexical, item.index_status?.semantic].filter((value): value is string => typeof value === "string" && value.length > 0);
+    const indexNotReady = indexStates.length > 0 && indexStates.some((value) => value === "NOT_BUILT" || value === "UNAVAILABLE");
+    return (!activeSystemFacets.type || item.entry_type === activeSystemFacets.type) && (!activeSystemFacets.format || format === activeSystemFacets.format) && (!activeSystemFacets.dedup || dedup === activeSystemFacets.dedup) && (!activeSystemFacets.tags || tagState === activeSystemFacets.tags) && (!activeSystemFacets.index || (activeSystemFacets.index === "NOT_READY" && indexNotReady));
   }), [activeSystemFacets, identityCounts, libraryItems]);
   const tagFacets = useMemo(() => {
     const visibleSubjects = new Set(facetFilteredItems.map((item) => item.subject_ref).filter((value): value is string => Boolean(value)));
@@ -189,19 +194,25 @@ function App() {
       types: [...types].map(([value, count]) => ({ value, count })).sort((left, right) => left.value.localeCompare(right.value, locale)),
       formats: [...formats].map(([value, count]) => ({ value, count })).sort((left, right) => left.value.localeCompare(right.value, locale)),
       dedup: ["DUPLICATE", "UNIQUE"].filter((value) => dedup.has(value)).map((value) => ({ value, count: dedup.get(value) ?? 0 })),
+      tags: [{ value: "UNMARKED", count: libraryItems.filter((item) => item.index_status?.tags === "UNMARKED").length }].filter((facet) => facet.count > 0),
+      index: [{ value: "NOT_READY", count: libraryItems.filter((item) => {
+        const states = [item.index_status?.lexical, item.index_status?.semantic].filter((value): value is string => typeof value === "string" && value.length > 0);
+        return states.length > 0 && states.some((value) => value === "NOT_BUILT" || value === "UNAVAILABLE");
+      }).length }].filter((facet) => facet.count > 0),
     };
   }, [identityCounts, libraryItems, locale]);
   const filteredLibraryItems = useMemo(() => facetFilteredItems.filter((item) => {
     const values = item.subject_ref ? tagsBySubject.get(item.subject_ref) ?? [] : [];
     return activeTags.every((tag) => values.includes(tag));
   }), [activeTags, facetFilteredItems, tagsBySubject]);
-  const hasSystemFacets = Boolean(activeSystemFacets.type || activeSystemFacets.format || activeSystemFacets.dedup);
+  const hasSystemFacets = Boolean(activeSystemFacets.type || activeSystemFacets.format || activeSystemFacets.dedup || activeSystemFacets.tags || activeSystemFacets.index);
   const hasActiveFilters = activeTags.length > 0 || hasSystemFacets;
   const tagVocabulary = useMemo(() => [...new Set(workspaceTags.map((tag) => tag.body?.trim()).filter((value): value is string => Boolean(value)))].sort((left, right) => left.localeCompare(right, locale)), [locale, workspaceTags]);
   const isConnected = status === "Connected";
   const isUnavailable = status === "Unavailable";
   const catalogHealthy = statusData?.catalog?.ok === true;
   const repositoryHealthy = statusData?.repository?.ok === true;
+  const repositoryCapacity = statusData?.repository;
   const annotationStorageReady = isConnected && catalogHealthy;
   const coreStorageReady = isConnected && catalogHealthy && repositoryHealthy;
   const coreStorageComponent = [
@@ -219,8 +230,12 @@ function App() {
       ? t("Core storage status unavailable")
       : t("Service connected, but catalog is unavailable.");
   const drawerOpen = addOpen || settingsOpen || restoreOpen;
+  const drawerKind = addOpen ? "add" : settingsOpen ? "settings" : restoreOpen ? "restore" : "closed";
   const configDirty = useMemo(() => Boolean(configDraft && configData?.config && JSON.stringify(configDraft) !== JSON.stringify(configData.config)), [configDraft, configData]);
   const settingsGuard = useRef({ open: false, dirty: false, prompt: "" });
+  // Capture the invoking control before React renders the modal. This keeps
+  // close/escape/backdrop dismissal predictable even when autoFocus runs.
+  const drawerTriggerRef = useRef<HTMLElement | null>(null);
   const refreshGenerationRef = useRef(0);
   const detailRequestRef = useRef(0);
   const detailSubjectRef = useRef("");
@@ -230,7 +245,7 @@ function App() {
     window.localStorage.removeItem("restoreweave.workspace_id");
     setSnapshotRef(""); setPlan(undefined); setRestorePlan(undefined); setAnnotations([]); setRepresentations([]); setDescriptions([]); setSources([]); setHits([]); setLibraryItems([]); setSelected(undefined);
     setBrowseRootID(""); setBrowseRoots([]); setBrowseCrumbs([]);
-    setActiveTags([]); setActiveSystemFacets({ type: "", format: "", dedup: "" }); setViewMode("content");
+    setActiveTags([]); setActiveSystemFacets({ type: "", format: "", dedup: "", tags: "", index: "" }); setViewMode("content");
     detailRequestRef.current += 1; detailSubjectRef.current = ""; setDetailState({ subjectRef: "", annotations: "idle", representations: "idle", descriptions: "idle" });
   }
 
@@ -290,7 +305,7 @@ function App() {
         await loadContentLibrary(activeWorkspaceID, refreshGeneration);
       } catch (error) {
         if (!isCurrentRefresh()) return;
-        setHits([]); setLibraryItems([]); setSelected(undefined); setBrowseRootID(""); setBrowseRoots([]); setBrowseCrumbs([]); setActiveTags([]); setActiveSystemFacets({ type: "", format: "", dedup: "" }); setViewMode("content");
+        setHits([]); setLibraryItems([]); setSelected(undefined); setBrowseRootID(""); setBrowseRoots([]); setBrowseCrumbs([]); setActiveTags([]); setActiveSystemFacets({ type: "", format: "", dedup: "", tags: "", index: "" }); setViewMode("content");
         setNotice({ kind: "warning", text: error instanceof Error ? t("Content library is unavailable: {{message}}", { message: error.message }) : t("Content library is unavailable.") });
       }
     } else {
@@ -307,7 +322,7 @@ function App() {
   }
   useEffect(() => { void refresh(); }, []);
   useEffect(() => {
-    if (!workspaceID) { setWorkspaceTags([]); setActiveTags([]); setActiveSystemFacets({ type: "", format: "", dedup: "" }); return; }
+    if (!workspaceID) { setWorkspaceTags([]); setActiveTags([]); setActiveSystemFacets({ type: "", format: "", dedup: "", tags: "", index: "" }); return; }
     void loadTagVocabulary(workspaceID);
   }, [workspaceID]);
   useEffect(() => {
@@ -325,8 +340,18 @@ function App() {
   }, [configDirty, settingsOpen, t]);
   useEffect(() => {
     if (!drawerOpen) return;
-    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : undefined;
+    const previouslyFocused = drawerTriggerRef.current ?? (document.activeElement instanceof HTMLElement ? document.activeElement : undefined);
     document.body.classList.add("drawer-open");
+    const focusFirstControl = () => {
+      const drawer = document.querySelector<HTMLElement>('[aria-modal="true"]');
+      // Prefer the task's first field over the dismiss button. Settings and
+      // restore drawers both have an actionable input; falling back to a
+      // button keeps empty/error states keyboard reachable.
+      const firstField = drawer?.querySelector<HTMLElement>('input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [autofocus]');
+      const first = firstField ?? drawer?.querySelector<HTMLElement>('button:not([disabled]), [tabindex]:not([tabindex="-1"])');
+      first?.focus();
+    };
+    requestAnimationFrame(focusFirstControl);
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape") {
         const guard = settingsGuard.current;
@@ -348,8 +373,9 @@ function App() {
       document.body.classList.remove("drawer-open");
       document.removeEventListener("keydown", handleKeyDown);
       previouslyFocused?.focus();
+      drawerTriggerRef.current = null;
     };
-  }, [drawerOpen]);
+  }, [drawerOpen, drawerKind]);
 
   async function runSearch(event?: FormEvent) {
     event?.preventDefault();
@@ -361,7 +387,10 @@ function App() {
       // Leave dimension selection to the typed dispatcher so ordinary search
       // always uses its lexical + structured + semantic default broker.
       const response = await command("search.query", { workspace_id: workspaceID, query: query.trim() });
-      setHits((response.data?.hits ?? []) as SearchHit[]); setSelected(undefined); setActiveTags([]); setActiveSystemFacets({ type: "", format: "", dedup: "" }); setViewMode("search");
+      const statusBySubject = new Map(libraryItems.map((item) => [item.subject_ref, item.index_status]));
+      const searchHits = (response.data?.hits ?? []) as SearchHit[];
+      setHits(searchHits.map((hit) => ({ ...hit, index_status: hit.index_status ?? statusBySubject.get(hit.subject_ref ?? "") })));
+      setSelected(undefined); setActiveTags([]); setActiveSystemFacets({ type: "", format: "", dedup: "", tags: "", index: "" }); setViewMode("search");
       if (response.status === "DEGRADED") {
         const reason = response.reasons?.map((item) => item.message?.trim()).filter((message): message is string => Boolean(message)).map((message) => t(message)).join("; ") || t("Search degradation reason was not reported.");
         setNotice({ kind: "warning", text: t("Search results are available, but some search coverage is degraded: {{reason}}", { reason }) });
@@ -372,7 +401,7 @@ function App() {
   }
   async function loadNamespace(activeWorkspaceID: string, rootID: string, parentEntryID = "", crumbs: BrowseCrumb[] = []) {
     const response = await command("namespace.list", { workspace_id: activeWorkspaceID, root_id: rootID, parent_id: parentEntryID || undefined });
-    const entries = (response.data?.entries ?? []) as Array<{ entry_id?: string; subject_ref?: string; display_name?: string; entry_type?: string; content_id?: string; logical_size?: number }>;
+    const entries = (response.data?.entries ?? []) as Array<{ entry_id?: string; subject_ref?: string; display_name?: string; entry_type?: string; content_id?: string; logical_size?: number; index_status?: SearchHit["index_status"] }>;
     const prefix = crumbs.map((crumb) => crumb.name).join("/");
     setHits(entries.map((entry) => ({
       subject_ref: entry.subject_ref || entry.entry_id,
@@ -382,8 +411,9 @@ function App() {
       entry_type: entry.entry_type,
       content_id: entry.content_id,
       logical_size: entry.logical_size,
+      index_status: entry.index_status,
     })));
-    setSelected(undefined); setBrowseRootID(rootID); setBrowseCrumbs(crumbs); setActiveTags([]); setActiveSystemFacets({ type: "", format: "", dedup: "" }); setViewMode("path");
+    setSelected(undefined); setBrowseRootID(rootID); setBrowseCrumbs(crumbs); setActiveTags([]); setActiveSystemFacets({ type: "", format: "", dedup: "", tags: "", index: "" }); setViewMode("path");
   }
   async function loadContentLibrary(activeWorkspaceID: string, refreshGeneration = refreshGenerationRef.current) {
     const response = await command("content.list", { workspace_id: activeWorkspaceID });
@@ -392,7 +422,7 @@ function App() {
     setLibraryItems(items); setHits(items);
     const roots = (response.data?.roots ?? []) as BrowseRoot[];
     const rootID = response.data?.root_id || (roots.length === 1 ? roots[0].root_id : "");
-    setSelected(undefined); setBrowseRoots(roots); setBrowseRootID(rootID); setBrowseCrumbs([]); setActiveTags([]); setActiveSystemFacets({ type: "", format: "", dedup: "" }); setViewMode("content");
+    setSelected(undefined); setBrowseRoots(roots); setBrowseRootID(rootID); setBrowseCrumbs([]); setActiveTags([]); setActiveSystemFacets({ type: "", format: "", dedup: "", tags: "", index: "" }); setViewMode("content");
   }
   async function loadSources(activeWorkspaceID: string, refreshGeneration = refreshGenerationRef.current) {
     try {
@@ -404,6 +434,9 @@ function App() {
       if (refreshGenerationRef.current !== refreshGeneration) return;
       // Source management is a secondary projection; an unavailable projection
       // must not hide the content library or imply that saved bytes are gone.
+      // Drop the old cards so a failed refresh cannot leave actions bound to a
+      // stale source projection.
+      setSources([]);
       setSourceProjection({ state: "DEGRADED" });
     }
   }
@@ -420,7 +453,7 @@ function App() {
     setQuery(""); setSelected(undefined); setActiveSystemFacets(next); setViewMode("tag");
   }
   function clearLibraryFilters() {
-    setHits(libraryItems); setSelected(undefined); setActiveTags([]); setActiveSystemFacets({ type: "", format: "", dedup: "" }); setViewMode("content");
+    setHits(libraryItems); setSelected(undefined); setActiveTags([]); setActiveSystemFacets({ type: "", format: "", dedup: "", tags: "", index: "" }); setViewMode("content");
   }
   async function openLibraryEntry(hit: SearchHit) {
     if (hit.entry_type === "DIRECTORY" && (hit.entry_id || hit.subject_ref) && browseRootID) {
@@ -473,7 +506,10 @@ function App() {
     }
   }
   async function rebuildSearch() {
-    if (!searchRebuildAvailable || !workspaceID || configDirty || configData?.restart_required || !semanticBundleReady) return;
+    // Lexical/structured indexing is useful on its own.  Rebuilding it must
+    // never be gated on the optional semantic bundle; the semantic lane can
+    // remain unavailable while the exact and keyword lanes recover.
+    if (!searchRebuildAvailable || !workspaceID || configDirty || configData?.restart_required) return;
     setSearchRebuild({ state: "RUNNING" });
     try {
       const response = await command("search.rebuild", { workspace_id: workspaceID });
@@ -531,7 +567,7 @@ function App() {
     const subjectRef = hit.subject_ref?.trim() ?? "";
     const requestToken = ++detailRequestRef.current;
     detailSubjectRef.current = subjectRef;
-    setSelected(hit); setAnnotations([]); setRepresentations([]); setDescriptions([]);
+    setSelected(hit); setAnnotations([]); setRepresentations([]); setDescriptions([]); setDescriptionsTruncated(false);
     setEditingNoteID(""); setEditingBody(""); setNoteDraft(""); setTagDraft("");
     setDetailState({ subjectRef, annotations: "loading", representations: "loading", descriptions: "loading" });
     if (!workspaceID || !subjectRef) {
@@ -554,7 +590,11 @@ function App() {
     const representationResult = subjectBoundDetailCollection(requests[1], "representations", subjectRef);
     const descriptionResult = subjectBoundDetailCollection(requests[2], "documents", subjectRef);
     const descriptionTruncated = requests[2].status === "fulfilled" && requests[2].value.data?.truncated === true;
-    const descriptionState: DetailResourceStatus = descriptionTruncated ? "error" : descriptionResult.status;
+    // Truncation is a partial-success condition: the returned Notes remain
+    // useful and must stay visible, with an explicit indication that history
+    // continues beyond this bounded response.
+    const descriptionState: DetailResourceStatus = descriptionResult.status;
+    setDescriptionsTruncated(descriptionTruncated);
     setDetailState({
       subjectRef,
       annotations: annotationResult.status,
@@ -607,7 +647,10 @@ function App() {
       setAnnotations((items) => annotationID ? items.map((item) => item.annotation_id === annotationID ? response.data.annotation : item) : [...items, response.data.annotation]);
       setNoteDraft(""); setEditingNoteID(""); setEditingBody("");
       await refreshCapabilities();
-      setNotice({ kind: "success", text: annotationID ? t("Note updated.") : t("Note added.") });
+      const degraded = response.status === "DEGRADED";
+      setNotice({ kind: degraded ? "warning" : "success", text: degraded
+        ? t(annotationID ? "Note updated, but search indexing is unavailable." : "Note added, but search indexing is unavailable.")
+        : t(annotationID ? "Note updated." : "Note added.") });
     }
     catch (error) { setNotice({ kind: "error", text: error instanceof Error ? error.message : t("Could not save annotation") }); }
     finally { setBusy(false); }
@@ -624,6 +667,15 @@ function App() {
       return [];
     }
   }
+  function syncTagCoverage(subjectRef: string, tags: AnnotationRecord[]) {
+    const normalized = subjectRef.trim();
+    if (!normalized) return;
+    const state = tags.some((item) => item.subject_ref?.trim() === normalized && item.kind === "TAG" && !item.tombstoned) ? "MARKED" : "UNMARKED";
+    const update = (item: SearchHit) => item.subject_ref?.trim() === normalized ? { ...item, index_status: { ...item.index_status, tags: state } } : item;
+    setLibraryItems((items) => items.map(update));
+    setHits((items) => items.map(update));
+    setSelected((item) => item && item.subject_ref?.trim() === normalized ? update(item) : item);
+  }
   async function saveTag() {
     const body = tagDraft.trim();
     const subjectRef = selected?.subject_ref?.trim() ?? "";
@@ -636,9 +688,10 @@ function App() {
       const annotation = response.data?.annotation;
       setAnnotations((items) => items.some((item) => item.annotation_id === annotation?.annotation_id) ? items : [...items, annotation]);
       setTagDraft("");
-      await loadTagVocabulary(workspaceID);
+      const tags = await loadTagVocabulary(workspaceID);
+      syncTagCoverage(subjectRef, tags);
       await refreshCapabilities();
-      setNotice({ kind: "success", text: t("Tag added.") });
+      setNotice({ kind: response.status === "DEGRADED" ? "warning" : "success", text: t(response.status === "DEGRADED" ? "Tag added, but search indexing is unavailable." : "Tag added.") });
     } catch (error) {
       setNotice({ kind: "error", text: error instanceof Error ? error.message : t("Could not save tag") });
     } finally { setBusy(false); }
@@ -649,10 +702,11 @@ function App() {
     const requestToken = detailRequestRef.current;
     setBusy(true); setNotice(undefined);
     try {
-      await command("annotation.delete", { workspace_id: workspaceID, annotation_id: tag.annotation_id, expected_revision: tag.revision });
+      const response = await command("annotation.delete", { workspace_id: workspaceID, annotation_id: tag.annotation_id, expected_revision: tag.revision });
       if (!detailIsCurrent(subjectRef, requestToken)) return;
       setAnnotations((items) => items.filter((item) => item.annotation_id !== tag.annotation_id));
       const remainingTags = await loadTagVocabulary(workspaceID);
+      syncTagCoverage(subjectRef, remainingTags);
       const removedValue = typeof tag.body === "string" ? tag.body.trim() : "";
       if (removedValue && activeTags.includes(removedValue) && !remainingTags.some((item) => item.body?.trim() === removedValue)) {
         const next = activeTags.filter((value) => value !== removedValue);
@@ -662,7 +716,7 @@ function App() {
         }
       }
       await refreshCapabilities();
-      setNotice({ kind: "success", text: t("Tag removed.") });
+      setNotice({ kind: response.status === "DEGRADED" ? "warning" : "success", text: t(response.status === "DEGRADED" ? "Tag removed, but search indexing is unavailable." : "Tag removed.") });
     } catch (error) {
       setNotice({ kind: "error", text: error instanceof Error ? error.message : t("Could not remove tag") });
     } finally { setBusy(false); }
@@ -673,12 +727,12 @@ function App() {
     const requestToken = detailRequestRef.current;
     setBusy(true); setNotice(undefined);
     try {
-      await command("annotation.delete", { workspace_id: workspaceID, annotation_id: note.annotation_id, expected_revision: note.revision });
+      const response = await command("annotation.delete", { workspace_id: workspaceID, annotation_id: note.annotation_id, expected_revision: note.revision });
       if (!detailIsCurrent(subjectRef, requestToken)) return;
       setAnnotations((items) => items.filter((item) => item.annotation_id !== note.annotation_id));
       setEditingNoteID(""); setEditingBody("");
       await refreshCapabilities();
-      setNotice({ kind: "success", text: t("Note deleted.") });
+      setNotice({ kind: response.status === "DEGRADED" ? "warning" : "success", text: t(response.status === "DEGRADED" ? "Note deleted, but search indexing is unavailable." : "Note deleted.") });
     } catch (error) {
       setNotice({ kind: "error", text: error instanceof Error ? error.message : t("Could not delete note") });
     } finally { setBusy(false); }
@@ -695,15 +749,40 @@ function App() {
     if (!restorePlan?.plan_id || !restorePlan?.plan_digest || !restorePlan?.workspace_id) return;
     if (!coreStorageReady) { setNotice({ kind: "error", text: coreStorageMessage }); return; }
     setBusy(true);
-    try { const response = await command("plan.apply", { workspace_id: restorePlan.workspace_id, plan_id: restorePlan.plan_id, plan_digest: restorePlan.plan_digest }); setRestorePlan({ ...restorePlan, ...response.data, state: response.data?.state ?? "SUCCEEDED" }); setRestoreOpen(false); setNotice({ kind: "success", text: t("Restored and verified {{files}} file(s) to {{destination}}.", { files: response.data?.files ?? restorePlan.files, destination: response.data?.destination ?? restoreDestination }) }); }
+    try {
+      const response = await command("plan.apply", { workspace_id: restorePlan.workspace_id, plan_id: restorePlan.plan_id, plan_digest: restorePlan.plan_digest });
+      setRestorePlan({ ...restorePlan, ...response.data, state: response.data?.state ?? response.status ?? "SUCCEEDED" });
+      setRestoreOpen(false);
+      const reasonMessages = [
+        ...(response.reasons ?? []).map((item) => item.message),
+        ...(Array.isArray(response.data?.warnings) ? response.data.warnings : []),
+        ...(Array.isArray(response.data?.reasons) ? response.data.reasons.map((item: unknown) => typeof item === "string" ? item : (item as { message?: string })?.message) : []),
+      ].filter((message): message is string => typeof message === "string" && Boolean(message.trim()));
+      const details = reasonMessages.length > 0 ? ` ${reasonMessages.join(" ")}` : "";
+      const files = response.data?.files ?? restorePlan.files;
+      const destination = response.data?.destination ?? restoreDestination;
+      if (response.status === "DEGRADED") {
+        setNotice({ kind: "warning", text: `${t("Restored {{files}} file(s) to {{destination}}, but some fidelity or metadata checks were unavailable.", { files, destination })}${details}` });
+      } else {
+        setNotice({ kind: "success", text: `${t("Restored and verified {{files}} file(s) to {{destination}}.", { files, destination })}${details}` });
+      }
+    }
     catch (error) { setNotice({ kind: "error", text: error instanceof Error ? error.message : t("Could not restore snapshot") }); }
     finally { setBusy(false); }
   }
   function rememberWorkspace(value: unknown) { if (typeof value === "string" && value.trim()) { setWorkspaceID(value); window.localStorage.setItem("restoreweave.workspace_id", value); } }
   function canLeaveSettings() { return !settingsOpen || !configDirty || window.confirm(t("Discard unsaved settings?")); }
-  function openAdd(sourceItem?: SourceSummary) {
+  function rememberDrawerTrigger(trigger?: EventTarget | null) {
+    drawerTriggerRef.current = trigger instanceof HTMLElement
+      ? trigger
+      : document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+  }
+  function openAdd(sourceItem?: SourceSummary, trigger?: EventTarget | null) {
     if (!isConnected || !coreStorageReady) { setNotice({ kind: "error", text: coreStorageMessage }); return; }
     if (!canLeaveSettings()) return;
+    rememberDrawerTrigger(trigger);
     setSettingsOpen(false); setRestoreOpen(false);
     setSource(sourceItem?.locator?.trim() ?? ""); setPlan(undefined);
     setRecheckSourceRef(sourceItem?.source_ref?.trim() ?? "");
@@ -723,8 +802,15 @@ function App() {
       setNotice({ kind: "error", text: error instanceof Error ? error.message : t("Could not open source content") });
     } finally { setBusy(false); }
   }
-  function openSettings() { setAddOpen(false); setRecheckSourceRef(""); setRestoreOpen(false); setSettingsOpen(true); setSettingsSection("storage"); void loadSettings(); }
-  function openRestore() { if (!isConnected || !coreStorageReady) { setNotice({ kind: "error", text: coreStorageMessage }); return; } if (!canLeaveSettings()) return; setAddOpen(false); setRecheckSourceRef(""); setSettingsOpen(false); setRestorePlan(undefined); setRestoreDestination(""); setRestoreOpen(true); setNotice(undefined); }
+  function openSettings(trigger?: EventTarget | null) {
+    if (!canLeaveSettings()) return;
+    // Keep the settings trigger so closing the drawer (including Escape or
+    // backdrop dismissal) returns keyboard users to the control that opened
+    // it, just like the add/restore drawers do.
+    rememberDrawerTrigger(trigger);
+    setAddOpen(false); setRecheckSourceRef(""); setRestoreOpen(false); setSettingsOpen(true); setSettingsSection("storage"); void loadSettings();
+  }
+  function openRestore(trigger?: EventTarget | null) { if (!isConnected || !coreStorageReady) { setNotice({ kind: "error", text: coreStorageMessage }); return; } if (!canLeaveSettings()) return; rememberDrawerTrigger(trigger); setAddOpen(false); setRecheckSourceRef(""); setSettingsOpen(false); setRestorePlan(undefined); setRestoreDestination(""); setRestoreOpen(true); setNotice(undefined); }
   function closeSettings() {
     if (!canLeaveSettings()) return;
     setSettingsOpen(false);
@@ -750,13 +836,16 @@ function App() {
       </form>
       <div className="top-actions">
         <span className={`connection ${isConnected ? "ok" : "bad"}`} aria-label={t(status)}>{status === "Checking service" ? <LoaderCircle className="spin" size={15} /> : isConnected ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}<span>{t(status)}</span></span>
-        <button className="secondary-button restore-button" aria-label={t("Restore latest snapshot")} title={t("Restore latest snapshot")} onClick={openRestore} disabled={!snapshotRef || !isConnected || !coreStorageReady}><ArchiveRestore size={16} /><span>{t("Restore")}</span></button>
-        <button className="primary-button add-button" aria-label={t("Add source")} title={t("Add source")} onClick={() => openAdd()} disabled={!isConnected || !coreStorageReady}><Plus size={16} /><span>{t("Add source")}</span></button>
+        <button className="secondary-button restore-button" aria-label={t("Restore latest snapshot")} title={t("Restore latest snapshot")} onClick={(event) => openRestore(event.currentTarget)} disabled={!snapshotRef || !isConnected || !coreStorageReady}><ArchiveRestore size={16} /><span>{t("Restore")}</span></button>
+        <button className="primary-button add-button" aria-label={t("Add source")} title={t("Add source")} onClick={(event) => openAdd(undefined, event.currentTarget)} disabled={!isConnected || !coreStorageReady}><Plus size={16} /><span>{t("Add source")}</span></button>
         <button className="icon-button" title={t("Refresh service status")} aria-label={t("Refresh service status")} onClick={() => void refresh()}><RefreshCw size={17} /></button>
-        <button className="icon-button" title={t("Open settings")} aria-label={t("Open settings")} onClick={openSettings}><Settings size={17} /></button>
+        <button className="icon-button" title={t("Open settings")} aria-label={t("Open settings")} onClick={(event) => openSettings(event.currentTarget)}><Settings size={17} /></button>
       </div>
     </header>
-    {isConnected && <div className="system-rail" aria-label={t("System readiness")}><span className={`rail-title ${coreStorageReady ? "" : "degraded"}`}>{t(coreStorageReady ? "SYSTEM READY" : "Core storage unavailable")}</span><span className={repositoryHealthy ? "ready" : "degraded"}><Database size={15} />{repositoryHealthy ? t("Exact repository") : t("Repository unavailable")}</span><span className={catalogHealthy ? "ready" : "degraded"}><Database size={15} />{catalogHealthy ? t("Catalog ready") : t("Catalog unavailable")}</span><span className={lexicalReady ? "ready" : "degraded"}><Search size={15} />{lexicalReady ? t("Keyword search") : `${t("Keyword search")} · ${t("Offline")}`}</span><span className={semanticReady ? "ready" : "degraded"}><Sparkles size={15} />{semanticReady ? t("Semantic search ready") : t("Semantic search unavailable")}</span><span className={snapshotRef ? "ready" : "degraded"}><ArchiveRestore size={15} />{snapshotRef ? t("Recovery point ready") : t("No recovery point")}</span></div>}
+    {isConnected && <details className="system-rail" aria-label={t("System readiness")} open={!coreStorageReady}>
+      <summary className={`rail-summary ${coreStorageReady ? "" : "degraded"}`}><span className="rail-title">{t(coreStorageReady ? "SYSTEM READY" : "Core storage unavailable")}</span><ChevronRight size={14} /></summary>
+      <div className="system-rail-details"><span className={repositoryHealthy ? "ready" : "degraded"}><Database size={15} />{repositoryHealthy ? t("Exact repository") : t("Repository unavailable")}</span><span className={catalogHealthy ? "ready" : "degraded"}><Database size={15} />{catalogHealthy ? t("Catalog ready") : t("Catalog unavailable")}</span><span className={lexicalReady ? "ready" : "degraded"}><Search size={15} />{lexicalReady ? t("Keyword search") : `${t("Keyword search")} · ${t("Offline")}`}</span><span className={semanticReady ? "ready" : "degraded"}><Sparkles size={15} />{semanticReady ? t("Semantic search ready") : t("Semantic search unavailable")}</span><span className={snapshotRef ? "ready" : "degraded"}><ArchiveRestore size={15} />{snapshotRef ? t("Recovery point ready") : t("No recovery point")}</span><CapacitySummary repository={repositoryCapacity} t={t} /></div>
+    </details>}
     <main className={`workspace ${selected ? "detail-active" : ""} ${showFirstSource ? "empty-library" : ""}`}><section className="content-column">
       <div className="workspace-heading"><div><p className="eyebrow">{t("YOUR LIBRARY")}</p><h1>{viewMode === "search" ? t("Results for \"{{query}}\"", { query }) : viewMode === "tag" ? activeTags.length ? t("Content tagged {{tags}}", { tags: activeTags.join(" + ") }) : t("Filtered content") : viewMode === "path" ? browseCrumbs.at(-1)?.name || t("Source paths") : t("All content")}</h1></div><div className="heading-actions">{hasActiveFilters && <button className="library-return" onClick={clearLibraryFilters}><X size={14} />{t("Clear filters")}</button>}{(viewMode === "search" || viewMode === "path") && workspaceID && <button className="library-return" onClick={() => void loadContentLibrary(workspaceID)}><Home size={14} />{t("All content")}</button>}<span className="result-count">{hits.length ? t(viewMode === "search" ? "{{count}} results" : "{{count}} items", { count: hits.length }) : workspaceID ? t("0 items") : t("No workspace yet")}</span></div></div>
       {showLibraryFacets && <section className="tag-browser" aria-label={t("Filter by tags")}>
@@ -766,26 +855,28 @@ function App() {
           {tagFacets.map((facet) => <button type="button" key={facet.value} className={`tag-filter ${activeTags.includes(facet.value) ? "active" : ""}`} aria-pressed={activeTags.includes(facet.value)} aria-label={t("Filter by tag {{tag}}, {{count}} items", { tag: facet.value, count: facet.count })} onClick={() => toggleTagFilter(facet.value)}><span>{facet.value}</span><b>{facet.count}</b></button>)}
           {tagFacets.length === 0 && <span className="tag-filter-empty">{t("No tags yet")}</span>}
         </div>
-        <div className="system-facet-heading"><Hash size={14} /><span>{t("System fields")}</span><small>{t("Read-only type, format, and dedup facets")}</small></div>
+        <details className="system-facets-disclosure">
+        <summary className="system-facet-heading"><Hash size={14} /><span>{t("System fields")}</span><small>{t("Read-only type, format, dedup, and index facets")}</small><ChevronRight size={14} /></summary>
         <div className="system-facet-groups">
           <div className="system-facet-group"><span>{t("Type")}</span>{systemFacets.types.map((facet) => <button type="button" key={facet.value} className={`system-facet ${activeSystemFacets.type === facet.value ? "active" : ""}`} aria-pressed={activeSystemFacets.type === facet.value} onClick={() => toggleSystemFacet("type", facet.value)}><span>{formatEntryType(facet.value, t)}</span><b>{facet.count}</b></button>)}</div>
           <div className="system-facet-group"><span>{t("Format")}</span>{systemFacets.formats.length ? systemFacets.formats.map((facet) => <button type="button" key={facet.value} className={`system-facet ${activeSystemFacets.format === facet.value ? "active" : ""}`} aria-pressed={activeSystemFacets.format === facet.value} onClick={() => toggleSystemFacet("format", facet.value)}><span>{facet.value}</span><b>{facet.count}</b></button>) : <small className="facet-unavailable">{t("No file formats")}</small>}</div>
           <div className="system-facet-group"><span>{t("Dedup")}</span>{systemFacets.dedup.map((facet) => <button type="button" key={facet.value} className={`system-facet ${activeSystemFacets.dedup === facet.value ? "active" : ""}`} aria-pressed={activeSystemFacets.dedup === facet.value} onClick={() => toggleSystemFacet("dedup", facet.value)}><span>{formatDedupFacet(facet.value, t)}</span><b>{facet.count}</b></button>)}</div>
-        </div>
-        {hasActiveFilters && <div className="filter-summary" aria-label={t("Active filters")}><span className="filter-summary-label">{t("Active filters")}:</span>{activeTags.map((tag) => <button type="button" className="active-filter" key={tag} onClick={() => toggleTagFilter(tag)} aria-label={t("Remove tag filter {{tag}}", { tag })}><Tag size={11} />{tag}<X size={11} /></button>)}{hasSystemFacets && <span className="filter-summary-system">{[activeSystemFacets.type ? `type:${formatEntryType(activeSystemFacets.type, t)}` : "", activeSystemFacets.format ? `format:${activeSystemFacets.format}` : "", activeSystemFacets.dedup ? `dedup:${formatDedupFacet(activeSystemFacets.dedup, t)}` : ""].filter(Boolean).join(" + ")}</span>}<button type="button" className="filter-summary-clear" onClick={clearLibraryFilters}>{t("Clear filters")}</button></div>}
+          <div className="system-facet-group"><span>{t("Coverage")}</span>{systemFacets.tags.map((facet) => <button type="button" key={facet.value} className={`system-facet ${activeSystemFacets.tags === facet.value ? "active" : ""}`} aria-pressed={activeSystemFacets.tags === facet.value} onClick={() => toggleSystemFacet("tags", facet.value)}><span>{t("Unmarked")}</span><b>{facet.count}</b></button>)}{systemFacets.index.map((facet) => <button type="button" key={facet.value} className={`system-facet ${activeSystemFacets.index === facet.value ? "active" : ""}`} aria-pressed={activeSystemFacets.index === facet.value} onClick={() => toggleSystemFacet("index", facet.value)}><span>{t("Index not ready")}</span><b>{facet.count}</b></button>)}{!systemFacets.tags.length && !systemFacets.index.length && <small className="facet-unavailable">{t("No incomplete coverage")}</small>}</div>
+        </div></details>
+        {hasActiveFilters && <div className="filter-summary" aria-label={t("Active filters")}><span className="filter-summary-label">{t("Active filters")}:</span>{activeTags.map((tag) => <button type="button" className="active-filter" key={tag} onClick={() => toggleTagFilter(tag)} aria-label={t("Remove tag filter {{tag}}", { tag })}><Tag size={11} />{tag}<X size={11} /></button>)}{hasSystemFacets && <span className="filter-summary-system">{[activeSystemFacets.type ? `type:${formatEntryType(activeSystemFacets.type, t)}` : "", activeSystemFacets.format ? `format:${activeSystemFacets.format}` : "", activeSystemFacets.dedup ? `dedup:${formatDedupFacet(activeSystemFacets.dedup, t)}` : "", activeSystemFacets.tags ? t("Unmarked") : "", activeSystemFacets.index ? t("Index not ready") : ""].filter(Boolean).join(" + ")}</span>}<button type="button" className="filter-summary-clear" onClick={clearLibraryFilters}>{t("Clear filters")}</button></div>}
       </section>}
       {(sources.length > 0 || sourceProjection.state === "DEGRADED") && <details className="source-manager">
         <summary><HardDrive size={14} /><span>{t("Sources")}</span><small>{sourceProjection.state === "DEGRADED" ? t("Source status unavailable") : t("{{count}} configured", { count: sources.length })}</small><ChevronRight size={14} /></summary>
         {sourceProjection.state === "DEGRADED" && <div className="source-projection-warning" role="status"><AlertCircle size={14} /><span>{t("Source status could not be loaded. Saved content remains available; refresh to try again.")}</span></div>}
-        <div className="source-manager-list">{sources.map((sourceItem, index) => <SourceCard key={sourceItem.source_ref ?? sourceItem.locator ?? index} source={sourceItem} locale={locale} t={t} busy={busy} coreStorageReady={coreStorageReady} onView={() => void viewSource(sourceItem)} onRecheck={() => openAdd(sourceItem)} />)}</div>
+        <div className="source-manager-list">{sources.map((sourceItem, index) => <SourceCard key={sourceItem.source_ref ?? sourceItem.locator ?? index} source={sourceItem} locale={locale} t={t} busy={busy} coreStorageReady={coreStorageReady} onView={() => void viewSource(sourceItem)} onRecheck={(trigger) => openAdd(sourceItem, trigger)} />)}</div>
       </details>}
       {(viewMode === "content" || viewMode === "tag") && browseRoots.length > 0 && <details className="source-disclosure"><summary><Folder size={14} /><span>{t("Browse source paths")}</span><small>{t("Source paths are provenance")}</small><ChevronRight size={14} /></summary><div className="source-switcher" aria-label={t("Source paths")}>{browseRoots.map((root) => { const label = sourceButtonLabel(root, browseRoots, t); const path = root.source_path?.trim(); return <button type="button" key={root.root_id} title={path || label} aria-label={path ? t("Browse source {{name}} at {{path}}", { name: root.name || t("Source path"), path }) : label} onClick={() => void navigateLibrary("", [], root.root_id)}><Folder size={14} />{label}</button>; })}</div></details>}
       {viewMode === "path" && browseRootID && <nav className="breadcrumbs" aria-label={t("Source paths")}><button title={t("Source paths")} aria-label={t("Source path root")} onClick={() => void navigateLibrary("", [])}><Home size={14} /></button>{browseCrumbs.map((crumb, index) => <span key={crumb.entry_id}><ChevronRight size={13} /><button onClick={() => void navigateLibrary(crumb.entry_id || crumb.subject_ref, browseCrumbs.slice(0, index + 1))}>{crumb.name}</button></span>)}</nav>}
       {isConnected && !coreStorageReady ? <div className="notice error" role="alert"><AlertCircle size={16} />{coreStorageMessage}</div> : isUnavailable ? <div className="service-offline" role="alert"><span><Server size={18} /></span><div><strong>{t("RestoreWeave service is unavailable")}</strong><small>{t("Start the service, then refresh this page. Saved content has not been changed.")}</small></div><button className="secondary-button compact" onClick={() => void refresh()}><RefreshCw size={15} />{t("Retry")}</button></div> : notice && <div className={`notice ${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"}>{notice.kind === "error" ? <AlertCircle size={16} /> : notice.kind === "warning" ? <Sparkles size={16} /> : <Check size={16} />}{notice.text}<button aria-label={t("Dismiss notice")} onClick={() => setNotice(undefined)}><X size={14} /></button></div>}
-      {hits.length ? <div className="result-list">{hits.map((hit, index) => <ResultRow key={hit.subject_ref ?? index} hit={hit} tags={hit.subject_ref ? tagsBySubject.get(hit.subject_ref) ?? [] : []} activeTags={activeTags} selected={selected?.subject_ref === hit.subject_ref} t={t} onSelect={() => void (viewMode === "path" ? openLibraryEntry(hit) : loadDetails(hit))} onTagFilter={toggleTagFilter} />)}</div> : <div className="empty-state"><span className="vault-sigil"><ShieldCheck size={35} /></span><h2>{t(showFirstSource ? "Start by adding a source" : showConfiguredSourceEmpty ? "Source configured, no saved content yet" : viewMode === "search" ? "No matches found" : viewMode === "tag" ? activeTags.length ? "No content matches these tags" : hasSystemFacets ? "No content matches these filters" : "No content matches these tags" : viewMode === "path" ? "This source path is empty" : "No content yet")}</h2><p>{t(showFirstSource ? "Add a server folder, review what will be stored, then confirm." : showConfiguredSourceEmpty ? "Recheck creates a reviewable plan. Existing saved content is not changed until you confirm." : viewMode === "search" ? "Try another name, path, metadata value, tag, note, or extracted phrase." : viewMode === "tag" ? activeTags.length ? "Choose fewer tags to broaden the result." : hasSystemFacets ? "Adjust or clear the system filters." : "Choose fewer tags to broaden the result." : viewMode === "path" ? "No captured items are recorded at this source path." : "Saved content will appear here independent of its original folders.")}</p>{showFirstSource && <button className="primary-button" onClick={() => openAdd()} disabled={!coreStorageReady}><Plus size={16} />{t("Add source")}</button>}</div>}
-    </section>{(selected || hits.length > 0) && <aside className="detail-column">{selected ? <Details hit={selected} annotations={annotations} representations={representations} descriptions={descriptions} annotationStatus={detailState.annotations} representationsStatus={detailState.representations} descriptionsStatus={detailState.descriptions} annotationMutationEnabled={annotationStorageReady && detailState.subjectRef === selected.subject_ref?.trim() && detailSubjectRef.current === selected.subject_ref?.trim() && detailState.annotations === "ready"} noteDraft={noteDraft} tagDraft={tagDraft} tagVocabulary={tagVocabulary} editingNoteID={editingNoteID} editingBody={editingBody} busy={busy} t={t} locale={locale} onBack={() => { detailRequestRef.current += 1; detailSubjectRef.current = ""; setDetailState({ subjectRef: "", annotations: "idle", representations: "idle", descriptions: "idle" }); setSelected(undefined); }} onDraft={setNoteDraft} onTagDraft={setTagDraft} onAddTag={() => void saveTag()} onDeleteTag={(tag) => void deleteTag(tag)} onAdd={() => void saveNote("", noteDraft)} onEdit={(note) => { setEditingNoteID(note.annotation_id); setEditingBody(note.body); }} onDeleteNote={(note) => void deleteNote(note)} onEditBody={setEditingBody} onSaveEdit={(note) => void saveNote(note.annotation_id, editingBody, note.revision, note.subject_ref)} onCancelEdit={() => { setEditingNoteID(""); setEditingBody(""); }} /> : <div className="detail-placeholder"><span className="inspection-mark"><Hash size={25} /></span><p className="eyebrow">{t("INSPECTOR")}</p><h2>{t("Select an item")}</h2><p>{t("Details, exact-storage status, tags, and notes appear here.")}</p></div>}</aside>}</main>
+    {hits.length ? <div className="result-list">{hits.map((hit, index) => <ResultRow key={hit.subject_ref ?? index} hit={hit} tags={hit.subject_ref ? tagsBySubject.get(hit.subject_ref) ?? [] : []} activeTags={activeTags} selected={selected?.subject_ref === hit.subject_ref} t={t} onSelect={() => void (viewMode === "path" ? openLibraryEntry(hit) : loadDetails(hit))} onTagFilter={toggleTagFilter} />)}</div> : <div className="empty-state"><span className="vault-sigil"><ShieldCheck size={35} /></span><h2>{t(showFirstSource ? "Start by adding a source" : showConfiguredSourceEmpty ? "Source configured, no saved content yet" : viewMode === "search" ? "No matches found" : viewMode === "tag" ? activeTags.length ? "No content matches these tags" : hasSystemFacets ? "No content matches these filters" : "No content matches these tags" : viewMode === "path" ? "This source path is empty" : "No content yet")}</h2><p>{t(showFirstSource ? "Add a server folder, review what will be stored, then confirm." : showConfiguredSourceEmpty ? "Recheck creates a reviewable plan. Existing saved content is not changed until you confirm." : viewMode === "search" ? "Try another name, path, metadata value, tag, note, or extracted phrase." : viewMode === "tag" ? activeTags.length ? "Choose fewer tags to broaden the result." : hasSystemFacets ? "Adjust or clear the system filters." : "Choose fewer tags to broaden the result." : viewMode === "path" ? "No captured items are recorded at this source path." : "Saved content will appear here independent of its original folders.")}</p>{showFirstSource && <button className="primary-button" onClick={(event) => openAdd(undefined, event.currentTarget)} disabled={!coreStorageReady}><Plus size={16} />{t("Add source")}</button>}</div>}
+    </section>{(selected || hits.length > 0) && <aside className="detail-column">{selected ? <Details hit={selected} annotations={annotations} representations={representations} descriptions={descriptions} descriptionsTruncated={descriptionsTruncated} annotationStatus={detailState.annotations} representationsStatus={detailState.representations} descriptionsStatus={detailState.descriptions} annotationMutationEnabled={annotationStorageReady && detailState.subjectRef === selected.subject_ref?.trim() && detailSubjectRef.current === selected.subject_ref?.trim() && detailState.annotations === "ready"} noteDraft={noteDraft} tagDraft={tagDraft} tagVocabulary={tagVocabulary} editingNoteID={editingNoteID} editingBody={editingBody} busy={busy} t={t} locale={locale} onBack={() => { detailRequestRef.current += 1; detailSubjectRef.current = ""; setDetailState({ subjectRef: "", annotations: "idle", representations: "idle", descriptions: "idle" }); setSelected(undefined); }} onDraft={setNoteDraft} onTagDraft={setTagDraft} onAddTag={() => void saveTag()} onDeleteTag={(tag) => void deleteTag(tag)} onAdd={() => void saveNote("", noteDraft)} onEdit={(note) => { setEditingNoteID(note.annotation_id); setEditingBody(note.body); }} onDeleteNote={(note) => void deleteNote(note)} onEditBody={setEditingBody} onSaveEdit={(note) => void saveNote(note.annotation_id, editingBody, note.revision, note.subject_ref)} onCancelEdit={() => { setEditingNoteID(""); setEditingBody(""); }} /> : <div className="detail-placeholder"><span className="inspection-mark"><Hash size={25} /></span><p className="eyebrow">{t("INSPECTOR")}</p><h2>{t("Select an item")}</h2><p>{t("Details, exact-storage status, tags, and notes appear here.")}</p></div>}</aside>}</main>
     {addOpen && <div className="drawer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) closeAdd(); }}><aside className="drawer source-drawer" role="dialog" aria-modal="true" aria-label={t(recheckSourceRef ? "Recheck source" : "Add source")}><div className="drawer-header"><div><p className="eyebrow">{t(recheckSourceRef ? "RECHECK SOURCE" : "NEW SOURCE")}</p><h2>{t(recheckSourceRef ? "Recheck source" : "Add source")}</h2></div><button className="icon-button" aria-label={t("Close add source")} onClick={closeAdd}><X size={17} /></button></div><p className="drawer-copy">{t(recheckSourceRef ? "Inspect this source again. Review the changes, then confirm to publish a new snapshot." : "Choose a server folder and preview its exact storage plan. Saving starts only after you confirm.")}</p>{isUnavailable ? <div className="drawer-inline-warning" role="alert"><AlertCircle size={15} />{t("Start the RestoreWeave service before previewing this source.")}</div> : !coreStorageReady ? <div className="drawer-inline-warning" role="alert"><AlertCircle size={15} />{coreStorageMessage}</div> : notice && <div className={`notice drawer-notice ${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"}>{notice.kind === "error" ? <AlertCircle size={16} /> : notice.kind === "warning" ? <Sparkles size={16} /> : <Check size={16} />}{notice.text}</div>}<div className="source-kind"><span className="source-kind-icon"><HardDrive size={19} /></span><div><strong>{t("Server folder")}</strong><small>{t("Local disk or mounted storage visible to RestoreWeave")}</small></div><em>{t("Supported now")}</em></div><div className="source-route" aria-label={t("Source storage route")}><div><span>{t("Read from")}</span><strong title={source.trim()}>{source.trim() || t("Enter a server path")}</strong><small>{t("Source files stay in place")}</small></div><ChevronRight size={17} /><div><span>{t("Store unique bytes in")}</span><strong title={repositoryPath}>{repositoryPath}</strong><small>{t("Exact whole-file deduplication")}</small></div></div><form className="stack-form" onSubmit={makePlan}><label>{t("Path on RestoreWeave host")}<input autoFocus value={source} onChange={(event) => { setSource(event.target.value); setPlan(undefined); }} placeholder={t("/data/to-add")} aria-invalid={sourceLooksRemote || undefined} /><small className="path-helper"><Server size={13} />{t("Use a local or mounted server path. This browser does not upload files or fetch URLs.")}</small>{sourceLooksRemote && <small className="source-inline-error"><AlertCircle size={13} />{t("Enter a server path, not a URL.")}</small>}</label><button className="primary-button" disabled={busy || isUnavailable || !coreStorageReady || !source.trim() || sourceLooksRemote}>{busy ? t("Inspecting...") : t("Preview storage plan")}</button></form><p className="planning-note">{t("Planning records the source and plan in the catalog, but does not write file bytes or publish a snapshot until you confirm.")}</p>{plan && <PlanCard plan={plan} busy={busy} coreStorageReady={coreStorageReady} t={t} onApply={() => void applyPlan()} />}</aside></div>}
-    {settingsOpen && <SettingsPanel section={settingsSection} configData={configData} draft={configDraft} loading={configLoading} dirty={configDirty} lexicalReady={lexicalReady} semanticReady={semanticReady} semanticBundleReady={semanticBundleReady} semanticBundleRestartRequired={semanticBundleRestartRequired} semanticInstallAvailable={semanticInstallAvailable} searchRebuildAvailable={searchRebuildAvailable} semanticInstall={semanticInstall} searchRebuild={searchRebuild} statusData={statusData} workspaceID={workspaceID} locale={locale} t={t} onLocale={setLocale} onSection={setSettingsSection} onClose={closeSettings} onField={setConfigField} onRepositoryProfile={setRepositoryProfile} onReload={reloadSettings} onSave={() => void saveSettings()} onInstallSemanticBundle={() => void installSemanticBundle()} onRebuildSearch={() => void rebuildSearch()} />}
+    {settingsOpen && <SettingsPanel section={settingsSection} configData={configData} draft={configDraft} loading={configLoading} dirty={configDirty} lexicalReady={lexicalReady} semanticReady={semanticReady} semanticBundleReady={semanticBundleReady} semanticBundleRestartRequired={semanticBundleRestartRequired} semanticBundleOperatorProvided={semanticBundleOperatorProvided} semanticInstallAvailable={semanticInstallAvailable} searchRebuildAvailable={searchRebuildAvailable} semanticInstall={semanticInstall} searchRebuild={searchRebuild} statusData={statusData} workspaceID={workspaceID} locale={locale} t={t} onLocale={setLocale} onSection={setSettingsSection} onClose={closeSettings} onField={setConfigField} onRepositoryProfile={setRepositoryProfile} onReload={reloadSettings} onSave={() => void saveSettings()} onInstallSemanticBundle={() => void installSemanticBundle()} onRebuildSearch={() => void rebuildSearch()} />}
     {restoreOpen && <div className="drawer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setRestoreOpen(false); }}><aside className="drawer" role="dialog" aria-modal="true" aria-label={t("Restore snapshot")}><div className="drawer-header"><div><p className="eyebrow">{t("RECOVER")}</p><h2>{t("Restore snapshot")}</h2></div><button className="icon-button" aria-label={t("Close restore")} onClick={() => setRestoreOpen(false)}><X size={17} /></button></div><p className="drawer-copy">{t("Choose an empty destination, inspect the plan, then restore and verify exact bytes.")}</p><form className="stack-form" onSubmit={makeRestorePlan}><label>{t("Destination folder")}<input autoFocus value={restoreDestination} onChange={(event) => { setRestoreDestination(event.target.value); setRestorePlan(undefined); }} placeholder={t("/data/restored-copy")} /></label><button className="primary-button" disabled={busy || !coreStorageReady || !restoreDestination.trim()}>{busy ? t("Inspecting...") : t("Preview restore")}</button></form>{restorePlan && <RestoreCard plan={restorePlan} busy={busy} coreStorageReady={coreStorageReady} t={t} onApply={() => void applyRestore()} />}</aside></div>}
   </div>;
 }
@@ -793,14 +884,23 @@ function App() {
 function ResultRow({ hit, tags, activeTags, selected, t, onSelect, onTagFilter }: { hit: SearchHit; tags: string[]; activeTags: string[]; selected: boolean; t: Translator; onSelect: () => void; onTagFilter: (tag: string) => void }) {
   const directory = hit.entry_type === "DIRECTORY";
   const matchedSegments = (hit.segments ?? []).filter((segment) => Boolean(segment.matched_text?.trim()));
-  const visibleSegments = matchedSegments.slice(0, MATCHED_SEGMENT_RENDER_LIMIT);
+  // The result list is a scan surface, not the full evidence viewer. Keep one
+  // short match here; the selected item's inspector remains the place for
+  // complete provenance, identity, and notes.
+  const visibleSegments = matchedSegments.slice(0, 1);
   const hiddenSegmentCount = matchedSegments.length - visibleSegments.length;
   const title = hit.name || t("Untitled subject");
   const path = hit.path || (hit.entry_type ? formatEntryType(hit.entry_type, t) : t("Protected content item"));
-  return <div className={`result-row ${selected ? "selected" : ""}`} role="group" aria-label={title} onClick={onSelect}><span className="file-icon">{directory ? <Folder size={20} /> : <FileSearch size={19} />}</span><span className="result-copy"><button type="button" className="result-open-copy" onClick={(event) => { event.stopPropagation(); onSelect(); }}><strong>{title}</strong><small>{path}{hit.logical_size != null && !directory ? ` · ${formatBytes(hit.logical_size)}` : ""}</small></button>{tags.length > 0 && <span className="row-tags" aria-label={t("Tags")}>{tags.map((tag) => { const active = activeTags.includes(tag); return <button type="button" className={`row-tag user-filter ${active ? "active" : ""}`} aria-pressed={active} title={t(active ? "Remove tag filter {{tag}}" : "Filter by tag {{tag}}", { tag })} aria-label={t(active ? "Remove tag filter {{tag}}" : "Filter by tag {{tag}}", { tag })} key={tag} onClick={(event) => { event.stopPropagation(); onTagFilter(tag); }}><Tag size={10} />{tag}</button>; })}</span>}{visibleSegments.map((segment, index) => { const metadata = searchSegmentMetadata(segment, t); const segmentKey = `${segment.semantic_segment_id || segment.source_id || segment.source_type || "segment"}-${segment.ordinal ?? index}-${index}`; return <span className="row-tags" aria-label={t("Matched segment provenance")} key={segmentKey}><span className="row-tag">{searchSegmentSourceLabel(segment, t)}</span><span className="row-tag">{previewUnicodeText(segment.matched_text)}</span>{metadata.map((value) => <span className="row-tag" key={value}>{value}</span>)}</span>; })}{hiddenSegmentCount > 0 && <span className="row-tags" aria-label={t("Matched segment provenance")}><span className="row-tag">{t("{{count}} more matched segments", { count: hiddenSegmentCount })}</span></span>}</span>{!directory && <IdentityWeave value={hit.content_id || hit.subject_ref} compact t={t} />}<span className="result-kind">{formatEntryType(hit.entry_type, t)}</span><ChevronRight className="row-arrow" size={17} /></div>;
+  const tagValue = hit.index_status?.tags;
+  const lexicalValue = hit.index_status?.lexical;
+  const semanticValue = hit.index_status?.semantic;
+  const tagStatus = formatCoverageStatus(tagValue, t);
+  const lexicalStatus = formatIndexStatus(lexicalValue, t);
+  const semanticStatus = formatIndexStatus(semanticValue, t);
+  return <div className={`result-row ${selected ? "selected" : ""}`} role="group" aria-label={title} onClick={onSelect}><span className="file-icon">{directory ? <Folder size={20} /> : <FileSearch size={19} />}</span><span className="result-copy"><button type="button" className="result-open-copy" onClick={(event) => { event.stopPropagation(); onSelect(); }}><strong>{title}</strong><small>{path}{hit.logical_size != null && !directory ? ` · ${formatBytes(hit.logical_size)}` : ""}</small></button>{visibleSegments.map((segment, index) => { const segmentKey = `${segment.semantic_segment_id || segment.source_id || segment.source_type || "segment"}-${segment.ordinal ?? index}-${index}`; return <span className="result-match" title={segment.matched_text} aria-label={t("Matched segment provenance")} key={segmentKey}><b>{searchSegmentSourceLabel(segment, t)}</b>{previewUnicodeText(segment.matched_text, 180)}</span>; })}{tags.length > 0 && <span className="row-tags" aria-label={t("Tags")}>{tags.map((tag) => { const active = activeTags.includes(tag); return <button type="button" className={`row-tag user-filter ${active ? "active" : ""}`} aria-pressed={active} title={t(active ? "Remove tag filter {{tag}}" : "Filter by tag {{tag}}", { tag })} aria-label={t(active ? "Remove tag filter {{tag}}" : "Filter by tag {{tag}}", { tag })} key={tag} onClick={(event) => { event.stopPropagation(); onTagFilter(tag); }}><Tag size={10} />{tag}</button>; })}</span>}<span className="result-status" aria-label={t("Index status")}><span className="result-status-item"><span className={`status-dot ${lexicalValue === "READY" ? "ready" : ""}`} />{t("Lexical")}: {lexicalStatus}</span><span className="result-status-item"><span className={`status-dot ${semanticValue === "READY" ? "ready" : ""}`} />{t("Semantic")}: {semanticStatus}</span><span className="result-status-item result-tag-status">{tagStatus}</span></span>{hiddenSegmentCount > 0 && <small className="result-more-hint">{t("{{count}} more matched segments", { count: hiddenSegmentCount })}</small>}</span><span className="result-kind">{formatEntryType(hit.entry_type, t)}</span><ChevronRight className="row-arrow" size={17} /></div>;
 }
 
-function SourceCard({ source, locale, t, busy, coreStorageReady, onView, onRecheck }: { source: SourceSummary; locale: Locale; t: Translator; busy: boolean; coreStorageReady: boolean; onView: () => void; onRecheck: () => void }) {
+function SourceCard({ source, locale, t, busy, coreStorageReady, onView, onRecheck }: { source: SourceSummary; locale: Locale; t: Translator; busy: boolean; coreStorageReady: boolean; onView: () => void; onRecheck: (trigger?: EventTarget | null) => void }) {
   const scan = source.latest_scan;
   const scanTime = scan?.finished_at || scan?.started_at;
   const issueCount = (scan?.failed_entries ?? 0) + (scan?.unstable_entries ?? 0) + (scan?.detection_failures ?? 0);
@@ -816,7 +916,7 @@ function SourceCard({ source, locale, t, busy, coreStorageReady, onView, onReche
     </div>
     <div className={`source-recovery ${source.latest_snapshot_ref ? "ready" : "pending"}`}><ArchiveRestore size={15} /><div><span>{t("Latest recovery point")}</span><strong>{source.latest_snapshot_ref ? t("Available") : t("Not published yet")}</strong></div></div>
     <p className="muted">{t("Recheck creates a reviewable plan. Existing saved content is not changed until you confirm.")}</p>
-    <footer className="source-card-actions"><button type="button" className="secondary-button compact" onClick={onRecheck} disabled={busy || !coreStorageReady || source.reachability !== "AVAILABLE"}><RefreshCw size={14} />{t("Recheck source")}</button><button type="button" className="secondary-button compact" onClick={onView} disabled={busy || !source.latest_namespace_root_id && !source.latest_snapshot_ref}><Folder size={14} />{t("View content")}</button></footer>
+      <footer className="source-card-actions"><button type="button" className="secondary-button compact" onClick={(event) => onRecheck(event.currentTarget)} disabled={busy || !coreStorageReady || source.reachability !== "AVAILABLE"}><RefreshCw size={14} />{t("Recheck source")}</button><button type="button" className="secondary-button compact" onClick={onView} disabled={busy || !source.latest_namespace_root_id && !source.latest_snapshot_ref}><Folder size={14} />{t("View content")}</button></footer>
   </article>;
 }
 
@@ -839,7 +939,7 @@ function sourceButtonLabel(root: BrowseRoot, roots: BrowseRoot[], t: Translator)
   return path;
 }
 
-function Details({ hit, annotations, representations, descriptions, annotationStatus, representationsStatus, descriptionsStatus, annotationMutationEnabled, noteDraft, tagDraft, tagVocabulary, editingNoteID, editingBody, busy, t, locale, onBack, onDraft, onTagDraft, onAddTag, onDeleteTag, onAdd, onEdit, onDeleteNote, onEditBody, onSaveEdit, onCancelEdit }: { hit: SearchHit; annotations: any[]; representations: any[]; descriptions: any[]; annotationStatus: DetailResourceStatus; representationsStatus: DetailResourceStatus; descriptionsStatus: DetailResourceStatus; annotationMutationEnabled: boolean; noteDraft: string; tagDraft: string; tagVocabulary: string[]; editingNoteID: string; editingBody: string; busy: boolean; t: Translator; locale: Locale; onBack: () => void; onDraft: (value: string) => void; onTagDraft: (value: string) => void; onAddTag: () => void; onDeleteTag: (tag: any) => void; onAdd: () => void; onEdit: (note: any) => void; onDeleteNote: (note: any) => void; onEditBody: (value: string) => void; onSaveEdit: (note: any) => void; onCancelEdit: () => void }) {
+function Details({ hit, annotations, representations, descriptions, descriptionsTruncated, annotationStatus, representationsStatus, descriptionsStatus, annotationMutationEnabled, noteDraft, tagDraft, tagVocabulary, editingNoteID, editingBody, busy, t, locale, onBack, onDraft, onTagDraft, onAddTag, onDeleteTag, onAdd, onEdit, onDeleteNote, onEditBody, onSaveEdit, onCancelEdit }: { hit: SearchHit; annotations: any[]; representations: any[]; descriptions: any[]; descriptionsTruncated: boolean; annotationStatus: DetailResourceStatus; representationsStatus: DetailResourceStatus; descriptionsStatus: DetailResourceStatus; annotationMutationEnabled: boolean; noteDraft: string; tagDraft: string; tagVocabulary: string[]; editingNoteID: string; editingBody: string; busy: boolean; t: Translator; locale: Locale; onBack: () => void; onDraft: (value: string) => void; onTagDraft: (value: string) => void; onAddTag: () => void; onDeleteTag: (tag: any) => void; onAdd: () => void; onEdit: (note: any) => void; onDeleteNote: (note: any) => void; onEditBody: (value: string) => void; onSaveEdit: (note: any) => void; onCancelEdit: () => void }) {
   const notes = annotations.filter((item) => item.kind === "NOTE" && !item.tombstoned);
   // A successor replaces a previous generated/imported note in the daily
   // view. The complete revision chain remains durable in the catalog.
@@ -892,14 +992,15 @@ function Details({ hit, annotations, representations, descriptions, annotationSt
     <div className="detail-title"><span className="file-icon large"><FileSearch size={23} /></span><div className="detail-title-copy"><p className="eyebrow">{t("CONTENT ITEM")}</p><h2>{hit.name || t("Untitled subject")}</h2><small>{formatEntryType(hit.entry_type, t)}</small></div><span className={`assurance-seal ${verifiedExact ? "" : "warning"}`}><ShieldCheck size={16} />{t(assuranceLabel)}</span></div>
     <div className="identity-band"><div className="identity-label"><span>{t("CONTENT WEAVE")}</span><small>{abbreviateIdentity(hit.content_id)}</small></div><IdentityWeave value={hit.content_id || hit.subject_ref} t={t} /></div>
     <dl className="facts"><div><dt>{t("Original path")}</dt><dd>{hit.path || t("Not recorded")}</dd></div><div><dt>{t("Content identity (SHA-256 + length)")}</dt><dd className="mono">{hit.content_id || t("Not available in this result")}</dd></div><div><dt>{t("Protection")}</dt><dd><span className={`inline-state ${verifiedExact ? "" : "warning"}`}>{verifiedExact ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}{t(exactState)}</span></dd></div>{exact && <div><dt>{t("Logical size")}</dt><dd>{formatBytes(exact.decoded_length)}</dd></div>}</dl>
-    <div className="detail-section tags-section"><div className="section-heading"><h3>{t("Tags")}</h3><span>{tags.length + systemTags.length}</span></div>
-      {annotationStatus !== "ready" ? <p className="muted" role="status">{detailStatus(annotationStatus)}</p> : <div className="tag-cloud">{systemTags.map((value) => <span className="tag-chip system" title={t("System field")} key={value}><Hash size={12} />{value}</span>)}{tags.map((tag) => <span className="tag-chip user" key={tag.annotation_id}><Tag size={12} />{tag.body}<button title={t("Remove tag")} aria-label={t("Remove tag {{tag}}", { tag: tag.body })} onClick={() => onDeleteTag(tag)} disabled={busy || !canMutateAnnotations}><X size={12} /></button></span>)}{!tags.length && !systemTags.length && <span className="muted">{t("No tags yet.")}</span>}</div>}
+    <div className="detail-section tags-section"><div className="section-heading"><h3>{t("Tags")}</h3><span>{tags.length}</span></div>
+      {annotationStatus !== "ready" ? <p className="muted" role="status">{detailStatus(annotationStatus)}</p> : <div className="tag-cloud">{systemTags.map((value) => <span className="tag-chip system" title={t("System field")} key={value}><Hash size={12} />{value}</span>)}{tags.map((tag) => <span className="tag-chip user" key={tag.annotation_id}><Tag size={12} />{tag.body}<button title={t("Remove tag")} aria-label={t("Remove tag {{tag}}", { tag: tag.body })} onClick={() => onDeleteTag(tag)} disabled={busy || !canMutateAnnotations}><X size={12} /></button></span>)}{!tags.length && <span className="muted">{t("No user tags yet.")}</span>}</div>}
       <div className="tag-composer"><input list="restoreweave-tag-vocabulary" aria-label={t("New tag")} value={tagDraft} onChange={(event) => onTagDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && tagDraft.trim() && canMutateAnnotations) { event.preventDefault(); onAddTag(); } }} placeholder={t("Add or reuse a tag")} disabled={!canMutateAnnotations} /><datalist id="restoreweave-tag-vocabulary">{suggestions.map((value) => <option value={value} key={value} />)}</datalist><button className="primary-button compact" onClick={onAddTag} disabled={busy || !canMutateAnnotations || !tagDraft.trim()}><Plus size={14} />{t("Add tag")}</button></div>
     </div>
     <div className="detail-section notes-section"><div className="section-heading"><h3>{t("Notes")}</h3><span>{combinedNotes.length}</span></div>
       <div className="notes-list">
         {annotationStatus !== "ready" && <p className="muted" role="status">{detailStatus(annotationStatus)}</p>}
         {descriptionsStatus === "loading" && <p className="muted" role="status">{t("Loading additional notes...")}</p>}
+        {descriptionsTruncated && descriptionsStatus === "ready" && <p className="muted" role="status">{t("Showing the latest notes; older note history is not loaded yet.")}</p>}
         {descriptionsStatus === "error" && <p className="muted" role="status">{t("Some imported or generated notes are unavailable.")}</p>}
         {(annotationStatus === "ready" || descriptionsStatus === "ready") && combinedNotes.length > 0 && combinedNotes.map(renderNote)}
         {annotationStatus === "ready" && descriptionsStatus === "ready" && combinedNotes.length === 0 && <p className="muted">{t("No notes yet.")}</p>}
@@ -938,7 +1039,7 @@ function PlanCard({ plan, busy, coreStorageReady, t, onApply }: { plan: any; bus
   </div>;
 }
 function RestoreCard({ plan, busy, coreStorageReady, t, onApply }: { plan: any; busy: boolean; coreStorageReady: boolean; t: Translator; onApply: () => void }) { return <div className="plan-card"><div className="plan-title"><div><p className="eyebrow">{t("REVIEW RESTORE")}</p><h3>{t(plan.state || "READY")}</h3></div><ArchiveRestore size={21} /></div><div className="plan-stats"><span><b>{plan.files ?? 0}</b>{t("files")}</span><span><b>{formatBytes(plan.bytes ?? 0)}</b>{t("verified output")}</span></div><div className="plan-outcomes"><span>{t("EXACT BYTES")}</span></div>{plan.executable && plan.state !== "SUCCEEDED" ? <button className="primary-button" onClick={onApply} disabled={busy || !coreStorageReady}>{t(busy ? "Restoring..." : "Confirm restore")}</button> : <p className="muted">{t("Restore is not executable.")}</p>}</div>; }
-function SettingsPanel({ section, configData, draft, loading, dirty, lexicalReady, semanticReady, semanticBundleReady, semanticBundleRestartRequired, semanticInstallAvailable, searchRebuildAvailable, semanticInstall, searchRebuild, statusData, workspaceID, locale, t, onLocale, onSection, onClose, onField, onRepositoryProfile, onReload, onSave, onInstallSemanticBundle, onRebuildSearch }: { section: SettingsSection; configData: any; draft: any; loading: boolean; dirty: boolean; lexicalReady: boolean; semanticReady: boolean; semanticBundleReady: boolean; semanticBundleRestartRequired: boolean; semanticInstallAvailable: boolean; searchRebuildAvailable: boolean; semanticInstall: ActionFeedback; searchRebuild: ActionFeedback; statusData: any; workspaceID: string; locale: Locale; t: Translator; onLocale: (locale: Locale) => void; onSection: (section: SettingsSection) => void; onClose: () => void; onField: (section: string, field: string, value: unknown) => void; onRepositoryProfile: (profile: string) => void; onReload: () => void; onSave: () => void; onInstallSemanticBundle: () => void; onRebuildSearch: () => void }) {
+function SettingsPanel({ section, configData, draft, loading, dirty, lexicalReady, semanticReady, semanticBundleReady, semanticBundleRestartRequired, semanticBundleOperatorProvided, semanticInstallAvailable, searchRebuildAvailable, semanticInstall, searchRebuild, statusData, workspaceID, locale, t, onLocale, onSection, onClose, onField, onRepositoryProfile, onReload, onSave, onInstallSemanticBundle, onRebuildSearch }: { section: SettingsSection; configData: any; draft: any; loading: boolean; dirty: boolean; lexicalReady: boolean; semanticReady: boolean; semanticBundleReady: boolean; semanticBundleRestartRequired: boolean; semanticBundleOperatorProvided: boolean; semanticInstallAvailable: boolean; searchRebuildAvailable: boolean; semanticInstall: ActionFeedback; searchRebuild: ActionFeedback; statusData: any; workspaceID: string; locale: Locale; t: Translator; onLocale: (locale: Locale) => void; onSection: (section: SettingsSection) => void; onClose: () => void; onField: (section: string, field: string, value: unknown) => void; onRepositoryProfile: (profile: string) => void; onReload: () => void; onSave: () => void; onInstallSemanticBundle: () => void; onRebuildSearch: () => void }) {
   const sections: Array<{ id: SettingsSection; label: string; icon: ReactNode }> = [
     { id: "storage", label: t("Storage & protection"), icon: <HardDrive size={17} /> },
     { id: "search", label: t("Search"), icon: <Search size={17} /> },
@@ -948,10 +1049,41 @@ function SettingsPanel({ section, configData, draft, loading, dirty, lexicalRead
   ];
   const config = draft ?? {};
   const semanticMode = config.semantic?.embedding_mode ?? "local";
+  const localProfile = String(config.semantic?.local_profile || "bge-small-zh-v1.5").trim() || "bge-small-zh-v1.5";
+  const pinnedLocalProfile = localProfile === "bge-small-zh-v1.5";
+  const localBundleUsable = pinnedLocalProfile || semanticBundleOperatorProvided;
+  const fixedBundleDownloadable = pinnedLocalProfile && !semanticBundleOperatorProvided;
   const actionBlocked = dirty || Boolean(configData?.restart_required);
-  const bundleInstalled = semanticBundleReady || semanticInstall.state === "SUCCEEDED";
-  const installDisabled = actionBlocked || !semanticInstallAvailable || semanticInstall.state === "RUNNING";
-  const rebuildVisible = semanticBundleReady && !semanticReady && !semanticBundleRestartRequired && semanticInstall.state !== "SUCCEEDED";
+  const restartRequired = Boolean(configData?.restart_required) || semanticBundleRestartRequired;
+  // A successful install action is not capability admission; only an
+  // admitted bundle may appear installed or usable.
+  const bundleInstalled = localBundleUsable && semanticBundleReady;
+  const bundleStateLabel = semanticInstall.state === "RUNNING"
+    ? "Installing..."
+    : !semanticBundleReady
+      ? (semanticBundleOperatorProvided ? "Operator-provided bundle unavailable or verification failed" : "Model not installed or verification failed")
+      : semanticBundleRestartRequired
+        ? "Installed; restart required"
+        : semanticReady
+          ? "Installed and running"
+          : "Model installed; index not ready";
+  const bundleNotice = !semanticBundleReady
+    ? (semanticBundleOperatorProvided
+      ? "The operator-provided local embedding bundle is unavailable or failed verification. Keyword search and exact recovery remain available."
+      : "The local BGE bundle is missing or failed verification. Keyword search and exact recovery remain available.")
+    : semanticBundleRestartRequired
+      ? "BGE installed. Restart the service to activate it."
+      : semanticBundleOperatorProvided
+        ? "This local embedding profile is supplied by the operator. RestoreWeave does not download or verify it here."
+        : bundleInstalled
+        ? "The verified local BGE bundle is installed. Semantic search becomes ready after a compatible index is opened or rebuilt."
+        : "The local BGE bundle is missing or failed verification. Keyword search and exact recovery remain available.";
+  const installDisabled = actionBlocked || !fixedBundleDownloadable || !semanticInstallAvailable || semanticInstall.state === "RUNNING";
+  // The rebuild operation always repairs the baseline lexical projection and
+  // opportunistically rebuilds semantic vectors when an admitted provider is
+  // present.  Keep the action visible even when BGE is not installed so a
+  // user can restore keyword search without first downloading a model.
+  const rebuildVisible = searchRebuildAvailable && Boolean(workspaceID) && !restartRequired && semanticInstall.state !== "SUCCEEDED";
   const rebuildDisabled = actionBlocked || !searchRebuildAvailable || !workspaceID || searchRebuild.state === "RUNNING";
   const closeButton = useRef<HTMLButtonElement>(null);
   const content = useRef<HTMLDivElement>(null);
@@ -971,11 +1103,11 @@ function SettingsPanel({ section, configData, draft, loading, dirty, lexicalRead
               <ConfigNotice kind="warning">{t("Changing a repository or catalog path does not move existing data. Restart only after the target has been prepared or migrated.")}</ConfigNotice>
             </section>}
             {section === "search" && <section className="config-section"><ConfigHeading eyebrow={t("DISCOVERY")} title={t("Search")} copy={t("Keyword search is always local. Semantic search uses the selected provider profile and disposable zvec generations.")} />
-              <ConfigGroup title={t("Provider health")} copy={t("See what is available now before changing the provider profile.")}><div className="running-label"><span />{t("Current running state")}</div><div className="provider-status"><span><Search size={17} />{t("Keyword search")}</span><strong className={lexicalReady ? "ready" : "offline"}>{t(lexicalReady ? "Ready" : "Offline")}</strong><span><Sparkles size={17} />{t("Semantic search")}</span><strong className={semanticReady ? "ready" : "offline"}>{t(semanticReady ? "Ready" : "Offline")}</strong></div></ConfigGroup>
+              <ConfigGroup title={t("Provider health")} copy={t("See what is available now before changing the provider profile.")}><div className="running-label"><span />{t("Current running state")}</div><div className="provider-status" aria-live="polite"><span><Search size={17} />{t("Keyword search")}</span><strong className={lexicalReady ? "ready" : "offline"}>{t(lexicalReady ? "Ready" : "Offline")}</strong><span><Sparkles size={17} />{t("Semantic search")}</span><strong className={semanticReady ? "ready" : "offline"}>{t(semanticReady ? "Ready" : "Offline")}</strong></div></ConfigGroup>
               <ConfigGroup title={t("Semantic provider")} copy={t("Select local BGE, an admitted online replacement, or a hybrid profile.")}><div className="running-label draft"><span />{t("Configuration to save")}</div><div className="segmented" role="group" aria-label={t("Embedding mode")}>{["local", "online", "hybrid"].map((mode) => <button className={semanticMode === mode ? "active" : ""} aria-pressed={semanticMode === mode} key={mode} onClick={() => onField("semantic", "embedding_mode", mode)}>{semanticMode === mode && <Check size={14} />}{t(mode === "local" ? "Local" : mode === "online" ? "Online" : "Hybrid")}</button>)}</div>
-              {semanticMode !== "online" && <div className={`model-card ${semanticReady ? "ready" : bundleInstalled ? "installed" : "offline"}`}><span className="model-icon"><Sparkles size={19} /></span><div><strong>BAAI/bge-small-zh-v1.5</strong><small>{t("Pinned local ONNX embedding profile")}</small></div><span className="model-state">{t(semanticInstall.state === "RUNNING" ? "Installing..." : semanticInstall.state === "SUCCEEDED" || semanticBundleRestartRequired ? "Installed; restart required" : semanticReady ? "Installed and running" : semanticBundleReady ? "Model installed; index not ready" : "Model not installed or verification failed")}</span><div className="model-meta"><span>zvec</span><span>{config.paths?.models || t("Models path not reported")}</span></div>{!bundleInstalled && <div className="model-action"><button type="button" className="primary-button compact" onClick={onInstallSemanticBundle} disabled={installDisabled}><DownloadIcon />{t(semanticInstall.state === "RUNNING" ? "Installing..." : "Download and verify fixed BGE (about 100MB model; full runtime is larger)")}</button>{actionBlocked && <small>{t(configData?.restart_required ? "Restart required before model actions." : "Save settings before model actions.")}</small>}{!semanticInstallAvailable && !actionBlocked && <small>{t("This build cannot install the local BGE bundle.")}</small>}</div>}{semanticInstall.message && <div className={`model-action-message ${semanticInstall.state === "FAILED" ? "error" : "success"}`}>{semanticInstall.message}</div>}{rebuildVisible && <div className="model-action"><button type="button" className="secondary-button compact" onClick={onRebuildSearch} disabled={rebuildDisabled}><RefreshCw size={14} className={searchRebuild.state === "RUNNING" ? "spin" : ""} />{t(searchRebuild.state === "RUNNING" ? "Rebuilding search indexes..." : "Rebuild search indexes")}</button>{actionBlocked && <small>{t(configData?.restart_required ? "Restart required before model actions." : "Save settings before model actions.")}</small>}{!workspaceID && <small>{t("Add a source before rebuilding search indexes.")}</small>}{!searchRebuildAvailable && !actionBlocked && workspaceID && <small>{t("Search rebuild is unavailable in this build.")}</small>}</div>}{searchRebuild.message && <div className={`model-action-message ${searchRebuild.state === "FAILED" || searchRebuild.state === "DEGRADED" ? "error" : "success"}`}>{searchRebuild.message}</div>}</div>}
+              {semanticMode !== "online" && <div className={`model-card ${semanticReady ? "ready" : bundleInstalled ? "installed" : "offline"}`}><span className="model-icon"><Sparkles size={19} /></span><div><strong>{pinnedLocalProfile ? "BAAI/bge-small-zh-v1.5" : localProfile}</strong><small>{t(semanticBundleOperatorProvided || !pinnedLocalProfile ? "Operator-provided local embedding profile" : "Pinned local ONNX embedding profile")}</small></div><span className="model-state" role="status" aria-live="polite">{t(bundleStateLabel)}</span><div className="model-meta"><span>zvec</span><span>{config.paths?.models || t("Models path not reported")}</span></div>{fixedBundleDownloadable && !bundleInstalled && <div className="model-action"><button type="button" className="primary-button compact" onClick={onInstallSemanticBundle} disabled={installDisabled}><DownloadIcon />{t(semanticInstall.state === "RUNNING" ? "Installing..." : "Download and verify fixed BGE (about 100MB model; full runtime is larger)")}</button>{actionBlocked && <small>{t(configData?.restart_required ? "Restart required before model actions." : "Save settings before model actions.")}</small>}{!semanticInstallAvailable && !actionBlocked && <small>{t("This build cannot install the local BGE bundle.")}</small>}</div>}{semanticInstall.message && <div className={`model-action-message ${semanticInstall.state === "FAILED" ? "error" : "success"}`}>{semanticInstall.message}</div>}{rebuildVisible && <div className="model-action"><button type="button" className="secondary-button compact" onClick={onRebuildSearch} disabled={rebuildDisabled}><RefreshCw size={14} className={searchRebuild.state === "RUNNING" ? "spin" : ""} />{t(searchRebuild.state === "RUNNING" ? "Rebuilding search indexes..." : "Rebuild search indexes")}</button>{actionBlocked && <small>{t(configData?.restart_required ? "Restart required before model actions." : "Save settings before model actions.")}</small>}{!workspaceID && <small>{t("Add a source before rebuilding search indexes.")}</small>}{!searchRebuildAvailable && !actionBlocked && workspaceID && <small>{t("Search rebuild is unavailable in this build.")}</small>}</div>}{searchRebuild.message && <div className={`model-action-message ${searchRebuild.state === "FAILED" || searchRebuild.state === "DEGRADED" ? "error" : "success"}`}>{searchRebuild.message}</div>}</div>}
               <div className="form-grid two"><ConfigReadonly label={t("Local embedding profile")} value={config.semantic?.local_profile || "bge-small-zh-v1.5"} t={t} /><ConfigReadonly label={t("Vector backend")} value={config.semantic?.vector_backend || "zvec"} t={t} />{semanticMode !== "local" && <><ConfigInput label={t("Online provider profile")} value={config.semantic?.online_profile} placeholder="installed-provider-profile" onChange={(value) => onField("semantic", "online_profile", value)} /><ConfigInput label={t("Credential reference")} value={config.semantic?.online_credential_ref} placeholder="keychain://restoreweave/provider" onChange={(value) => onField("semantic", "online_credential_ref", value)} /><ConfigToggle label={t("Send content without per-request confirmation")} copy={t("Keep off unless this provider and its data policy are explicitly trusted.")} checked={Boolean(config.semantic?.send_content_without_confirmation)} onChange={(value) => onField("semantic", "send_content_without_confirmation", value)} /></>}</div></ConfigGroup>
-              {semanticMode === "local" ? <ConfigNotice kind={bundleInstalled ? "info" : "warning"}>{t(semanticInstall.state === "SUCCEEDED" || semanticBundleRestartRequired ? "BGE installed. Restart the service to activate it." : bundleInstalled ? "The verified local BGE bundle is installed. Semantic search becomes ready after a compatible index is opened or rebuilt." : "The local BGE bundle is missing or failed verification. Keyword search and exact recovery remain available.")}</ConfigNotice> : <ConfigNotice kind="warning">{t("Online and hybrid are replacement-profile selections. This build will report semantic search unavailable unless that provider is separately installed and admitted.")}</ConfigNotice>}
+              {semanticMode === "local" ? <ConfigNotice kind={bundleInstalled ? "info" : "warning"}>{t(bundleNotice)}</ConfigNotice> : <ConfigNotice kind="warning">{t("Online and hybrid are replacement-profile selections. This build will report semantic search unavailable unless that provider is separately installed and admitted.")}</ConfigNotice>}
             </section>}
             {section === "descriptions" && <section className="config-section"><ConfigHeading eyebrow={t("NOTES")} title={t("Notes")} copy={t("Notes remain durable facts; optional AI notes are added only when requested.")} />
               <ConfigGroup title={t("Notes storage")} copy={t("Your notes are always available; imported, extracted, and AI-created text appears in this same Notes list.")}><div className="form-grid two"><ConfigToggle label={t("Keep additional notes")} copy={t("Keep imported, extracted, and generated text alongside your notes.")} checked={Boolean(config.descriptions?.enabled)} onChange={(value) => { onField("descriptions", "enabled", value); onField("descriptions", "generate", value ? "on_demand" : "disabled"); if (value) onField("descriptions", "retain_full_text", true); }} /><ConfigSelect label={t("Generation")} value={config.descriptions?.generate} onChange={(value) => onField("descriptions", "generate", value)} options={[{ value: "disabled", label: t("Disabled") }, { value: "on_demand", label: t("On demand") }]} disabled={!config.descriptions?.enabled} /><ConfigInput label={t("Provider profile")} value={config.descriptions?.provider_profile} placeholder="optional-describe-profile" onChange={(value) => onField("descriptions", "provider_profile", value)} disabled={!config.descriptions?.enabled || config.descriptions?.generate === "disabled"} /><ConfigInput label={t("Credential reference")} value={config.descriptions?.credential_ref} placeholder="keychain://restoreweave/notes" onChange={(value) => onField("descriptions", "credential_ref", value)} disabled={!config.descriptions?.enabled || config.descriptions?.generate === "disabled"} /><ConfigToggle label={t("Retain full text")} copy={t("Required when model-generated notes are enabled.")} checked={Boolean(config.descriptions?.retain_full_text)} onChange={(value) => onField("descriptions", "retain_full_text", value)} disabled={config.descriptions?.enabled && config.descriptions?.generate !== "disabled"} /></div></ConfigGroup>
@@ -1004,23 +1136,50 @@ function ConfigSelect({ label, value, options, disabled = false, onChange }: { l
 function ConfigReadonly({ label, value, t, mono = false, wide = false }: { label: string; value?: string; t: Translator; mono?: boolean; wide?: boolean }) { return <div className={`config-field readonly ${wide ? "wide" : ""}`}><span>{label}</span><strong className={mono ? "mono" : ""}>{value || t("Not reported")}</strong></div>; }
 function ConfigToggle({ label, copy, checked, disabled = false, onChange }: { label: string; copy: string; checked: boolean; disabled?: boolean; onChange: (value: boolean) => void }) { return <label className={`toggle-field ${disabled ? "disabled" : ""}`}><span className="toggle-copy"><strong>{label}</strong><small>{copy}</small></span><input type="checkbox" checked={checked} disabled={disabled} onChange={(event) => onChange(event.target.checked)} /><i /></label>; }
 function ConfigNotice({ kind = "info", children }: { kind?: "info" | "warning"; children: ReactNode }) { return <div className={`config-notice ${kind}`}>{children}</div>; }
+function CapacitySummary({ repository, t }: { repository?: any; t: Translator }) {
+  const measured = repository?.capacity_state === "AVAILABLE"
+    && ["capacity_total", "capacity_free", "capacity_used"].every((key) => typeof repository?.[key] === "number" && Number.isFinite(repository[key]));
+  const value = (key: string) => measured ? formatBytes(repository[key]) : t("Unknown");
+  const reason = typeof repository?.capacity_reason === "string" ? repository.capacity_reason.trim() : "";
+  return <span className={`capacity-summary ${measured ? "ready" : "degraded"}`} aria-label={t("Physical repository capacity")} title={reason || t("Physical repository capacity")}><HardDrive size={15} /><span className="capacity-summary-values"><b>{t("Capacity")}</b><small>{t("Total")}: {value("capacity_total")} · {t("Available")}: {value("capacity_free")} · {t("Used")}: {value("capacity_used")}</small>{!measured && reason && <small className="capacity-reason">{t("Reason")}: {reason}</small>}</span></span>;
+}
 function IdentityWeave({ value, t, compact = false }: { value?: string; t: Translator; compact?: boolean }) {
   const bars = identityBars(value, compact ? 12 : 32);
   return <span className={`identity-weave ${compact ? "compact" : ""}`} role="img" aria-label={t("Visual identity derived from the content SHA-256")}>{bars.map((bar, index) => <i className={`tone-${bar.tone}`} data-level={bar.level} key={index} />)}</span>;
 }
-function formatBytes(value: number) { if (!value) return "0 B"; if (value < 1024) return `${value} B`; if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`; return `${(value / 1024 / 1024).toFixed(1)} MB`; }
+function formatBytes(value: number) {
+  if (!value) return "0 B";
+  if (value < 1024) return `${value} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let scaled = value;
+  let unit = -1;
+  while (scaled >= 1024 && unit < units.length - 1) { scaled /= 1024; unit += 1; }
+  return `${scaled.toFixed(1)} ${units[unit]}`;
+}
 function looksLikeRemoteLocator(value: string) { return /^[a-z][a-z0-9+.-]*:\/\//i.test(value.trim()); }
 function formatEntryType(value: string | undefined, t: Translator) { return t(value ? value.replaceAll("_", " ") : "FILE"); }
 // Search provenance can contain extracted or generated text close to the
 // backend's payload limit. Keep the browser projection small while retaining
 // the complete segment in the API response and its immutable identifiers.
-const MATCHED_SEGMENT_RENDER_LIMIT = 3;
 const MATCHED_TEXT_PREVIEW_CODE_POINTS = 280;
 function previewUnicodeText(value: string | undefined, limit = MATCHED_TEXT_PREVIEW_CODE_POINTS) {
   const text = value?.trim() ?? "";
   const codePointLimit = Math.max(1, Math.floor(limit));
   const codePoints = Array.from(text);
   return codePoints.length > codePointLimit ? `${codePoints.slice(0, codePointLimit).join("")}…` : text;
+}
+function formatIndexStatus(value: string | undefined, t: Translator) {
+  const normalized = value?.trim().toUpperCase();
+  if (normalized === "READY") return t("READY");
+  if (normalized === "NOT_BUILT") return t("Not built");
+  if (normalized === "UNAVAILABLE") return t("Unavailable");
+  return t("Unknown");
+}
+function formatCoverageStatus(value: string | undefined, t: Translator) {
+  const normalized = value?.trim().toUpperCase();
+  if (normalized === "MARKED") return t("Marked");
+  if (normalized === "UNMARKED") return t("Unmarked");
+  return t("Unknown");
 }
 function descriptionKindLabel(kind: string | undefined, t: Translator) {
   const normalized = kind?.trim().toUpperCase();

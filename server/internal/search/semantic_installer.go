@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"time"
 )
 
 const (
@@ -78,6 +79,28 @@ type semanticBundleInstallDownload struct {
 	Size   uint64
 	Max    uint64
 }
+
+// SemanticBundleArchive is the independently retainable identity of an
+// offline bundle package. The archive digest covers the deterministic tar.gz
+// bytes; ProfileDigest covers the descriptor and all declared asset digests.
+// Neither digest is inferred from a URL or from the destination path.
+type SemanticBundleArchive struct {
+	Path          string `json:"path"`
+	SHA256        string `json:"sha256"`
+	Size          uint64 `json:"size"`
+	ProfileDigest string `json:"profile_digest"`
+	PlatformOS    string `json:"platform_os"`
+	PlatformArch  string `json:"platform_arch"`
+}
+
+const (
+	semanticInstallerArchivePrefix = ".restoreweave-semantic-archive-"
+	semanticInstallerArchiveMax    = uint64(512 << 20)
+	// The v1 package has exactly one manifest and the eleven fixed bundle
+	// assets. Rejecting more entries before extraction bounds zero-byte entry
+	// floods as well as the byte-size limit.
+	semanticInstallerArchiveMaxEntries = 12
+)
 
 // InstallDefaultSemanticBundle downloads and atomically installs the pinned
 // BGE text profile for the host. It has no first-query or startup download
@@ -1059,6 +1082,341 @@ func semanticInstallerAsset(path, source string) (SemanticBundleAsset, error) {
 // staged, atomic, recoverable publication path as the online installer.
 func InstallDefaultSemanticBundleFromDirectory(ctx context.Context, modelsRoot, sourceRoot string) (SemanticBundleAdmission, error) {
 	return installSemanticBundleFromDirectory(ctx, modelsRoot, sourceRoot, true)
+}
+
+// PackageSemanticBundleArchive creates a deterministic, self-contained offline
+// artifact from an admitted bundle. It reopens and verifies the source bundle
+// before writing any output, and refuses to replace an existing artifact.
+func PackageSemanticBundleArchive(ctx context.Context, destination, sourceRoot string, admission SemanticBundleAdmission) (SemanticBundleArchive, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return SemanticBundleArchive{}, err
+	}
+	destination, err := canonicalSemanticBundleArchivePath(destination)
+	if err != nil {
+		return SemanticBundleArchive{}, err
+	}
+	sourceRoot, err = canonicalSemanticBundleRoot(sourceRoot)
+	if err != nil {
+		return SemanticBundleArchive{}, err
+	}
+	if err := validateSemanticOfflineBundleSourceRoot(sourceRoot); err != nil {
+		return SemanticBundleArchive{}, err
+	}
+	if err := admission.Validate(); err != nil {
+		return SemanticBundleArchive{}, err
+	}
+	loaded, err := LoadSemanticBundle(sourceRoot)
+	if err != nil {
+		return SemanticBundleArchive{}, fmt.Errorf("%w: source admission: %v", ErrInvalidSemanticBundle, err)
+	}
+	if loaded.ProfileDigest != admission.ProfileDigest {
+		return SemanticBundleArchive{}, fmt.Errorf("%w: source profile differs from admission", ErrInvalidSemanticBundle)
+	}
+	for _, entry := range loaded.Descriptor.assets() {
+		if loaded.AssetDigests[entry.Name] != admission.AssetDigests[entry.Name] {
+			return SemanticBundleArchive{}, fmt.Errorf("%w: source asset %s differs from admission", ErrInvalidSemanticBundle, entry.Name)
+		}
+	}
+	if err := validateSemanticBundlePath(filepath.Dir(destination), true); err != nil {
+		return SemanticBundleArchive{}, fmt.Errorf("%w: archive parent: %v", ErrInvalidSemanticBundle, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		return SemanticBundleArchive{}, fmt.Errorf("%w: create archive parent: %v", ErrInvalidSemanticBundle, err)
+	}
+	if _, err := os.Lstat(destination); err == nil {
+		return SemanticBundleArchive{}, fmt.Errorf("%w: archive destination already exists", ErrInvalidSemanticBundle)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return SemanticBundleArchive{}, fmt.Errorf("%w: inspect archive destination: %v", ErrInvalidSemanticBundle, err)
+	}
+	temporary, err := semanticInstallerSiblingPath(filepath.Dir(destination), semanticInstallerArchivePrefix)
+	if err != nil {
+		return SemanticBundleArchive{}, fmt.Errorf("%w: reserve archive path: %v", ErrInvalidSemanticBundle, err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(temporary)
+		}
+	}()
+	output, err := os.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return SemanticBundleArchive{}, fmt.Errorf("%w: create archive: %v", ErrInvalidSemanticBundle, err)
+	}
+	digest := sha256.New()
+	gz := gzip.NewWriter(io.MultiWriter(output, digest))
+	// Fixed gzip metadata and tar metadata make repeated packaging byte-identical.
+	gz.Header.ModTime = time.Unix(0, 0)
+	gz.Header.OS = 255
+	tarWriter := tar.NewWriter(gz)
+	manifest, err := json.Marshal(loaded.Descriptor)
+	if err == nil {
+		err = writeSemanticBundleArchiveBytes(tarWriter, SemanticBundleManifestName, manifest)
+	}
+	entries := append([]semanticBundleAssetEntry(nil), loaded.Descriptor.assets()...)
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Asset.Path < entries[j].Asset.Path })
+	if err == nil {
+		for _, entry := range entries {
+			if writeErr := writeSemanticBundleArchiveAsset(ctx, tarWriter, sourceRoot, entry); writeErr != nil {
+				err = writeErr
+				break
+			}
+		}
+	}
+	if closeErr := tarWriter.Close(); err == nil {
+		err = closeErr
+	}
+	if closeErr := gz.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = output.Sync()
+	}
+	if closeErr := output.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return SemanticBundleArchive{}, fmt.Errorf("%w: write archive: %v", ErrInvalidSemanticBundle, err)
+	}
+	info, err := os.Stat(temporary)
+	if err != nil {
+		return SemanticBundleArchive{}, fmt.Errorf("%w: stat archive: %v", ErrInvalidSemanticBundle, err)
+	}
+	if info.Size() <= 0 || uint64(info.Size()) > semanticInstallerArchiveMax {
+		return SemanticBundleArchive{}, fmt.Errorf("%w: archive size %d is outside bounds", ErrInvalidSemanticBundle, info.Size())
+	}
+	if err := os.Rename(temporary, destination); err != nil {
+		return SemanticBundleArchive{}, fmt.Errorf("%w: publish archive: %v", ErrInvalidSemanticBundle, err)
+	}
+	if err := syncSemanticInstallerDirectory(filepath.Dir(destination)); err != nil {
+		return SemanticBundleArchive{}, fmt.Errorf("%w: persist archive: %v", ErrInvalidSemanticBundle, err)
+	}
+	committed = true
+	return SemanticBundleArchive{
+		Path: destination, SHA256: hex.EncodeToString(digest.Sum(nil)), Size: uint64(info.Size()),
+		ProfileDigest: loaded.ProfileDigest, PlatformOS: loaded.Descriptor.PlatformOS, PlatformArch: loaded.Descriptor.PlatformArch,
+	}, nil
+}
+
+func writeSemanticBundleArchiveBytes(writer *tar.Writer, name string, payload []byte) error {
+	if err := validateSemanticBundleAssetPath(name); err != nil && name != SemanticBundleManifestName {
+		return err
+	}
+	if err := writer.WriteHeader(&tar.Header{Name: name, Mode: 0o600, Typeflag: tar.TypeReg, Size: int64(len(payload)), Uid: 0, Gid: 0, ModTime: time.Unix(0, 0)}); err != nil {
+		return err
+	}
+	_, err := writer.Write(payload)
+	return err
+}
+
+func writeSemanticBundleArchiveAsset(ctx context.Context, writer *tar.Writer, root string, entry semanticBundleAssetEntry) error {
+	f, err := openBundleAsset(root, entry)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := writer.WriteHeader(&tar.Header{Name: entry.Asset.Path, Mode: 0o600, Typeflag: tar.TypeReg, Size: int64(entry.Asset.Size), Uid: 0, Gid: 0, ModTime: time.Unix(0, 0)}); err != nil {
+		return err
+	}
+	digest := sha256.New()
+	reader := &semanticBundleContextReader{ctx: ctx, reader: io.TeeReader(f, digest)}
+	written, err := io.Copy(writer, io.LimitReader(reader, int64(entry.Asset.Size)+1))
+	if err != nil {
+		return err
+	}
+	if written != int64(entry.Asset.Size) {
+		return fmt.Errorf("%w %s: read %d bytes, want %d", ErrSemanticBundleAsset, entry.Name, written, entry.Asset.Size)
+	}
+	if got := hex.EncodeToString(digest.Sum(nil)); got != entry.Asset.SHA256 {
+		return fmt.Errorf("%w %s: digest %s does not match declared %s", ErrSemanticBundleAsset, entry.Name, got, entry.Asset.SHA256)
+	}
+	return ctx.Err()
+}
+
+// InstallDefaultSemanticBundleFromArchive installs a pinned bundle from one
+// local tar.gz artifact. Extraction is bounded and contains no network or
+// ambient model lookup; the existing directory installer performs the final
+// pinned admission and atomic publication.
+func InstallDefaultSemanticBundleFromArchive(ctx context.Context, modelsRoot, archivePath string) (SemanticBundleAdmission, error) {
+	return installSemanticBundleFromArchive(ctx, modelsRoot, archivePath, true)
+}
+
+func installSemanticBundleFromArchive(ctx context.Context, modelsRoot, archivePath string, requirePinned bool) (SemanticBundleAdmission, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return SemanticBundleAdmission{}, err
+	}
+	archivePath, err := canonicalSemanticBundleArchivePath(archivePath)
+	if err != nil {
+		return SemanticBundleAdmission{}, err
+	}
+	if err := validateSemanticBundlePath(filepath.Dir(archivePath), false); err != nil {
+		return SemanticBundleAdmission{}, fmt.Errorf("%w: archive parent: %v", ErrInvalidSemanticBundle, err)
+	}
+	info, err := os.Lstat(archivePath)
+	if err != nil {
+		return SemanticBundleAdmission{}, fmt.Errorf("%w: archive: %v", ErrInvalidSemanticBundle, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return SemanticBundleAdmission{}, fmt.Errorf("%w: archive must be a regular non-symlink file", ErrInvalidSemanticBundle)
+	}
+	if info.Size() <= 0 || uint64(info.Size()) > semanticInstallerArchiveMax {
+		return SemanticBundleAdmission{}, fmt.Errorf("%w: archive size %d is outside bounds", ErrInvalidSemanticBundle, info.Size())
+	}
+	input, err := openBundleFileNoFollow(filepath.Dir(archivePath), filepath.Base(archivePath))
+	if err != nil {
+		return SemanticBundleAdmission{}, fmt.Errorf("%w: open archive without following symlink: %v", ErrInvalidSemanticBundle, err)
+	}
+	defer input.Close()
+	openedInfo, err := input.Stat()
+	if err != nil {
+		return SemanticBundleAdmission{}, fmt.Errorf("%w: stat opened archive: %v", ErrInvalidSemanticBundle, err)
+	}
+	if !openedInfo.Mode().IsRegular() || openedInfo.Size() != info.Size() {
+		return SemanticBundleAdmission{}, fmt.Errorf("%w: archive changed while opening", ErrInvalidSemanticBundle)
+	}
+	stage, err := os.MkdirTemp("", ".restoreweave-semantic-archive-install-")
+	if err != nil {
+		return SemanticBundleAdmission{}, fmt.Errorf("%w: stage archive: %v", ErrInvalidSemanticBundle, err)
+	}
+	defer os.RemoveAll(stage)
+	if err := extractSemanticBundleArchive(input, stage); err != nil {
+		return SemanticBundleAdmission{}, fmt.Errorf("%w: extract archive: %v", ErrInvalidSemanticBundle, err)
+	}
+	admission, err := LoadSemanticBundle(stage)
+	if err != nil {
+		return SemanticBundleAdmission{}, fmt.Errorf("%w: archive admission: %v", ErrInvalidSemanticBundle, err)
+	}
+	if err := validateSemanticBundleArchiveContents(stage, admission); err != nil {
+		return SemanticBundleAdmission{}, err
+	}
+	if requirePinned {
+		if err := ValidateDefaultSemanticBundleAdmission(admission); err != nil {
+			return SemanticBundleAdmission{}, fmt.Errorf("%w: archive is not the pinned default: %v", ErrInvalidSemanticBundle, err)
+		}
+	}
+	return installSemanticBundleFromDirectory(ctx, modelsRoot, stage, requirePinned)
+}
+
+func canonicalSemanticBundleArchivePath(path string) (string, error) {
+	if strings.TrimSpace(path) == "" || strings.TrimSpace(path) != path || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return "", fmt.Errorf("%w: archive path must be absolute and canonical", ErrInvalidSemanticBundle)
+	}
+	return path, nil
+}
+
+func extractSemanticBundleArchive(input *os.File, destination string) error {
+	if input == nil {
+		return errors.New("archive file is required")
+	}
+	gz, err := gzip.NewReader(io.LimitReader(input, int64(semanticInstallerArchiveMax)+1))
+	if err != nil {
+		return err
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	seen := map[string]bool{}
+	var total uint64
+	entryCount := 0
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		entryCount++
+		if entryCount > semanticInstallerArchiveMaxEntries {
+			return fmt.Errorf("archive contains more than %d entries", semanticInstallerArchiveMaxEntries)
+		}
+		name, err := semanticBundleArchivePath(hdr.Name)
+		if err != nil {
+			return err
+		}
+		if seen[name] {
+			return fmt.Errorf("duplicate archive path %q", name)
+		}
+		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+			return fmt.Errorf("archive entry %q is not a regular file", name)
+		}
+		if hdr.Size < 0 || uint64(hdr.Size) > semanticInstallerArchiveMax-total {
+			return fmt.Errorf("archive exceeds extraction limit")
+		}
+		target := filepath.Join(destination, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+			return err
+		}
+		f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.CopyN(f, tr, hdr.Size)
+		closeErr := f.Close()
+		if copyErr != nil || closeErr != nil {
+			return fmt.Errorf("extract %q: %v %v", name, copyErr, closeErr)
+		}
+		seen[name] = true
+		total += uint64(hdr.Size)
+	}
+	return nil
+}
+
+func semanticBundleArchivePath(name string) (string, error) {
+	original := name
+	name = strings.ReplaceAll(name, "\\", "/")
+	if strings.HasPrefix(name, "./") {
+		name = strings.TrimPrefix(name, "./")
+	}
+	if name == "" || name != filepath.ToSlash(filepath.Clean(filepath.FromSlash(name))) {
+		return "", fmt.Errorf("non-canonical archive path %q", original)
+	}
+	if _, err := semanticArchivePath(name); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+func validateSemanticBundleArchiveContents(root string, admission SemanticBundleAdmission) error {
+	expected := map[string]bool{SemanticBundleManifestName: true}
+	expectedDirs := map[string]bool{}
+	for _, entry := range admission.Descriptor.assets() {
+		expected[entry.Asset.Path] = true
+		for parent := filepath.Dir(filepath.FromSlash(entry.Asset.Path)); parent != "."; parent = filepath.Dir(parent) {
+			expectedDirs[filepath.ToSlash(parent)] = true
+		}
+	}
+	err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == root {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if info.IsDir() {
+			if !expectedDirs[rel] {
+				return fmt.Errorf("%w: unexpected archive directory %q", ErrInvalidSemanticBundle, rel)
+			}
+			return nil
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || !expected[rel] {
+			return fmt.Errorf("%w: unexpected archive file %q", ErrInvalidSemanticBundle, rel)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // installSemanticBundleFromDirectory is deliberately private so tests can use

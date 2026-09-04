@@ -133,7 +133,9 @@ func (d *Dispatcher) handleAnnotationUpsert(ctx context.Context, env command.Env
 		return annotationWriteResult(env, started, err)
 	}
 	if kind != sqlite.AnnotationProgress {
-		d.rebuildSearch(ctx, input.WorkspaceID)
+		if rebuildErr := d.rebuildSearch(ctx, input.WorkspaceID); rebuildErr != nil {
+			return degradedResult(env, started, command.AnnotationUpsertData{Annotation: projectAnnotation(record)}, "annotation saved, but search index is unavailable: "+rebuildErr.Error())
+		}
 	}
 	return succeeded(env, started, command.AnnotationUpsertData{Annotation: projectAnnotation(record)})
 }
@@ -169,7 +171,9 @@ func (d *Dispatcher) handleAnnotationDelete(ctx context.Context, env command.Env
 	if err != nil {
 		return annotationWriteResult(env, started, err)
 	}
-	d.rebuildSearch(ctx, input.WorkspaceID)
+	if rebuildErr := d.rebuildSearch(ctx, input.WorkspaceID); rebuildErr != nil {
+		return degradedResult(env, started, command.AnnotationUpsertData{Annotation: projectAnnotation(updated)}, "annotation deleted, but search index is unavailable: "+rebuildErr.Error())
+	}
 	return succeeded(env, started, command.AnnotationUpsertData{Annotation: projectAnnotation(updated)})
 }
 
@@ -335,7 +339,11 @@ func (d *Dispatcher) handleAnnotationImport(ctx context.Context, env command.Env
 		return annotationWriteResult(env, started, err)
 	}
 	for workspaceID := range workspaces {
-		d.rebuildSearch(ctx, workspaceID)
+		if rebuildErr := d.rebuildSearch(ctx, workspaceID); rebuildErr != nil {
+			return degradedResult(env, started, command.AnnotationExportData{
+				Schema: command.AnnotationBundleSchema, Annotations: imported, Conflict: policy,
+			}, "annotations imported, but search index is unavailable: "+rebuildErr.Error())
+		}
 	}
 	return succeeded(env, started, command.AnnotationExportData{
 		Schema:      command.AnnotationBundleSchema,
@@ -491,6 +499,16 @@ func (d *Dispatcher) handleFusedSearch(ctx context.Context, env command.Envelope
 			Hits:           component.Hits,
 		})
 	}
+	// A user-facing broker query may omit workspace_id. Indexer.Query can
+	// select the newest generation in that case, but authorization still needs
+	// the generation's workspace to resolve stable SubjectRefs. Derive it only
+	// from successful, generation-pinned components and require every such
+	// component to agree; never mix globally newest generations from different
+	// workspaces or guess a default workspace.
+	authorizedWorkspaceID, err := d.resolveFusedWorkspace(ctx, workspaceID, fused.Components)
+	if err != nil {
+		return catalogErrorResult(env, started, err)
+	}
 	hits := make([]search.Hit, 0, len(fused.Hits))
 	dimBySubject := map[string][]string{}
 	for _, hit := range fused.Hits {
@@ -503,7 +521,7 @@ func (d *Dispatcher) handleFusedSearch(ctx context.Context, env command.Envelope
 		FusedDimensions: dims,
 		ConstructAxes:   axes,
 		Components:      components,
-		Hits:            d.authorizeHits(ctx, workspaceID, "", hits, dimBySubject),
+		Hits:            d.authorizeHits(ctx, authorizedWorkspaceID, "", hits, dimBySubject),
 	}
 	if !search.FuseSucceeded(fused) {
 		return degradedResult(env, started, data, "all fused dimensions were unavailable; namespace, annotations, and restore are unaffected")
@@ -518,11 +536,50 @@ func (d *Dispatcher) handleFusedSearch(ctx context.Context, env command.Envelope
 	return succeeded(env, started, data)
 }
 
+func (d *Dispatcher) resolveFusedWorkspace(ctx context.Context, requested string, components []search.Component) (string, error) {
+	workspaceID := strings.TrimSpace(requested)
+	for _, component := range components {
+		if component.Status != string(command.StatusSucceeded) {
+			continue
+		}
+		generationID := strings.TrimSpace(component.GenerationID)
+		if generationID == "" {
+			return "", fmt.Errorf("fused component %q succeeded without an index generation", component.Dimension)
+		}
+		generation, err := d.store.GetIndexGeneration(ctx, generationID)
+		if err != nil {
+			return "", fmt.Errorf("resolve fused component %q generation: %w", component.Dimension, err)
+		}
+		// Query preserves compatibility with legacy generations whose dimension
+		// field is empty; a non-empty value must still match the component.
+		if (generation.Dimension != "" && generation.Dimension != component.Dimension) || strings.TrimSpace(generation.WorkspaceID) == "" {
+			return "", fmt.Errorf("fused component %q generation binding is invalid", component.Dimension)
+		}
+		if workspaceID == "" {
+			workspaceID = generation.WorkspaceID
+			continue
+		}
+		if workspaceID != generation.WorkspaceID {
+			return "", fmt.Errorf("fused component %q belongs to workspace %q, want %q", component.Dimension, generation.WorkspaceID, workspaceID)
+		}
+	}
+	return workspaceID, nil
+}
+
 func (d *Dispatcher) authorizeHits(ctx context.Context, workspaceID, fallbackWorkspace string, hits []search.Hit, dimensions map[string][]string) []command.SearchHitData {
-	authorized := make([]command.SearchHitData, 0, len(hits))
 	if workspaceID == "" {
 		workspaceID = fallbackWorkspace
 	}
+	// Resolve and authorize every hit before projecting it.  Index status is a
+	// read-only, best-effort projection; calculating it once for the resolved
+	// set keeps the API result consistent without making search depend on a
+	// disposable index or annotation read succeeding.
+	type resolvedHit struct {
+		hit         search.Hit
+		entry       sqlite.NamespaceEntry
+		displayPath string
+	}
+	resolved := make([]resolvedHit, 0, len(hits))
 	for _, hit := range hits {
 		entry, err := d.resolveSubject(ctx, workspaceID, hit.SubjectID)
 		if err != nil {
@@ -532,16 +589,32 @@ func (d *Dispatcher) authorizeHits(ctx context.Context, workspaceID, fallbackWor
 		if displayPath == "" {
 			displayPath = d.namespaceDisplayPath(ctx, workspaceID, entry)
 		}
+		resolved = append(resolved, resolvedHit{hit: hit, entry: entry, displayPath: displayPath})
+	}
+	var statuses map[string]*command.ContentIndexStatus
+	if len(resolved) > 0 && strings.TrimSpace(workspaceID) != "" {
+		entries := make([]sqlite.NamespaceEntry, 0, len(resolved))
+		for _, item := range resolved {
+			entries = append(entries, item.entry)
+		}
+		// Search must remain usable when an optional annotation/index
+		// projection is unavailable, so deliberately ignore this auxiliary
+		// lookup's error and leave the field absent in that case.
+		statuses, _ = d.contentIndexStatuses(ctx, workspaceID, entries)
+	}
+	authorized := make([]command.SearchHitData, 0, len(resolved))
+	for _, item := range resolved {
 		authorized = append(authorized, command.SearchHitData{
-			SubjectRef:    entry.SubjectRef,
-			EntryID:       entry.ID,
-			Path:          displayPath,
-			Name:          entry.DisplayName,
-			EntryType:     string(entry.EntryType),
-			ContentID:     entry.ContentID,
-			ConstructAxes: hit.ConstructAxes,
-			Dimensions:    dimensions[hit.SubjectID],
-			Segments:      projectSearchSegments(hit.Segments),
+			SubjectRef:    item.entry.SubjectRef,
+			EntryID:       item.entry.ID,
+			Path:          item.displayPath,
+			Name:          item.entry.DisplayName,
+			EntryType:     string(item.entry.EntryType),
+			ContentID:     item.entry.ContentID,
+			ConstructAxes: item.hit.ConstructAxes,
+			Dimensions:    dimensions[item.hit.SubjectID],
+			Segments:      projectSearchSegments(item.hit.Segments),
+			IndexStatus:   statuses[item.entry.SubjectRef],
 		})
 	}
 	return authorized
@@ -701,11 +774,12 @@ func (d *Dispatcher) upsertProgress(ctx context.Context, input annotationUpsertI
 	return d.store.GetAnnotation(ctx, input.WorkspaceID, id)
 }
 
-func (d *Dispatcher) rebuildSearch(ctx context.Context, workspaceID string) {
+func (d *Dispatcher) rebuildSearch(ctx context.Context, workspaceID string) error {
 	if d.search == nil {
-		return
+		return nil
 	}
-	_, _ = d.search.RebuildLatest(ctx, workspaceID)
+	_, err := d.search.RebuildLatest(ctx, workspaceID)
+	return err
 }
 
 func annotationWriteResult(env command.Envelope, started time.Time, err error) command.Result {

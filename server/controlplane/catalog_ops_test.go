@@ -77,6 +77,15 @@ func TestIndexLossDegradesSearchOnly(t *testing.T) {
 	if fileID == "" || fileSubject == "" {
 		t.Fatalf("quarterly-report.txt missing: %+v", childrenData.Entries)
 	}
+	var namespaceFileBeforeLoss command.NamespaceEntryData
+	for _, entry := range childrenData.Entries {
+		if entry.ID == fileID {
+			namespaceFileBeforeLoss = entry
+		}
+	}
+	if namespaceFileBeforeLoss.IndexStatus == nil || namespaceFileBeforeLoss.IndexStatus.Lexical != "READY" || namespaceFileBeforeLoss.IndexStatus.Tags != "UNMARKED" {
+		t.Fatalf("namespace index status before loss = %+v", namespaceFileBeforeLoss.IndexStatus)
+	}
 
 	tagged := dispatcher.Handle(ctx, mustEnvelope(t, command.OpAnnotationUpsert, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
@@ -130,6 +139,9 @@ func TestIndexLossDegradesSearchOnly(t *testing.T) {
 	if searchData.GenerationID == "" || searchData.ScoreSemantics != search.ScoreLexicalRank {
 		t.Fatalf("search generation/score = %+v", searchData)
 	}
+	if searchData.Hits[0].IndexStatus == nil || searchData.Hits[0].IndexStatus.Lexical != "READY" || searchData.Hits[0].IndexStatus.Tags != "MARKED" {
+		t.Fatalf("search hit index status = %+v, want lexical READY and tags MARKED", searchData.Hits[0].IndexStatus)
+	}
 
 	taggedHits := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
@@ -156,6 +168,21 @@ func TestIndexLossDegradesSearchOnly(t *testing.T) {
 	if degraded.Status != command.StatusDegraded || !hasReasonCode(degraded, ReasonCodeUnavailable) {
 		t.Fatalf("search after index loss = %q reasons=%+v", degraded.Status, degraded.Reasons)
 	}
+	statusAfterLoss := dispatcher.Handle(ctx, mustEnvelope(t, command.OpContentList, map[string]any{
+		"workspace_id": ingestData.WorkspaceID,
+	}))
+	if statusAfterLoss.Status != command.StatusSucceeded {
+		t.Fatalf("content.list after index loss = %q: %+v", statusAfterLoss.Status, statusAfterLoss.Reasons)
+	}
+	var statusAfterLossData command.ContentListData
+	if err := json.Unmarshal(statusAfterLoss.Data, &statusAfterLossData); err != nil {
+		t.Fatalf("decode content.list after index loss: %v", err)
+	}
+	if len(statusAfterLossData.Items) != 1 || statusAfterLossData.Items[0].IndexStatus == nil ||
+		statusAfterLossData.Items[0].IndexStatus.Lexical != "UNAVAILABLE" ||
+		statusAfterLossData.Items[0].IndexStatus.Tags != "MARKED" {
+		t.Fatalf("content status after index loss = %+v", statusAfterLossData.Items)
+	}
 
 	stillListed := dispatcher.Handle(ctx, mustEnvelope(t, command.OpNamespaceList, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
@@ -164,6 +191,19 @@ func TestIndexLossDegradesSearchOnly(t *testing.T) {
 	}))
 	if stillListed.Status != command.StatusSucceeded {
 		t.Fatalf("namespace after index loss = %q: %+v", stillListed.Status, stillListed.Reasons)
+	}
+	var afterLossData command.NamespaceListData
+	if err := json.Unmarshal(stillListed.Data, &afterLossData); err != nil {
+		t.Fatalf("decode namespace after index loss: %v", err)
+	}
+	var namespaceFileAfterLoss command.NamespaceEntryData
+	for _, entry := range afterLossData.Entries {
+		if entry.ID == fileID {
+			namespaceFileAfterLoss = entry
+		}
+	}
+	if namespaceFileAfterLoss.IndexStatus == nil || namespaceFileAfterLoss.IndexStatus.Lexical != "UNAVAILABLE" || namespaceFileAfterLoss.IndexStatus.Tags != "MARKED" {
+		t.Fatalf("namespace index status after loss = %+v", namespaceFileAfterLoss.IndexStatus)
 	}
 	annotations := dispatcher.Handle(ctx, mustEnvelope(t, command.OpAnnotationList, map[string]any{
 		"workspace_id": ingestData.WorkspaceID,
@@ -250,6 +290,9 @@ func TestIndexLossDegradesSearchOnly(t *testing.T) {
 	if len(recoveredData.Hits) != 1 || recoveredData.Hits[0].SubjectRef != fileSubject || recoveredData.Hits[0].EntryID != fileID {
 		t.Fatalf("recovered hits = %+v", recoveredData.Hits)
 	}
+	if recoveredData.Hits[0].IndexStatus == nil || recoveredData.Hits[0].IndexStatus.Lexical != "READY" || recoveredData.Hits[0].IndexStatus.Tags != "MARKED" {
+		t.Fatalf("recovered hit index status = %+v", recoveredData.Hits[0].IndexStatus)
+	}
 }
 
 func TestContentListProjectsPublishedWorkspaceWithoutDirectoryNavigation(t *testing.T) {
@@ -289,6 +332,27 @@ func TestContentListProjectsPublishedWorkspaceWithoutDirectoryNavigation(t *test
 	if item.SubjectRef == "" || item.Name != "report.txt" || item.Path != "docs/report.txt" ||
 		item.EntryType != "REGULAR_FILE" || item.ContentID == "" || item.LogicalSize == nil || *item.LogicalSize != 6 {
 		t.Fatalf("content item = %+v", item)
+	}
+	if item.IndexStatus == nil || item.IndexStatus.Tags != "UNMARKED" {
+		t.Fatalf("untagged content status = %+v, want UNMARKED", item.IndexStatus)
+	}
+	if item.IndexStatus.Lexical != "READY" || item.IndexStatus.Semantic != "UNAVAILABLE" {
+		t.Fatalf("initial content index status = %+v, want lexical READY and semantic UNAVAILABLE", item.IndexStatus)
+	}
+	tagged := dispatcher.Handle(ctx, mustEnvelope(t, command.OpAnnotationUpsert, map[string]any{
+		"workspace_id": ingest.WorkspaceID, "subject_ref": item.SubjectRef,
+		"kind": "TAG", "body": "reviewed",
+	}))
+	if tagged.Status != command.StatusSucceeded {
+		t.Fatalf("tag = %q: %+v", tagged.Status, tagged.Reasons)
+	}
+	listed = dispatcher.Handle(ctx, mustEnvelope(t, command.OpContentList, map[string]any{"workspace_id": ingest.WorkspaceID}))
+	var taggedData command.ContentListData
+	if err := json.Unmarshal(listed.Data, &taggedData); err != nil {
+		t.Fatalf("decode tagged content.list: %v", err)
+	}
+	if len(taggedData.Items) != 1 || taggedData.Items[0].IndexStatus == nil || taggedData.Items[0].IndexStatus.Tags != "MARKED" {
+		t.Fatalf("tagged content status = %+v, want MARKED", taggedData.Items)
 	}
 
 	// A valid subject/root from another workspace cannot be used to widen this

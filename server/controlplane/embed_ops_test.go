@@ -98,6 +98,31 @@ func TestSemanticMultimodalFuse(t *testing.T) {
 		t.Fatalf("default broker hits missing text subject: %+v", defaultData.Hits)
 	}
 
+	// The semantic fixture accepts its generation token directly. It is not a
+	// lexical term, so this exercises the broker's semantic-only union while
+	// omitting workspace_id as a normal user-facing query does.
+	semanticTokenQuery := processor.FixtureEmbedding("sem1", string(text))
+	semanticOnly := dispatcher.Handle(ctx, mustEnvelope(t, command.OpSearchQuery, map[string]any{
+		"query": semanticTokenQuery,
+	}))
+	if semanticOnly.Status != command.StatusSucceeded {
+		t.Fatalf("semantic-only default broker = %q: %+v", semanticOnly.Status, semanticOnly.Reasons)
+	}
+	var semanticOnlyData command.SearchQueryData
+	if err := json.Unmarshal(semanticOnly.Data, &semanticOnlyData); err != nil {
+		t.Fatalf("decode semantic-only default broker: %v", err)
+	}
+	if len(semanticOnlyData.Components) != 2 ||
+		semanticOnlyData.Components[0].Dimension != search.DimensionLexical || semanticOnlyData.Components[0].Status != string(command.StatusSucceeded) || semanticOnlyData.Components[0].Hits != 0 ||
+		semanticOnlyData.Components[1].Dimension != search.DimensionSemantic || semanticOnlyData.Components[1].Status != string(command.StatusSucceeded) || semanticOnlyData.Components[1].Hits == 0 {
+		t.Fatalf("semantic-only default broker components = %+v", semanticOnlyData.Components)
+	}
+	if len(semanticOnlyData.Hits) != 1 || semanticOnlyData.Hits[0].SubjectRef != textRef ||
+		len(semanticOnlyData.Hits[0].Dimensions) != 1 || semanticOnlyData.Hits[0].Dimensions[0] != search.DimensionSemantic ||
+		semanticOnlyData.Hits[0].EntryID == "" {
+		t.Fatalf("semantic-only default broker hit = %+v", semanticOnlyData.Hits)
+	}
+
 	lexicalGeneration, err := store.LatestIndexGeneration(ctx, ingestData.WorkspaceID, search.DimensionLexical)
 	if err != nil {
 		t.Fatalf("latest lexical generation: %v", err)

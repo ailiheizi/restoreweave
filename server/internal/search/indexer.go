@@ -50,11 +50,21 @@ type Indexer struct {
 	// generation looking healthy or silently serve it with an unhealthy
 	// provider. A later successful rebuild clears the latch.
 	semanticUnavailable atomic.Bool
+	// lexicalUnavailable is a process-local health latch for the latest
+	// rebuild attempt. An older FTS generation may remain readable, but it must
+	// not be advertised as current after a failed rebuild. The per-workspace
+	// map below is the authoritative view for control-plane status; the atomic
+	// fields remain as a compatibility fallback for low-level callers that do
+	// not provide a workspace.
+	lexicalUnavailable atomic.Bool
 	// semanticIndexReady is evidence that a real generation passed complete
 	// coverage verification for the current profile/binding. Provider embedding
 	// or a local query result alone is insufficient.
 	semanticIndexReady atomic.Bool
 	semanticFailure    atomic.Value
+	lexicalFailure     atomic.Value
+	lexicalHealthMu    sync.RWMutex
+	lexicalHealth      map[string]string
 
 	// semanticVerified records immutable backend coverage evidence per
 	// generation. It is process-local and disposable: durable generation
@@ -233,8 +243,23 @@ func generationBindingMatches(idx *Indexer, generation sqlite.IndexGeneration, d
 
 // Rebuild writes one new FTS5 database for the given namespace root and
 // records its path in the operational catalog.
-func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, namespaceRootID string) (sqlite.IndexGeneration, error) {
-	var generation sqlite.IndexGeneration
+func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, namespaceRootID string) (generation sqlite.IndexGeneration, rebuildErr error) {
+	// Keep the old generation in the catalog for recovery/debugging, while
+	// making the failed current rebuild visible to capability/status callers.
+	defer func() {
+		if idx == nil {
+			return
+		}
+		if rebuildErr != nil {
+			idx.lexicalUnavailable.Store(true)
+			idx.lexicalFailure.Store(rebuildErr.Error())
+			idx.setLexicalWorkspaceFailure(workspaceID, rebuildErr.Error())
+			return
+		}
+		idx.lexicalUnavailable.Store(false)
+		idx.lexicalFailure.Store("")
+		idx.setLexicalWorkspaceFailure(workspaceID, "")
+	}()
 	if idx == nil || idx.Store == nil || idx.Engine == nil {
 		return generation, errors.New("search indexer requires a catalog and engine")
 	}
@@ -657,6 +682,71 @@ func (idx *Indexer) Rebuild(ctx context.Context, workspaceID, snapshotRef, names
 	}
 	_, _ = idx.rebuildGraph(ctx, workspaceID, snapshotRef, namespaceRootID, byID, annotations, artifacts)
 	return generation, nil
+}
+
+func (idx *Indexer) setLexicalWorkspaceFailure(workspaceID, failure string) {
+	if idx == nil {
+		return
+	}
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return
+	}
+	idx.lexicalHealthMu.Lock()
+	defer idx.lexicalHealthMu.Unlock()
+	if idx.lexicalHealth == nil {
+		idx.lexicalHealth = make(map[string]string)
+	}
+	if failure == "" {
+		delete(idx.lexicalHealth, workspaceID)
+	} else {
+		idx.lexicalHealth[workspaceID] = failure
+	}
+}
+
+// LexicalUnavailableForWorkspace reports the health of the latest rebuild
+// attempt for one workspace. Search generations are workspace-scoped, so a
+// failure in one workspace must not make another workspace look unavailable.
+func (idx *Indexer) LexicalUnavailableForWorkspace(workspaceID string) bool {
+	if idx == nil {
+		return false
+	}
+	idx.lexicalHealthMu.RLock()
+	_, failed := idx.lexicalHealth[strings.TrimSpace(workspaceID)]
+	idx.lexicalHealthMu.RUnlock()
+	return failed
+}
+
+// LexicalFailureForWorkspace returns the latest lexical rebuild failure for
+// one workspace, if any.
+func (idx *Indexer) LexicalFailureForWorkspace(workspaceID string) string {
+	if idx == nil {
+		return ""
+	}
+	idx.lexicalHealthMu.RLock()
+	failure := idx.lexicalHealth[strings.TrimSpace(workspaceID)]
+	idx.lexicalHealthMu.RUnlock()
+	return strings.TrimSpace(failure)
+}
+
+// LexicalFailure returns the latest lexical rebuild failure, if any.
+func (idx *Indexer) LexicalFailure() string {
+	if idx == nil {
+		return ""
+	}
+	value := idx.lexicalFailure.Load()
+	if value == nil {
+		return ""
+	}
+	failure, _ := value.(string)
+	return strings.TrimSpace(failure)
+}
+
+// LexicalUnavailable reports whether the latest rebuild failed. It is a
+// disposable process health signal; the catalog remains the source of truth
+// for durable generations.
+func (idx *Indexer) LexicalUnavailable() bool {
+	return idx != nil && idx.lexicalUnavailable.Load()
 }
 
 // SemanticFailure returns the latest real-provider rebuild failure for
@@ -1591,7 +1681,7 @@ func (idx *Indexer) Query(ctx context.Context, req QueryRequest) (sqlite.IndexGe
 		return generation, nil, ErrUnavailable
 	}
 	if workspaceID := strings.TrimSpace(req.WorkspaceID); workspaceID != "" &&
-		strings.TrimSpace(generation.WorkspaceID) != "" && workspaceID != generation.WorkspaceID {
+		workspaceID != strings.TrimSpace(generation.WorkspaceID) {
 		// A pinned generation is still scoped to the workspace that published
 		// it. Do not let an internal caller use a valid index from another
 		// workspace merely because it knows the generation ID.

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,6 +42,111 @@ func TestBuildCorpusManifestIsDeterministicAndUnicodeSafe(t *testing.T) {
 	}
 	if a.Entries[0].SHA256 != a.Entries[1].SHA256 || a.Entries[0].Bytes != a.Entries[1].Bytes {
 		t.Fatalf("duplicate content was not represented independently: %+v", a.Entries)
+	}
+}
+
+func TestOperatorCorpusManifestRoundTripAndExactVerification(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("alpha"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "nested", "b.bin"), []byte("beta"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	expected, err := BuildCorpusManifest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(t.TempDir(), "operator.json")
+	if err := writeJSONFile(manifestPath, expected); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := ReadCorpusManifest(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !manifestEqual(expected, loaded) {
+		t.Fatalf("manifest changed on read: %#v %#v", expected, loaded)
+	}
+	if err := VerifyCorpusManifest(root, loaded); err != nil {
+		t.Fatalf("valid operator manifest rejected: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("tampered"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyCorpusManifest(root, loaded); err == nil {
+		t.Fatal("tampered corpus accepted")
+	}
+}
+
+func TestReadCorpusManifestRejectsUnknownFieldsAndBadCanonicalDigest(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "item"), []byte("item"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := BuildCorpusManifest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknown := filepath.Join(t.TempDir(), "unknown.json")
+	if err := os.WriteFile(unknown, []byte(`{"schema":"restoreweave.corpus-manifest.v1","entries":[],"digest":"x","extra":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadCorpusManifest(unknown); err == nil {
+		t.Fatal("manifest with unknown field accepted")
+	}
+	bad := filepath.Join(t.TempDir(), "bad.json")
+	manifest.Digest = "0000000000000000000000000000000000000000000000000000000000000000"
+	if err := writeJSONFile(bad, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadCorpusManifest(bad); err == nil {
+		t.Fatal("manifest with bad canonical digest accepted")
+	}
+}
+
+func TestReadCorpusManifestRejectsNonCanonicalPathsAndUppercaseSHA(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "item"), []byte("item"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := BuildCorpusManifest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.Entries[0].Path = "./item"
+	digest, err := manifestDigest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.Digest = digest
+	pathManifest := filepath.Join(t.TempDir(), "path.json")
+	if err := writeJSONFile(pathManifest, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadCorpusManifest(pathManifest); err == nil {
+		t.Fatal("manifest with non-canonical path accepted")
+	}
+
+	manifest, err = BuildCorpusManifest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.Entries[0].SHA256 = strings.ToUpper(manifest.Entries[0].SHA256)
+	digest, err = manifestDigest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.Digest = digest
+	shaManifest := filepath.Join(t.TempDir(), "sha.json")
+	if err := writeJSONFile(shaManifest, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadCorpusManifest(shaManifest); err == nil {
+		t.Fatal("manifest with uppercase sha accepted")
 	}
 }
 
@@ -203,4 +309,30 @@ func TestCandidateEvidenceDeclaresCatalogUnmeasured(t *testing.T) {
 		}
 	}
 	t.Fatalf("candidate evidence omitted unmeasured catalog: %+v", evidence.Unmeasured)
+}
+
+func TestWriteCorpusManifestSummaryBindsDigestAndLogicalBytes(t *testing.T) {
+	manifest := CorpusManifest{
+		Schema: corpusManifestSchema,
+		Digest: "manifest-digest",
+		Entries: []CorpusEntry{
+			{Path: "a", Bytes: 7, SHA256: "a"},
+			{Path: "b", Bytes: 11, SHA256: "b"},
+		},
+	}
+	path := filepath.Join(t.TempDir(), "manifest.json")
+	var output bytes.Buffer
+	if err := writeCorpusManifestSummary(path, manifest, &output); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := output.String(), "corpus_manifest_digest=manifest-digest\ncorpus_files=2\nlogical_bytes=18\n"; got != want {
+		t.Fatalf("summary = %q, want %q", got, want)
+	}
+	written, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(written, []byte(`"digest": "manifest-digest"`)) {
+		t.Fatalf("written manifest omitted digest: %s", written)
+	}
 }

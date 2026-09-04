@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,6 +15,23 @@ import (
 	"github.com/ailiheizi/restoreweave/server/internal/store/sqlite"
 	"github.com/ailiheizi/restoreweave/server/testutil"
 )
+
+type capacityErrorDriver struct{ repository.Driver }
+
+func (d capacityErrorDriver) RepositoryProfile() repository.ProfileDescription {
+	return repository.DescribeProfile(d.Driver)
+}
+
+func (d capacityErrorDriver) DescribeCapabilities() repository.CapabilityProfile {
+	if reporter, ok := d.Driver.(repository.CapabilityReporter); ok {
+		return reporter.DescribeCapabilities()
+	}
+	return repository.CapabilityProfile{}
+}
+
+func (d capacityErrorDriver) DescribeHealthAndCapacity(context.Context) (repository.HealthProfile, error) {
+	return repository.HealthProfile{}, errors.New("capacity probe failed in test")
+}
 
 func newTestDispatcher(t *testing.T) (*Dispatcher, *sqlite.Store) {
 	t.Helper()
@@ -281,6 +299,34 @@ func TestDispatcherStatusGet(t *testing.T) {
 	}
 	if data.Repository != nil {
 		t.Fatalf("repository present without exact lane: %+v", data.Repository)
+	}
+}
+
+func TestDispatcherStatusPreservesCapacityProbeError(t *testing.T) {
+	ctx := context.Background()
+	store := testutil.OpenStore(t, ":memory:")
+	base, err := repository.OpenDir(filepath.Join(t.TempDir(), "repository"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatcher := NewDispatcher(store, "catalog.sqlite", "/tmp/rw.sock", WithExact(&exact.Service{
+		Store: store,
+		Repo:  capacityErrorDriver{Driver: base},
+	}))
+	result := dispatcher.Handle(ctx, mustEnvelope(t, command.OpStatusGet, map[string]any{}))
+	if result.Status != command.StatusSucceeded {
+		t.Fatalf("status = %q: %+v", result.Status, result.Reasons)
+	}
+	var data command.StatusData
+	if err := json.Unmarshal(result.Data, &data); err != nil {
+		t.Fatal(err)
+	}
+	if data.Repository == nil || data.Repository.CapacityState != repository.CapacityUnknown ||
+		data.Repository.CapacityReason != "capacity probe failed in test" {
+		t.Fatalf("repository capacity = %+v, want UNKNOWN with probe reason", data.Repository)
+	}
+	if !data.Repository.OK {
+		t.Fatal("capacity probe error incorrectly made repository unavailable")
 	}
 }
 

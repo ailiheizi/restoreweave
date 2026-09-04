@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -49,18 +48,13 @@ func (d *puregoZvecGenerationDriver) ZvecReady(libraryPath, libraryDigest string
 	if err != nil || actual != libraryDigest {
 		return false
 	}
-	stagingDir, err := os.MkdirTemp("", "restoreweave-zvec-readiness-*")
-	if err != nil {
-		return false
-	}
-	defer os.RemoveAll(stagingDir)
-	stagedPath, err := stageZvecLibrary(ZvecGenerationSpec{
-		Path: filepath.Join(stagingDir, "generation"), LibraryPath: libraryPath, LibraryDigest: libraryDigest,
-	})
-	if err != nil {
-		return false
-	}
-	err = withExplicitZvecLibrary(stagedPath, libraryDigest, func() error {
+	// Readiness may run before the first generation build (for example while
+	// capability.list is served). zvec keeps the loaded native library for the
+	// lifetime of the process, so loading a temporary staged copy here would
+	// leave the process pointing at a path that is removed on return. Bind the
+	// already digest-verified, persistent bundle path instead; generation
+	// writes remain staged by prepare/build below.
+	err = withExplicitZvecLibrary(libraryPath, libraryDigest, func() error {
 		if !zvec.IsInitialized() {
 			if err := zvec.Initialize(nil); err != nil {
 				return err

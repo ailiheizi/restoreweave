@@ -6,9 +6,11 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func testKeyProvider(keys map[string][]byte) KeyProvider {
@@ -203,5 +205,168 @@ func TestEncryptedZstdRelocationAndKeyRotationCopyForward(t *testing.T) {
 	}
 	if _, err := OpenProfileReadOnlyWithKeyProvider(RepositoryProfileLocalZstdEncryptedV1, moved, providerOne); !errors.Is(err, ErrKeyUnavailable) {
 		t.Fatalf("old key provider open error = %v, want ErrKeyUnavailable", err)
+	}
+}
+
+func TestEncryptedZstdMigrationProcessCrashBeforePublishCanRetryWithCleanReaders(t *testing.T) {
+	ctx := context.Background()
+	keyOne := bytes.Repeat([]byte{0x11}, 32)
+	keyTwo := bytes.Repeat([]byte{0x22}, 32)
+	providerOne := testKeyProvider(map[string][]byte{"key://one": keyOne})
+	providerTwo := testKeyProvider(map[string][]byte{"key://two": keyTwo})
+	root := t.TempDir()
+	sourceRoot := filepath.Join(root, "source")
+	targetRoot := filepath.Join(root, "target")
+	markerPath := filepath.Join(root, "after-payload.marker")
+	source, err := OpenEncryptedZstdDir(sourceRoot, "key://one", providerOne)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("encrypted process crash migration payload\n"), 128)
+	receipt, err := source.Place(ctx, bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := source.PlaceRecord(ctx, RecordPublicationCommit, strings.NewReader(`{"commit":"encrypted-crash"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestEncryptedZstdMigrationCrashHelperProcess")
+	cmd.Env = append(os.Environ(),
+		"RW_ENCRYPTED_MIGRATION_CRASH_HELPER=1",
+		"RW_ENCRYPTED_MIGRATION_SOURCE_ROOT="+sourceRoot,
+		"RW_ENCRYPTED_MIGRATION_TARGET_ROOT="+targetRoot,
+		"RW_ENCRYPTED_MIGRATION_MARKER="+markerPath,
+	)
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	waitComplete := false
+	defer func() {
+		if !waitComplete {
+			_ = cmd.Process.Kill()
+			<-done
+		}
+	}()
+	deadline := time.NewTimer(15 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer deadline.Stop()
+	defer ticker.Stop()
+	for {
+		select {
+		case err := <-done:
+			t.Fatalf("encrypted migration helper exited before marker: %v (%s)", err, output.String())
+		case <-ticker.C:
+			if _, err := os.Stat(markerPath); err == nil {
+				goto crash
+			} else if !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("stat encrypted migration marker: %v", err)
+			}
+		case <-deadline.C:
+			_ = cmd.Process.Kill()
+			<-done
+			waitComplete = true
+			t.Fatal("timed out waiting for encrypted migration crash marker")
+		}
+	}
+
+crash:
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err == nil {
+		t.Fatal("encrypted migration helper unexpectedly exited cleanly")
+	}
+	waitComplete = true
+	if _, err := os.Lstat(targetRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("crashed encrypted migration published target: %v", err)
+	}
+
+	verifyAndRead := func(label string, repo DriverRecord) {
+		t.Helper()
+		if err := repo.Verify(ctx, receipt.ContentID); err != nil {
+			t.Fatalf("%s payload verify: %v", label, err)
+		}
+		body, err := repo.Open(ctx, receipt.ContentID)
+		if err != nil {
+			t.Fatalf("%s payload open: %v", label, err)
+		}
+		got, readErr := io.ReadAll(body)
+		closeErr := body.Close()
+		if readErr != nil || closeErr != nil || !bytes.Equal(got, payload) {
+			t.Fatalf("%s payload read: bytes=%d readErr=%v closeErr=%v", label, len(got), readErr, closeErr)
+		}
+		if err := repo.VerifyRecord(ctx, record); err != nil {
+			t.Fatalf("%s record verify: %v", label, err)
+		}
+	}
+
+	sourceReader, err := OpenProfileReadOnlyWithKeyProvider(RepositoryProfileLocalZstdEncryptedV1, sourceRoot, providerOne)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifyAndRead("source after crash", sourceReader)
+	if _, err := MigrateProfileWithKeyProviders(ctx, RepositoryProfileLocalZstdEncryptedV1, sourceRoot, RepositoryProfileLocalZstdEncryptedV1, targetRoot, "key://two", providerOne, providerTwo); err != nil {
+		t.Fatalf("retry encrypted migration: %v", err)
+	}
+	targetReader, err := OpenProfileReadOnlyWithKeyProvider(RepositoryProfileLocalZstdEncryptedV1, targetRoot, providerTwo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifyAndRead("target after retry", targetReader)
+	if sourceReader.RepositoryIdentity() != targetReader.RepositoryIdentity() {
+		t.Fatalf("repository identity changed: source=%q target=%q", sourceReader.RepositoryIdentity(), targetReader.RepositoryIdentity())
+	}
+	sourceReader, err = OpenProfileReadOnlyWithKeyProvider(RepositoryProfileLocalZstdEncryptedV1, sourceRoot, providerOne)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifyAndRead("source reopened after retry", sourceReader)
+	if _, err := OpenProfileReadOnlyWithKeyProvider(RepositoryProfileLocalZstdEncryptedV1, targetRoot, providerOne); !errors.Is(err, ErrKeyUnavailable) {
+		t.Fatalf("old key provider target open error = %v, want ErrKeyUnavailable", err)
+	}
+	wrongReader, err := OpenProfileReadOnlyWithKeyProvider(RepositoryProfileLocalZstdEncryptedV1, targetRoot, testKeyProvider(map[string][]byte{"key://two": bytes.Repeat([]byte{0x23}, 32)}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wrongReader.Verify(ctx, receipt.ContentID); !errors.Is(err, ErrKeyMismatch) {
+		t.Fatalf("wrong key target verify error = %v, want ErrKeyMismatch", err)
+	}
+	if body, err := wrongReader.Open(ctx, receipt.ContentID); err == nil {
+		decrypted, readErr := io.ReadAll(body)
+		_ = body.Close()
+		if readErr == nil || bytes.Contains(decrypted, payload) {
+			t.Fatalf("wrong key target returned plaintext: %q read=%v", decrypted, readErr)
+		}
+	}
+}
+
+func TestEncryptedZstdMigrationCrashHelperProcess(t *testing.T) {
+	if os.Getenv("RW_ENCRYPTED_MIGRATION_CRASH_HELPER") != "1" {
+		return
+	}
+	keyOne := bytes.Repeat([]byte{0x11}, 32)
+	keyTwo := bytes.Repeat([]byte{0x22}, 32)
+	providerOne := testKeyProvider(map[string][]byte{"key://one": keyOne})
+	providerTwo := testKeyProvider(map[string][]byte{"key://two": keyTwo})
+	_, err := migrateProfileWithHooks(context.Background(), RepositoryProfileLocalZstdEncryptedV1,
+		os.Getenv("RW_ENCRYPTED_MIGRATION_SOURCE_ROOT"), RepositoryProfileLocalZstdEncryptedV1,
+		os.Getenv("RW_ENCRYPTED_MIGRATION_TARGET_ROOT"), "key://two", providerOne, providerTwo, migrationHooks{
+			afterPayload: func(string) error {
+				if err := os.WriteFile(os.Getenv("RW_ENCRYPTED_MIGRATION_MARKER"), []byte("after-payload\n"), 0o600); err != nil {
+					return err
+				}
+				time.Sleep(time.Hour)
+				return nil
+			},
+		})
+	if err != nil {
+		t.Fatalf("encrypted migration crash helper: %v", err)
 	}
 }

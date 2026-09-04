@@ -1,6 +1,7 @@
 # RestoreWeave browser client
 
-This directory is part of the `v0.1.0-prealpha.1` core preview.
+This directory is part of the unreleased core preview on `main` after
+`v0.1.0-prealpha.1`.
 
 This is a small React/Vite client for the optional loopback API. It contains
 no storage logic: all requests are `command.Envelope` calls to

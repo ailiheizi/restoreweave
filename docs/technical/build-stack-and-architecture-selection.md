@@ -272,6 +272,44 @@ This table maps every meaningful upstream into the seam it serves and the exact 
 - **Consequences:** The daily workflow stays simple while source attribution, acceptance, immutable history, indexing, export, and catalog-free recovery remain intact. API and CLI clients can still use the typed record-specific commands when they need full provenance. New UI work must extend the single Notes projection rather than reintroduce parallel labels.
 - **Rejected alternative:** Physically merging every text into one record or copying AI text into annotations would duplicate bodies and discard source/producer/acceptance semantics, making search and recovery less trustworthy. Showing two user-facing concepts would add complexity without adding capability.
 
+### ADR-009: Storage schemes and derived index status
+
+- **Status:** Accepted as a product direction. The read-only capacity report
+  and per-dimension index-status projection are implemented and tested; the
+  named multi-storage scheme and production repository selection remain
+  deferred until the Phase 5 repository profile is qualified. This record does
+  not authorize a new public storage schema by itself.
+- **Context:** Operators need an easy way to choose where a new file is kept,
+  understand which exact-saving rule applies, see available disk space, and
+  tell which optional analyses have run. Treating location, repository engine,
+  deduplication, compression, and every index as unrelated switches would make
+  the small product harder to use and could imply unsafe cross-engine mixing.
+- **Decision:** Model the future user-facing choice as one named **storage
+  scheme** bundling location, `RepositoryDriver` profile, exact deduplication
+  policy, and compression. A default scheme is selected for new ingest; an
+  explicit ingest input may choose another configured scheme. The core
+  identity remains SHA-256 plus logical length, and each scheme owns its own
+  physical placements. Capacity is an optional capability report with total,
+  free, measured-at, and unknown/error states; an unknown value does not block
+  exact protection. Keep one SQLite catalog.
+- **Decision (derived indexes):** Keyword/structured search is the baseline.
+  BGE remains the local text semantic profile, but optional analysis never
+  blocks exact saving. Future CLIP/SigLIP image and music-feature dimensions
+  have separate models, spaces, and generations and may be fused only at the
+  stable-subject result layer. Per-file “not tagged”, “not built”, “queued”,
+  “unavailable”, and “not applicable” are calculated system status/filter
+  values, not user `Annotation.TAG` rows.
+- **Consequences:** The existing capacity card and per-dimension status view
+  are read-only projections and add no database or second identity system. A
+  future scheme picker affects new placements only; it never silently moves
+  old data or falls back to another backend. Restic/Kopia/Plakar and media
+  indexes stay qualification candidates until their respective gates pass.
+  The short explanation is maintained in the [RestoreWeave Wiki](../wiki/README.md).
+- **Rejected alternative:** Exposing arbitrary engine/algorithm toggles or
+  storing “unindexed” as a user tag would allow combinations that have not
+  passed recovery tests and would mix transient system state with the user's
+  organization.
+
 ## 9. Open gates before the release binary
 
 | Gate | Blocks | Owner of the evidence |

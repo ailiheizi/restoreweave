@@ -42,7 +42,9 @@ func TestDirectoryProfilesDescribeCapabilitiesAndHealth(t *testing.T) {
 				t.Fatal(err)
 			}
 			if !health.Available || !health.ReaderReady || health.KeyState != KeyStateNotRequired ||
-				health.CapacityState != CapacityUnknown || health.CorruptionState != CorruptionNotChecked {
+				health.CapacityState != CapacityAvailable || health.CapacityTotal == 0 ||
+				health.CapacityFree > health.CapacityTotal || health.CapacityUsed != health.CapacityTotal-health.CapacityFree ||
+				health.CorruptionState != CorruptionNotChecked {
 				t.Fatalf("health profile = %+v", health)
 			}
 		})
@@ -136,6 +138,16 @@ func TestMemoryCapabilityReportsNoCleanReaderDependency(t *testing.T) {
 	}
 	if health, err := reporter.DescribeHealthAndCapacity(ctx); err != nil || !health.Available {
 		t.Fatalf("memory health = %+v err=%v", health, err)
+	}
+}
+
+func TestCapacityBytesRejectsOverflow(t *testing.T) {
+	if got, err := capacityBytes(^uint64(0), 2); err == nil || got != 0 {
+		t.Fatalf("overflow result = %d, err = %v", got, err)
+	}
+	got, err := capacityBytes(4, 1024)
+	if err != nil || got != 4096 {
+		t.Fatalf("capacity result = %d, err = %v", got, err)
 	}
 }
 

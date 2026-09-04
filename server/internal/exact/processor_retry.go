@@ -167,11 +167,10 @@ func (s *Service) runProcessorRetryBatch(ctx context.Context, processor publicat
 
 func (s *Service) runProcessorRetryJob(ctx context.Context, processor publicationRetryProcessor, options ProcessorRetryWorkerOptions, candidate sqlite.Job) error {
 	var input processorRetryJobInput
-	if err := decodeStrictRecord(candidate.Input, &input); err != nil || input.Schema != processorRetrySchemaV1 ||
-		input.WorkspaceID != candidate.WorkspaceID || input.SnapshotRef == "" || input.NamespaceRootID == "" ||
-		input.ParentPublicationDigest == "" || input.PlanDigest == "" || input.IdempotencyKey == "" || len(input.Targets) == 0 {
-		return s.finishProcessorRetryJob(ctx, candidate, sqlite.JobFailed, "PROCESSOR_RETRY_INPUT_INVALID", candidate.Attempt)
-	}
+	decodeErr := decodeStrictRecord(candidate.Input, &input)
+	inputValid := decodeErr == nil && input.Schema == processorRetrySchemaV1 &&
+		input.WorkspaceID == candidate.WorkspaceID && input.SnapshotRef != "" && input.NamespaceRootID != "" &&
+		input.ParentPublicationDigest != "" && input.PlanDigest != "" && input.IdempotencyKey != "" && len(input.Targets) > 0
 	leaseToken := fmt.Sprintf("%s:%s:%d", options.Owner, candidate.ID, candidate.FencingToken+1)
 	now := options.Now().UTC()
 	var fence int64
@@ -198,7 +197,14 @@ func (s *Service) runProcessorRetryJob(ctx context.Context, processor publicatio
 		}
 		return s.finishProcessorRetryJob(ctx, job, state, code, job.Attempt)
 	}
-	if candidate.State == sqlite.JobNeedsReconcile {
+	if !inputValid {
+		return finish(sqlite.JobFailed, "PROCESSOR_RETRY_INPUT_INVALID")
+	}
+	if err := s.validateProcessorRetryInput(ctx, job, input); err != nil {
+		return finish(sqlite.JobFailed, "PROCESSOR_RETRY_INPUT_INVALID")
+	}
+	reconciled := candidate.State == sqlite.JobNeedsReconcile
+	if reconciled {
 		if err := s.validateProcessorRetryLease(leaseCtx, job, options.Owner, leaseToken, fence, options.Now().UTC()); err != nil {
 			return err
 		}
@@ -206,10 +212,13 @@ func (s *Service) runProcessorRetryJob(ctx context.Context, processor publicatio
 			return finish(sqlite.JobNeedsReconcile, "PROCESSOR_RETRY_RECONCILIATION_UNKNOWN")
 		}
 	}
-	processErr := processor.RetryPublication(leaseCtx, input.WorkspaceID, input.SnapshotRef, input.NamespaceRootID, ProcessorRetryInvocation{
-		JobID: candidate.ID, Owner: options.Owner, Attempt: job.Attempt, IdempotencyKey: input.IdempotencyKey,
-		LeaseToken: leaseToken, FenceToken: fence, Targets: append([]ProcessorRetryTarget(nil), input.Targets...),
-	})
+	var processErr error
+	if !reconciled {
+		processErr = processor.RetryPublication(leaseCtx, input.WorkspaceID, input.SnapshotRef, input.NamespaceRootID, ProcessorRetryInvocation{
+			JobID: candidate.ID, Owner: options.Owner, Attempt: job.Attempt, IdempotencyKey: input.IdempotencyKey,
+			LeaseToken: leaseToken, FenceToken: fence, Targets: append([]ProcessorRetryTarget(nil), input.Targets...),
+		})
+	}
 	if err := s.validateProcessorRetryLease(leaseCtx, job, options.Owner, leaseToken, fence, options.Now().UTC()); err != nil {
 		return err
 	}
@@ -235,6 +244,63 @@ func (s *Service) runProcessorRetryJob(ctx context.Context, processor publicatio
 		return finish(sqlite.JobQueued, "PROCESSOR_RETRYABLE_FAILURE")
 	}
 	return finish(sqlite.JobFailed, "PROCESSOR_RETRY_EXHAUSTED")
+}
+
+func (s *Service) validateProcessorRetryInput(ctx context.Context, job sqlite.Job, input processorRetryJobInput) error {
+	plan, err := s.Store.GetPlanByDigest(ctx, input.WorkspaceID, input.PlanDigest)
+	if err == nil {
+		if plan.WorkspaceID != input.WorkspaceID || plan.PlanDigest != input.PlanDigest ||
+			(job.PlanID != "" && job.PlanID != plan.ID) {
+			return errors.New("processor retry plan binding mismatch")
+		}
+	} else if !errors.Is(err, sqlite.ErrNotFound) {
+		return fmt.Errorf("processor retry plan binding: %w", err)
+	} else if job.PlanID != "" {
+		// A job that names a plan must be backed by that catalog record. Jobs
+		// created by the in-memory exact apply path have no plan row and are
+		// instead bound by the immutable publication below.
+		return errors.New("processor retry plan binding mismatch")
+	}
+	if input.IdempotencyKey != "processor-retry:"+input.PlanDigest {
+		return errors.New("processor retry idempotency binding mismatch")
+	}
+	publication, err := s.Store.GetPublicationByPlanDigest(ctx, input.WorkspaceID, input.PlanDigest)
+	if err != nil || publication.SnapshotRef != input.SnapshotRef || publication.NamespaceRootID != input.NamespaceRootID {
+		return errors.New("processor retry publication binding mismatch")
+	}
+	committed, err := s.committedPublicationByPlanDigest(ctx, input.PlanDigest)
+	if err != nil || committed.CommitDigest != input.ParentPublicationDigest ||
+		committed.Manifest.SnapshotRef != input.SnapshotRef || committed.Commit.PlanDigest != input.PlanDigest {
+		return errors.New("processor retry parent publication binding mismatch")
+	}
+	attempts, err := s.Store.ListProcessorAttempts(ctx, input.WorkspaceID, input.SnapshotRef)
+	if err != nil {
+		return fmt.Errorf("list processor retry predecessors: %w", err)
+	}
+	byID := make(map[string]sqlite.ProcessorAttempt, len(attempts))
+	for _, attempt := range attempts {
+		byID[attempt.ID] = attempt
+	}
+	seen := make(map[string]struct{}, len(input.Targets))
+	for _, target := range input.Targets {
+		if strings.TrimSpace(target.SubjectRef) == "" || strings.TrimSpace(target.RouteDigest) == "" ||
+			strings.TrimSpace(target.Stage) == "" || strings.TrimSpace(target.CapabilityID) == "" ||
+			strings.TrimSpace(target.PredecessorAttemptID) == "" || strings.TrimSpace(target.ReasonCode) == "" {
+			return errors.New("processor retry target is incomplete")
+		}
+		if _, ok := seen[target.PredecessorAttemptID]; ok {
+			return errors.New("processor retry target predecessor is duplicated")
+		}
+		seen[target.PredecessorAttemptID] = struct{}{}
+		attempt, ok := byID[target.PredecessorAttemptID]
+		if !ok || attempt.SubjectRef != target.SubjectRef || attempt.RouteDigest != target.RouteDigest ||
+			attempt.Stage != target.Stage || attempt.CapabilityID != target.CapabilityID ||
+			attempt.ReasonCode != target.ReasonCode ||
+			(attempt.Status != "FAILED" && attempt.Status != "CANCELLED") {
+			return errors.New("processor retry target binding mismatch")
+		}
+	}
+	return nil
 }
 
 func (s *Service) validateProcessorRetryLease(ctx context.Context, job sqlite.Job, owner, leaseToken string, fence int64, now time.Time) error {

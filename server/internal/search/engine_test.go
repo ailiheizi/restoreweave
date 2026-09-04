@@ -119,6 +119,24 @@ func TestEngineBuildQueryAndUnavailableAfterDelete(t *testing.T) {
 	}
 }
 
+func TestEngineChineseShortAndFullPhraseSearch(t *testing.T) {
+	ctx := context.Background()
+	engine := &Engine{Dir: t.TempDir()}
+	path, err := engine.Build(ctx, "idx_testcjk000000000000000000000", []Document{{
+		SubjectID: "nse_cjk", Path: "项目说明.txt", Name: "项目说明.txt", Suffix: "txt",
+		EntryType: "REGULAR_FILE", Notes: "项目文件的说明和恢复记录",
+	}})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, query := range []string{"项目", "项目文件的说明"} {
+		hits, queryErr := engine.Query(ctx, path, query, nil)
+		if queryErr != nil || len(hits) != 1 {
+			t.Fatalf("Query %q = %+v, err=%v", query, hits, queryErr)
+		}
+	}
+}
+
 func TestAcousticEngineExactLookupAndUnavailableAfterDelete(t *testing.T) {
 	ctx := context.Background()
 	engine := &Engine{Dir: t.TempDir()}

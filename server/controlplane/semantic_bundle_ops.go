@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -19,14 +20,15 @@ import (
 // Installation is explicit and independent from search generation building:
 // this operation never hot-loads an embedding worker or rebuilds zvec.
 func (d *Dispatcher) handleSemanticBundleInstall(ctx context.Context, env command.Envelope, started time.Time) command.Result {
-	if err := requireEmptyObject(env.Input); err != nil {
+	var input command.SemanticBundleInstallInput
+	if err := decodeSemanticBundleInstallInput(env.Input, &input); err != nil {
 		return invalidInputResult(env, started, err)
 	}
 	data := command.SemanticBundleInstallData{
 		ProfileID:       search.SemanticBundleBGEProfileID,
 		RestartRequired: true,
 	}
-	if d == nil || d.semanticBundleInstaller == nil || strings.TrimSpace(d.semanticBundleModelsRoot) == "" {
+	if d == nil || strings.TrimSpace(d.semanticBundleModelsRoot) == "" {
 		return failed(env, started, newReason(ReasonCodeUnavailable, "fixed semantic bundle installer is unavailable"))
 	}
 
@@ -34,7 +36,19 @@ func (d *Dispatcher) handleSemanticBundleInstall(ctx context.Context, env comman
 	// requests in one daemon from racing over the same persisted model root.
 	d.semanticBundleInstallMu.Lock()
 	defer d.semanticBundleInstallMu.Unlock()
-	receipt, err := d.semanticBundleInstaller(ctx, d.semanticBundleModelsRoot)
+	var receipt SemanticBundleInstallReceipt
+	var err error
+	if strings.TrimSpace(input.ArchivePath) != "" {
+		if d.semanticBundleArchiveInstaller == nil {
+			return failed(env, started, newReason(ReasonCodeUnavailable, "offline semantic bundle installer is unavailable"))
+		}
+		receipt, err = d.semanticBundleArchiveInstaller(ctx, d.semanticBundleModelsRoot, input.ArchivePath)
+	} else {
+		if d.semanticBundleInstaller == nil {
+			return failed(env, started, newReason(ReasonCodeUnavailable, "fixed semantic bundle installer is unavailable"))
+		}
+		receipt, err = d.semanticBundleInstaller(ctx, d.semanticBundleModelsRoot)
+	}
 	if err != nil {
 		return failed(env, started, newReason(ReasonCodeUnavailable, "semantic bundle installation unavailable: "+err.Error()))
 	}
@@ -62,6 +76,32 @@ func (d *Dispatcher) handleSemanticBundleInstall(ctx context.Context, env comman
 	}
 	d.semanticBundleMu.Unlock()
 	return succeeded(env, started, data)
+}
+
+func decodeSemanticBundleInstallInput(raw json.RawMessage, input *command.SemanticBundleInstallInput) error {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return errors.New("input must be a JSON object")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(input); err != nil {
+		return fmt.Errorf("invalid input: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("input must contain exactly one JSON object")
+		}
+		return fmt.Errorf("invalid input: %w", err)
+	}
+	if strings.TrimSpace(input.ArchivePath) != input.ArchivePath {
+		return errors.New("archive_path must not have surrounding whitespace")
+	}
+	if input.ArchivePath != "" && (!filepath.IsAbs(input.ArchivePath) || filepath.Clean(input.ArchivePath) != input.ArchivePath) {
+		return errors.New("archive_path must be an absolute canonical path")
+	}
+	return nil
 }
 
 func validateSemanticBundleInstallReceipt(receipt SemanticBundleInstallReceipt, modelsRoot string) error {

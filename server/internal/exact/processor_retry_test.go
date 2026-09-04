@@ -4,24 +4,43 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/ailiheizi/restoreweave/server/internal/repository"
 	"github.com/ailiheizi/restoreweave/server/internal/store/sqlite"
 )
 
 type retryFixtureProcessor struct {
-	store       *sqlite.Store
-	mu          sync.Mutex
-	failRetries int
-	retryCalls  int
-	lastFence   int64
+	store        *sqlite.Store
+	mu           sync.Mutex
+	failRetries  int
+	retryCalls   int
+	lastFence    int64
+	retryStarted chan struct{}
+	retryBlock   <-chan struct{}
+	retryOnce    sync.Once
 }
 
 type retryFixtureError struct{ targets []ProcessorRetryTarget }
+
+type retryUnknownClosureRepo struct {
+	*repository.Dir
+	failRole repository.RecordRole
+	failed   bool
+}
+
+func (r *retryUnknownClosureRepo) PlaceRecord(ctx context.Context, role repository.RecordRole, body io.Reader) (repository.RecordReceipt, error) {
+	if role == r.failRole && !r.failed {
+		r.failed = true
+		return repository.RecordReceipt{}, errors.New("retry closure placement outcome unavailable")
+	}
+	return r.Dir.PlaceRecord(ctx, role, body)
+}
 
 func (e *retryFixtureError) Error() string                 { return "retry fixture failure" }
 func (e *retryFixtureError) PublicationWarnings() []string { return []string{e.Error()} }
@@ -51,6 +70,16 @@ func (p *retryFixtureProcessor) ProcessPublication(ctx context.Context, workspac
 }
 
 func (p *retryFixtureProcessor) RetryPublication(ctx context.Context, workspaceID, snapshotRef, _ string, invocation ProcessorRetryInvocation) error {
+	if p.retryStarted != nil {
+		p.retryOnce.Do(func() { close(p.retryStarted) })
+	}
+	if p.retryBlock != nil {
+		select {
+		case <-p.retryBlock:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	p.mu.Lock()
 	p.retryCalls++
 	p.lastFence = invocation.FenceToken
@@ -77,6 +106,80 @@ func (p *retryFixtureProcessor) RetryPublication(ctx context.Context, workspaceI
 		SubjectRef: target.SubjectRef, RouteDigest: attempt.RouteDigest, Stage: attempt.Stage,
 		CapabilityID: attempt.CapabilityID, PredecessorAttemptID: attempt.ID, ReasonCode: attempt.ReasonCode,
 	}}}
+}
+
+// TestProcessorRetryQualificationMatrix is the Phase 2 gate evidence for the
+// bounded same-plan retry contract. Channels and an injected clock make lease
+// races deterministic without sleeps.
+func TestProcessorRetryQualificationMatrix(t *testing.T) {
+	t.Run("competing workers execute once", func(t *testing.T) {
+		fixture := newSignedPublicationFixture(t, "retry-qualification-race.txt", []byte("qualification race"))
+		release := make(chan struct{})
+		started := make(chan struct{})
+		processor := &retryFixtureProcessor{store: fixture.store, retryStarted: started, retryBlock: release}
+		fixture.service.Processor = processor
+		result := fixture.ingest(t, "sha256:processor-retry-qualification-race")
+		jobs, err := fixture.store.ListRecentJobs(context.Background(), 10)
+		if err != nil || len(jobs) != 1 {
+			t.Fatalf("retry jobs = %+v, err=%v", jobs, err)
+		}
+		options := ProcessorRetryWorkerOptions{Owner: "qualification-a", LeaseTTL: time.Minute, BatchSize: 1, Now: time.Now}
+		done := make(chan error, 1)
+		go func() { done <- fixture.service.runProcessorRetryBatch(context.Background(), processor, options) }()
+		<-started
+		if err := fixture.service.runProcessorRetryBatch(context.Background(), processor, ProcessorRetryWorkerOptions{Owner: "qualification-b", LeaseTTL: time.Minute, BatchSize: 1, Now: time.Now}); err != nil {
+			t.Fatal(err)
+		}
+		close(release)
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		if processor.retryCalls != 1 {
+			t.Fatalf("competing workers executed processor %d times", processor.retryCalls)
+		}
+		job, err := fixture.store.GetJob(context.Background(), result.WorkspaceID, jobs[0].ID)
+		if err != nil || job.State != sqlite.JobSucceeded {
+			t.Fatalf("competing worker job = %+v, err=%v", job, err)
+		}
+	})
+
+	t.Run("expired lease fences old worker", func(t *testing.T) {
+		fixture := newSignedPublicationFixture(t, "retry-qualification-fence.txt", []byte("qualification fence"))
+		release := make(chan struct{})
+		started := make(chan struct{})
+		processor := &retryFixtureProcessor{store: fixture.store, retryStarted: started, retryBlock: release}
+		fixture.service.Processor = processor
+		result := fixture.ingest(t, "sha256:processor-retry-qualification-fence")
+		jobs, err := fixture.store.ListRecentJobs(context.Background(), 10)
+		if err != nil || len(jobs) != 1 {
+			t.Fatalf("retry jobs = %+v, err=%v", jobs, err)
+		}
+		start := time.Now().UTC()
+		oldDone := make(chan error, 1)
+		go func() {
+			oldDone <- fixture.service.runProcessorRetryJob(context.Background(), processor, ProcessorRetryWorkerOptions{Owner: "qualification-old", LeaseTTL: time.Second, BatchSize: 1, Now: func() time.Time { return start }}, jobs[0])
+		}()
+		<-started
+		var takeover int64
+		if err := fixture.store.Update(context.Background(), func(tx *sqlite.Tx) error {
+			var err error
+			takeover, err = tx.AcquireJobLease(context.Background(), result.WorkspaceID, jobs[0].ID, jobs[0].Revision+1, "qualification-new", "new-lease", start.Add(2*time.Second), start.Add(3*time.Second))
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if takeover != 2 {
+			t.Fatalf("takeover fence = %d, want 2", takeover)
+		}
+		close(release)
+		if err := <-oldDone; !errors.Is(err, sqlite.ErrConflict) {
+			t.Fatalf("old worker error = %v, want fencing conflict", err)
+		}
+		job, err := fixture.store.GetJob(context.Background(), result.WorkspaceID, jobs[0].ID)
+		if err != nil || job.FencingToken != takeover || job.State != sqlite.JobRunning {
+			t.Fatalf("fenced job = %+v, err=%v", job, err)
+		}
+	})
 }
 
 func (p *retryFixtureProcessor) insertAttempt(ctx context.Context, workspaceID, snapshotRef, subject, status, reason string, fence int64, extra map[string]any) (sqlite.ProcessorAttempt, error) {
@@ -250,5 +353,145 @@ func TestProcessorRetryWorkerResumesQueuedJobAfterCatalogReopen(t *testing.T) {
 	attempts, err := reopened.ListProcessorAttempts(context.Background(), result.WorkspaceID, result.SnapshotRef)
 	if err != nil || len(attempts) != 2 || attempts[1].Status != "SUCCEEDED" || resumedProcessor.retryCalls != 1 {
 		t.Fatalf("retry attempts after restart = %+v, calls=%d, err=%v", attempts, resumedProcessor.retryCalls, err)
+	}
+}
+
+func TestProcessorRetryWorkerRejectsTamperedInputBeforeProcessorCall(t *testing.T) {
+	fixture := newSignedPublicationFixture(t, "retry-tampered.txt", []byte("tampered retry input"))
+	processor := &retryFixtureProcessor{store: fixture.store}
+	fixture.service.Processor = processor
+	result := fixture.ingest(t, "sha256:processor-retry-tampered-plan")
+	jobs, err := fixture.store.ListRecentJobs(context.Background(), 10)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("scheduled retry jobs = %+v, err=%v", jobs, err)
+	}
+
+	jobID, err := sqlite.NewStableID(sqlite.IDPrefixJob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tampered processorRetryJobInput
+	if err := decodeStrictRecord(jobs[0].Input, &tampered); err != nil {
+		t.Fatal(err)
+	}
+	tampered.ParentPublicationDigest = "sha256:tampered-parent-publication"
+	input, err := json.Marshal(tampered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.store.Update(context.Background(), func(tx *sqlite.Tx) error {
+		return tx.InsertJob(context.Background(), &sqlite.Job{ID: jobID, WorkspaceID: result.WorkspaceID, PlanID: jobs[0].PlanID, Kind: processorRetryJobKind, State: sqlite.JobQueued, Input: input, MaxAttempts: 3})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := fixture.store.GetJob(context.Background(), result.WorkspaceID, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.service.runProcessorRetryJob(context.Background(), processor, ProcessorRetryWorkerOptions{Owner: "tamper-worker", LeaseTTL: time.Minute, BatchSize: 4, Now: time.Now}, candidate); err != nil {
+		t.Fatal(err)
+	}
+	job, err := fixture.store.GetJob(context.Background(), result.WorkspaceID, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.State != sqlite.JobFailed || job.ErrorCode != "PROCESSOR_RETRY_INPUT_INVALID" {
+		t.Fatalf("tampered retry job = %+v", job)
+	}
+	if processor.retryCalls != 0 {
+		t.Fatalf("tampered retry invoked processor %d times", processor.retryCalls)
+	}
+}
+
+func TestProcessorRetryWorkerReconcilesUnknownClosureWithoutReexecution(t *testing.T) {
+	fixture := newSignedPublicationFixture(t, "retry-unknown.txt", []byte("unknown closure keeps exact bytes"))
+	processor := &retryFixtureProcessor{store: fixture.store}
+	fixture.service.Processor = processor
+	result := fixture.ingest(t, "sha256:processor-retry-unknown-plan")
+	fixture.service.Repo = &retryUnknownClosureRepo{Dir: fixture.repo, failRole: repository.RecordProcessorAttemptClosure}
+
+	jobs, err := fixture.store.ListRecentJobs(context.Background(), 10)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("retry jobs = %+v, err=%v", jobs, err)
+	}
+	options := ProcessorRetryWorkerOptions{Owner: "retry-worker-unknown", LeaseTTL: time.Minute, BatchSize: 4, Now: time.Now}
+	if err := fixture.service.runProcessorRetryBatch(context.Background(), processor, options); err != nil {
+		t.Fatal(err)
+	}
+	job, err := fixture.store.GetJob(context.Background(), result.WorkspaceID, jobs[0].ID)
+	if err != nil || job.State != sqlite.JobNeedsReconcile || processor.retryCalls != 1 {
+		t.Fatalf("unknown retry job = %+v, calls=%d, err=%v", job, processor.retryCalls, err)
+	}
+	if err := fixture.service.runProcessorRetryBatch(context.Background(), processor, options); err != nil {
+		t.Fatal(err)
+	}
+	job, err = fixture.store.GetJob(context.Background(), result.WorkspaceID, jobs[0].ID)
+	if err != nil || job.State != sqlite.JobSucceeded || processor.retryCalls != 1 {
+		t.Fatalf("reconciled retry job = %+v, calls=%d, err=%v", job, processor.retryCalls, err)
+	}
+	attempts, err := fixture.store.ListProcessorAttempts(context.Background(), result.WorkspaceID, result.SnapshotRef)
+	if err != nil || len(attempts) != 2 || attempts[1].Status != "SUCCEEDED" {
+		t.Fatalf("reconciled retry attempts = %+v, err=%v", attempts, err)
+	}
+	destination := filepath.Join(t.TempDir(), "restore")
+	if _, err := fixture.service.Restore(context.Background(), result.SnapshotRef, destination); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := os.ReadFile(filepath.Join(destination, "retry-unknown.txt"))
+	if err != nil || string(payload) != "unknown closure keeps exact bytes" {
+		t.Fatalf("restored unknown retry payload = %q, err=%v", payload, err)
+	}
+}
+
+func TestProcessorRetryWorkerReconcilesUnknownPortableFactsWithoutReexecution(t *testing.T) {
+	fixture := newSignedPublicationFixture(t, "retry-portable-unknown.txt", []byte("unknown portable facts keep exact bytes"))
+	initialProcessor := &retryFixtureProcessor{store: fixture.store}
+	fixture.service.Processor = initialProcessor
+	result := fixture.ingest(t, "sha256:processor-retry-portable-unknown-plan")
+	insertRaceDescription(t, fixture, result, "portable retry unknown outcome")
+	fixture.service.Repo = &retryUnknownClosureRepo{Dir: fixture.repo, failRole: repository.RecordPortableFactClosure}
+
+	jobs, err := fixture.store.ListRecentJobs(context.Background(), 10)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("retry jobs = %+v, err=%v", jobs, err)
+	}
+	options := ProcessorRetryWorkerOptions{Owner: "retry-worker-portable-unknown", LeaseTTL: time.Minute, BatchSize: 4, Now: time.Now}
+	if err := fixture.service.runProcessorRetryBatch(context.Background(), initialProcessor, options); err != nil {
+		t.Fatal(err)
+	}
+	job, err := fixture.store.GetJob(context.Background(), result.WorkspaceID, jobs[0].ID)
+	if err != nil || job.State != sqlite.JobNeedsReconcile || initialProcessor.retryCalls != 1 {
+		t.Fatalf("unknown portable retry job = %+v, calls=%d, err=%v", job, initialProcessor.retryCalls, err)
+	}
+	if err := fixture.store.Close(); err != nil {
+		t.Fatalf("close catalog for portable retry restart: %v", err)
+	}
+	reopened, err := sqlite.Open(context.Background(), fixture.catalogPath, sqlite.Options{})
+	if err != nil {
+		t.Fatalf("reopen catalog for portable retry: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	fixture.store = reopened
+	fixture.service.Store = reopened
+	resumedProcessor := &retryFixtureProcessor{store: reopened}
+	fixture.service.Processor = resumedProcessor
+	if err := fixture.service.runProcessorRetryBatch(context.Background(), resumedProcessor, options); err != nil {
+		t.Fatal(err)
+	}
+	job, err = reopened.GetJob(context.Background(), result.WorkspaceID, jobs[0].ID)
+	if err != nil || job.State != sqlite.JobSucceeded || resumedProcessor.retryCalls != 0 {
+		t.Fatalf("reconciled portable retry job = %+v, calls=%d, err=%v", job, resumedProcessor.retryCalls, err)
+	}
+	attempts, err := reopened.ListProcessorAttempts(context.Background(), result.WorkspaceID, result.SnapshotRef)
+	if err != nil || len(attempts) != 2 || attempts[1].Status != "SUCCEEDED" {
+		t.Fatalf("reconciled portable retry attempts = %+v, err=%v", attempts, err)
+	}
+	destination := filepath.Join(t.TempDir(), "restore")
+	if _, err := fixture.service.Restore(context.Background(), result.SnapshotRef, destination); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := os.ReadFile(filepath.Join(destination, "retry-portable-unknown.txt"))
+	if err != nil || string(payload) != "unknown portable facts keep exact bytes" {
+		t.Fatalf("restored unknown portable retry payload = %q, err=%v", payload, err)
 	}
 }

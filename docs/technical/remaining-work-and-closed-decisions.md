@@ -83,32 +83,50 @@ qualification.
 
 `local-zstd-v1` is an opt-in candidate with whole-file compression and dedup,
 decode-and-hash verification, corruption and relocation handling, repair,
-mechanism-separated savings reports, and copy-forward migration evidence. It
-is not a selected production engine.
+mechanism-separated savings reports, and copy-forward migration evidence,
+including a real pre-publication process-crash/retry boundary. It is not a
+selected production engine.
+
+Whole-file exact deduplication is sufficient for the MVP. Chunking is an
+unselected optional repository feature and becomes a gate only if a selected
+profile uses it. Destructive collection is disabled rather than unfinished
+MVP work; reachability stays `NON_DESTRUCTIVE_ONLY`.
 
 `local-zstd-encrypted-v1` is an experimental candidate with AES-256-GCM,
 host-provided key references, wrong/missing-key rejection, encrypted readback,
-relocation, and key-rotation copy-forward evidence. It is not admitted by the
-generated default and does not close encryption release qualification.
+relocation, and key-rotation copy-forward evidence. A real pre-publication
+process-crash test now proves target non-publication, retry, independent
+source/target clean-reader reopening, and old/wrong-key rejection. It is not
+admitted by the persisted config or daemon, and does not close encryption
+release qualification.
 
 ## 5. Near-term release work
 
-1. **Formal asynchronous processing:** release-qualify the existing bounded
-   same-plan worker, and define a separate signed successor contract for
-   user-triggered, rerouted, or general reprocessing.
-2. **Supported offline semantic packaging:** distribute the daemon, ONNX
+1. **Supported offline semantic packaging:** distribute the daemon, ONNX
    Runtime, pinned BGE model/tokenizer, and zvec library without a first-query
-   download.
-3. **Production repository qualification:** measure representative corpora and
+   download. The candidate artifact assembler now produces a deterministic
+   same-host archive with checksums and separated license/SBOM evidence, but
+   clean supported-host installation, a complete release SBOM, redistribution
+   review, and upgrade qualification remain.
+2. **Production repository qualification:** measure representative corpora and
    select one lossless profile only after encryption, crash, corruption,
    repair, relocation, migration, rollback, clean-reader, capacity, and net
-   savings gates pass.
-4. **Complete operator experience:** expose configuration, diagnostics,
+   savings gates pass. The qualification runner now accepts a reviewed,
+   operator-supplied corpus manifest and verifies every path, length, and
+   SHA-256 before an engine is opened; the checkout still has no representative
+   operator corpus or cross-platform evidence.
+3. **Complete operator experience:** expose configuration, diagnostics,
    SavedViews, ExportManifests, backup, upgrade, and recovery guidance without
    requiring internal IDs in the ordinary browser flow.
-5. **Release qualification:** run Linux and NAS-like acceptance for search
+4. **Release qualification:** run Linux and NAS-like acceptance for search
    coverage, latency, storage growth, recovery time, upgrade/rollback,
    packaging, and clean installation.
+
+The bounded same-plan asynchronous retry contract is implemented and tested,
+including a real process crash followed by cross-process lease takeover.
+User-triggered, rerouted, or general reprocessing remains disabled and requires
+a separately reviewed signed successor contract; it is not a hidden MVP
+completion requirement.
 
 ## 6. Later optional directions
 
@@ -121,6 +139,14 @@ profile. They are not current release promises:
 - remote enterprise administration, audit, RBAC, HA, and multitenancy;
 - advanced exact-reversible representations after the simple storage and
   recovery gates close.
+
+The product direction for future named storage schemes is recorded in
+[ADR-009](build-stack-and-architecture-selection.md#adr-009-storage-schemes-and-derived-index-status)
+and summarized in the [RestoreWeave Wiki](../wiki/README.md). The current
+read-only capacity and per-dimension index-status projections are implemented
+and tested; the named-scheme configuration remains deferred. This direction
+does not add a second catalog, change exact identity, or move CLIP/music
+indexes into the current default profile.
 
 ## 7. Not in the core queue
 

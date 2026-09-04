@@ -46,6 +46,18 @@ or safety gates, keep it outside the core queue.
   pinned ONNX Runtime, `BAAI/bge-small-zh-v1.5`, and in-process zvec. Fixture
   vectors do not satisfy this requirement. Qdrant, Milvus, and Docker Compose
   are not personal-profile dependencies.
+- Keep the physical storage choice simple: the current profile has one
+  configured repository and one SQLite catalog. A future named storage scheme
+  may bundle location, repository engine, exact deduplication, and compression
+  for new placements, but it must not silently move old data or create another
+  live metadata store. Repository capacity is a read-only optional report;
+  `UNKNOWN` (with a reason when available) must not block exact saving.
+- Per-file tag and index coverage are calculated status projections, not user
+  tags or a new durable state store. The baseline is lexical + structured
+  search; the local BGE semantic profile may run in the background or on
+  demand, never as an exact-save prerequisite, and reports `READY`,
+  `NOT_BUILT`, or `UNAVAILABLE` honestly. Future image/music dimensions keep
+  separate models and generations and remain outside the current default.
 - User, imported, extracted, and model-produced descriptions are durable,
   versioned content. AI description generation is an explicit, on-demand
   `DESCRIBE_SUBJECT` operation and is not an implicit ingest dependency.

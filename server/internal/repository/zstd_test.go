@@ -5,12 +5,33 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 )
+
+type interruptedPlacementReader struct {
+	body      []byte
+	remaining int
+	err       error
+}
+
+func (reader *interruptedPlacementReader) Read(p []byte) (int, error) {
+	if reader.remaining == 0 {
+		return 0, reader.err
+	}
+	count := reader.remaining
+	if count > len(p) {
+		count = len(p)
+	}
+	copy(p, reader.body[:count])
+	reader.body = reader.body[count:]
+	reader.remaining -= count
+	return count, nil
+}
 
 func TestZstdDirReadbackCompressionAndDeduplication(t *testing.T) {
 	ctx := context.Background()
@@ -44,6 +65,81 @@ func TestZstdDirReadbackCompressionAndDeduplication(t *testing.T) {
 	}
 	if !second.Existed || second.StoredBytes != first.StoredBytes || second.ContentID != first.ContentID {
 		t.Fatalf("deduplicated receipt: %+v then %+v", first, second)
+	}
+}
+
+func TestZstdPlacementInterruptionLeavesNoObjectAndRetrySucceeds(t *testing.T) {
+	ctx := context.Background()
+	payload := bytes.Repeat([]byte("interrupted exact placement\n"), 256)
+	sum := sha256.Sum256(payload)
+	contentID := AlgorithmSHA256 + ":" + hex.EncodeToString(sum[:])
+	sentinel := errors.New("injected placement interruption")
+
+	tests := []struct {
+		name string
+		open func(string) (*ZstdDir, error)
+	}{
+		{
+			name: "zstd",
+			open: OpenZstdDir,
+		},
+		{
+			name: "encrypted zstd",
+			open: func(root string) (*ZstdDir, error) {
+				key := bytes.Repeat([]byte{0x51}, 32)
+				return OpenEncryptedZstdDir(root, "key://placement-test", testKeyProvider(map[string][]byte{
+					"key://placement-test": key,
+				}))
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "repository")
+			repo, err := test.open(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reader := &interruptedPlacementReader{
+				body:      append([]byte(nil), payload...),
+				remaining: len(payload) / 2,
+				err:       sentinel,
+			}
+			if _, err := repo.PlaceExact(ctx, contentID, reader); !errors.Is(err, sentinel) {
+				t.Fatalf("interrupted placement error = %v, want sentinel", err)
+			}
+			if _, err := os.Lstat(blobPath(root, contentID)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("interrupted placement published object: %v", err)
+			}
+			temporary, err := os.ReadDir(filepath.Join(root, tmpDirName))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(temporary) != 0 {
+				t.Fatalf("interrupted placement left temporary files: %v", temporary)
+			}
+
+			receipt, err := repo.PlaceExact(ctx, contentID, bytes.NewReader(payload))
+			if err != nil {
+				t.Fatalf("retry placement: %v", err)
+			}
+			if receipt.ContentID != contentID || receipt.Bytes != int64(len(payload)) || receipt.Existed {
+				t.Fatalf("retry receipt = %+v", receipt)
+			}
+			if err := repo.Verify(ctx, contentID); err != nil {
+				t.Fatalf("verify retry: %v", err)
+			}
+			body, err := repo.Open(ctx, contentID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, readErr := io.ReadAll(body)
+			closeErr := body.Close()
+			if readErr != nil || closeErr != nil || !bytes.Equal(got, payload) {
+				t.Fatalf("retry readback mismatch: len=%d read=%v close=%v", len(got), readErr, closeErr)
+			}
+		})
 	}
 }
 

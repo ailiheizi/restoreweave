@@ -124,7 +124,8 @@ Notes:
 
 ## Re-running on Linux/NAS
 
-- Re-run with `scripts/qualification-spike.sh --corpus-dir <dir> --work-dir <dir> [--size-mb N]` (pure bash + awk + dd; no bubblewrap/container sandbox needed — it is a plain user-space corpus + repo run). Engine paths are overridable via `KOPIA_BIN`/`RESTIC_BIN`/`PLAKAR_BIN` (default `PATH`); results land in `<work-dir>/results.tsv` and `results.md`.
+- Re-run with `scripts/qualification-spike.sh --corpus-dir <dir> --work-dir <dir> [--size-mb N]` (shell corpus/engine harness plus the in-tree Go corpus-manifest helper; no bubblewrap/container sandbox is needed). Engine paths are overridable via `KOPIA_BIN`/`RESTIC_BIN`/`PLAKAR_BIN` (default `PATH`); results land in `<work-dir>/results.tsv` and `results.md`.
+- For a supplied corpus, use `scripts/qualification-spike.sh --existing-corpus <dir> --work-dir <new-or-empty-dir>`. This mode never modifies the corpus. Add `--corpus-manifest <file>` when an operator-owned manifest has been reviewed; the runner verifies its canonical digest and every path, length, and SHA-256 before opening an engine. Generated mode refuses an existing corpus destination, and the work directory must be empty and disjoint from the corpus. The runner writes `corpus.manifest.json`, binding every relative path, logical length, and SHA-256 digest into the dated TSV/Markdown report. Metrics the external-engine spike cannot separate remain explicitly `UNMEASURED`; no missing value is treated as zero or used to select an engine.
 - Run as a regular user: Kopia and Plakar need no privileges; `restic restore` may need `root` or `--allow-root` if the snapshot contains root-owned files (and `restic check` is fully offline). The openat2/`O_BENEATH`-style hardening topics are Linux implementation details and are not exercised by this script.
 - Plakar's first-backup cold-start cost (~50 s+ on this host) is expected; FUSE is only needed for `plakar mount` (requires libfuse on Linux) and is not part of this qualification. Note for Plakar v1.1.x: `plakar -disable-security-check create` exits 0 but creates nothing — the script uses plain `plakar create`.
 
@@ -134,8 +135,11 @@ Notes:
 profiles with the mechanism-separated report implemented by
 `server/internal/repository/savings.go` (`MeasureSavings`) and run through
 `scripts/savings-report.sh`. No engine is selected; no engine name becomes
-normative. `local-zstd-v1` remains a candidate pending encryption, chunking,
-GC, repair, migration, reader-closure, and representative-corpus gates.
+normative. `local-zstd-v1` remains a candidate pending encryption admission,
+broader crash/migration rollback, repair, reader-closure, supported-host,
+representative-corpus, and dated engine-selection gates. Whole-file
+deduplication is sufficient for the MVP. Chunking is tested only if a selected
+repository profile uses it, and destructive GC remains disabled.
 
 ### Method
 
@@ -233,9 +237,74 @@ for a separately reviewed adapter and qualification run.
 ### Remaining qualification gates (all open)
 
 `local-zstd-v1` is not the release profile. Before any production claim it must
-pass: repository encryption and credential handling, content-defined chunking,
-reachability/GC ownership, repair workflow, crash/corruption qualification,
-relocation, migration/rollback, independently installable reader closure,
-representative corpus measurement, and a dated engine-selection decision. Until
-then the generated config stays on `directory-cas-dev-v1` and this document
-reports a candidate measurement, not a conclusion.
+pass: repository encryption admission and credential handling, repair workflow,
+broader crash/corruption and migration/rollback qualification, relocation,
+independently installable reader closure, supported-host packaging,
+representative corpus measurement, non-destructive retention accounting, and a
+dated engine-selection decision. Content-defined chunking becomes a gate only
+if the selected profile uses it. Destructive collection remains out of scope;
+the current reachability plan stays `NON_DESTRUCTIVE_ONLY`. Until then the
+generated config stays on `directory-cas-dev-v1` and this document reports a
+candidate measurement, not a conclusion.
+
+### Deterministic heterogeneous corpus runner (2026-09-03)
+
+The internal `server/internal/repository/qualificationcorpus` package now
+generates a self-contained, symlink-free corpus for repeatable engine probes.
+The corpus manifest is `restoreweave.qualification-corpus.v1` and records the
+seed (`restoreweave-phase5-heterogeneous-v1`), generator provenance,
+`license=self-generated`, per-file category, size, SHA-256, and exact/near
+duplicate relationships. Generation rejects existing or overlapping targets
+and symlink parents; the generated files are never committed.
+
+The generated corpus contains 15 files (117,099 logical bytes): valid UTF-8
+text, Go source, JSON, PDF 1.4, PNG, JPEG, GIF, PCM WAV, ZIP, TAR.GZ, and an
+opaque binary. It includes two exact whole-file duplicates and two one-change
+near duplicates. Standard-library decoders/parsers accepted each structured
+fixture. Two independently generated directories produced the same manifest
+digest. The generator and format/safety tests passed under both normal and
+race-enabled test runs, and `go vet` passed.
+
+The existing read-only qualification runner was then executed against this
+corpus on Darwin arm64:
+
+```text
+scripts/qualification-spike.sh --existing-corpus <generated-corpus> --work-dir <new-empty-work-dir>
+```
+
+Restic 0.19.1 completed backup (`0.793 s`), restore (`0.762 s`), offline
+verification (`0.753 s`), and exact tree diff (`YES`); the repository measured
+124 KiB. Kopia and Plakar were not installed and were recorded as explicit
+`FAILED / binary check` rows. The runner left the source corpus unchanged and
+wrote a per-file SHA-256 manifest. This is heterogeneous restore evidence on
+one host, not an engine selection or release qualification. The runner still
+reports deduplication, compression, catalog/index/model/temp overhead, and net
+savings as `UNMEASURED` for external engines; those missing mechanisms remain
+an open Phase 5 gate.
+
+### Same-corpus development-docs probe (2026-09-03)
+
+The external-engine runner and the in-tree savings runner were also exercised
+against the same current `docs/` tree: 64 regular files, 1,732,478 logical
+bytes, with corpus-manifest digest
+`57aca631675f0601db7989ea9baee631eb1a12b7d12fa21e57c4d46a2ee3ddc8`.
+The source tree was read-only and remained outside every repository and work
+directory.
+
+| Candidate | Measured repository bytes | Physical / logical | Exact restore/readback |
+| --- | ---: | ---: | --- |
+| `directory-cas-dev-v1` | 1,732,537 | 1.000 | passed |
+| `local-zstd-v1` | 650,786 | 0.376 | passed |
+| Restic 0.19.1 | 684,032 (`du -sk`: 668 KiB) | 0.395 | `check` and tree diff passed |
+
+The local-zstd figure includes its 52-byte repository metadata overhead but no
+portable recovery records; the Restic figure includes its own encrypted
+repository and snapshot metadata and was measured through `du -sk`. Kopia and
+Plakar were unavailable in this rerun and were recorded as failed binary
+checks. The harness labels an existing input directory `operator-supplied`,
+but this particular directory was selected only as a convenient development
+code/document corpus. It is not an operator-reviewed representative archive,
+does not compare equal feature sets, and does not select an engine. It only
+provides a useful same-input sanity check: both zstd and Restic materially
+reduced this text-heavy corpus and restored it exactly, with neither showing a
+decisive storage-size advantage here.

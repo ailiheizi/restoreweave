@@ -273,14 +273,6 @@ func (engine *Engine) filterCandidates(ctx context.Context, dbPath string, candi
 		return nil, err
 	}
 	defer db.Close()
-	if len(candidates) == 0 {
-		// Opening the generation is part of the filter dependency check. An
-		// empty provider result must not hide a missing lexical authority.
-		if err := db.PingContext(ctx); err != nil {
-			return nil, fmt.Errorf("open candidate filter authority: %w", err)
-		}
-		return nil, nil
-	}
 	stmt, err := db.PrepareContext(ctx, `
 SELECT entry_type, content_id, duplicate_group, suffix, protection, language,
        size_facet, mtime_facet
@@ -288,9 +280,15 @@ FROM documents
 WHERE subject_id = ?
 LIMIT 1`)
 	if err != nil {
-		return nil, fmt.Errorf("prepare candidate filter: %w", err)
+		return nil, fmt.Errorf("%w: prepare candidate filter: %w", ErrUnavailable, err)
 	}
 	defer stmt.Close()
+	if len(candidates) == 0 {
+		// Preparing against the lexical schema is part of the dependency
+		// check. An empty provider result must not hide a missing, corrupt, or
+		// wrong-schema lexical authority.
+		return nil, nil
+	}
 	filtered := make([]Hit, 0, len(candidates))
 	for _, candidate := range candidates {
 		var indexed Hit

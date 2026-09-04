@@ -75,19 +75,13 @@ func TestRealDaemonSemanticEndToEnd(t *testing.T) {
 	// first-start network/download path.
 	bundleSource := filepath.Join(root, "offline-semantic-bundle")
 	writeRealSemanticBundle(t, bundleSource, runtimeSource, modelSource, tokenizerSource, zvecSource)
-	installed, err := search.InstallDefaultSemanticBundleFromDirectory(context.Background(), config.Paths.Models, bundleSource)
+	bundleAdmission, err := search.LoadSemanticBundle(bundleSource)
 	if err != nil {
-		t.Fatalf("install packaged semantic bundle offline: %v", err)
+		t.Fatalf("load generated offline semantic bundle: %v", err)
 	}
-	bundleRoot := filepath.Join(config.Paths.Models, search.SemanticBundleBGEProfileID, runtime.GOOS+"-"+runtime.GOARCH)
-	if installed.Descriptor.ProfileID != search.SemanticBundleBGEProfileID || installed.Descriptor.PlatformOS != runtime.GOOS || installed.Descriptor.PlatformArch != runtime.GOARCH || installed.ProfileDigest == "" {
-		t.Fatalf("offline installed semantic bundle = %+v", installed.Descriptor)
-	}
-	if err := os.RemoveAll(bundleSource); err != nil {
-		t.Fatalf("isolate offline semantic bundle source: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(bundleRoot, search.SemanticBundleManifestName)); err != nil {
-		t.Fatalf("installed semantic bundle manifest after source isolation: %v", err)
+	archivePath := filepath.Join(root, "offline-semantic-bundle.tar.gz")
+	if _, err := search.PackageSemanticBundleArchive(context.Background(), archivePath, bundleSource, bundleAdmission); err != nil {
+		t.Fatalf("package generated offline semantic archive: %v", err)
 	}
 
 	// macOS has a short Unix-domain socket path limit; keep this test endpoint
@@ -101,7 +95,25 @@ func TestRealDaemonSemanticEndToEnd(t *testing.T) {
 
 	initialCaps := runRealRWProcess(t, rwBin, socketPath, "capability", "list")
 	assertSemanticCapability(t, initialCaps, command.CapabilityUnavailable)
-	assertModelBundleCapability(t, initialCaps, command.CapabilityAvailable)
+	assertModelBundleCapability(t, initialCaps, command.CapabilityUnavailable)
+	installedResult := runRealRWProcess(t, rwBin, socketPath, "semantic", "bundle", "install", "--archive", archivePath)
+	var installedData command.SemanticBundleInstallData
+	decodeProcessResult(t, installedResult, &installedData)
+	if installedData.ProfileID != search.SemanticBundleBGEProfileID || installedData.ProfileDigest == "" || installedData.Destination == "" || !installedData.Changed || !installedData.RestartRequired {
+		t.Fatalf("CLI semantic bundle install = %+v", installedData)
+	}
+	if err := os.RemoveAll(bundleSource); err != nil {
+		t.Fatalf("isolate offline semantic bundle source: %v", err)
+	}
+	if err := daemon.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-daemonDone; err != nil {
+		t.Fatalf("daemon stop after install: %v\n%s", err, daemonLog.String())
+	}
+	daemon, daemonDone, daemonLog = startDaemonProcessWithEnv(t, env, daemonBin, socketPath, "--config", configPath)
+	waitForRealDaemonCLI(t, rwBin, socketPath, daemonDone, daemonLog, "status")
+	assertModelBundleCapability(t, runRealRWProcess(t, rwBin, socketPath, "capability", "list"), command.CapabilityAvailable)
 
 	planned := runRealRWProcess(t, rwBin, socketPath, "ingest", source)
 	var ingest command.PlanIngestData
@@ -137,9 +149,10 @@ func TestRealDaemonSemanticEndToEnd(t *testing.T) {
 	}
 	assertSemanticCapability(t, runRealRWProcess(t, rwBin, socketPath, "capability", "list"), command.CapabilityAvailable)
 
-	// The ordinary CLI path must use the default fused broker, retaining both
-	// lexical and semantic components while applying a typed structured filter.
-	defaultSearch := runRealRWProcess(t, rwBin, socketPath, "search", "洪水城市", "--workspace", appliedData.WorkspaceID, "--filter", "entry_type=REGULAR_FILE")
+	// The ordinary CLI path deliberately omits the internal workspace ID. The
+	// default fused broker must resolve the default workspace, retain both
+	// lexical and semantic components, and apply the typed structured filter.
+	defaultSearch := runRealRWProcess(t, rwBin, socketPath, "search", "洪水城市", "--filter", "entry_type=REGULAR_FILE")
 	var defaultData command.SearchQueryData
 	decodeProcessResult(t, defaultSearch, &defaultData)
 	if defaultData.Provider != search.ProviderBrokerFuse || defaultData.Dimension != "" || len(defaultData.FusedDimensions) != 2 ||

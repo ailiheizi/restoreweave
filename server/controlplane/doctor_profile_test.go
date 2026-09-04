@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ailiheizi/restoreweave/client/command"
 	"github.com/ailiheizi/restoreweave/server/internal/exact"
@@ -60,5 +61,15 @@ func TestDoctorAndStatusReportLocalZstdProfile(t *testing.T) {
 	if status.Repository == nil || status.Repository.RepositoryProfile != repository.RepositoryProfileLocalZstdV1 ||
 		status.Repository.CompressionProfile != repository.CompressionProfileZstdV1 {
 		t.Fatalf("repository status = %+v", status.Repository)
+	}
+	if status.Repository.CapacityState != repository.CapacityAvailable ||
+		status.Repository.CapacityTotal == 0 ||
+		status.Repository.CapacityFree > status.Repository.CapacityTotal ||
+		status.Repository.CapacityUsed != status.Repository.CapacityTotal-status.Repository.CapacityFree ||
+		status.Repository.CapacityMeasuredAt == "" || status.Repository.CapacityReason != "" {
+		t.Fatalf("repository capacity status = %+v", status.Repository)
+	}
+	if _, err := time.Parse(time.RFC3339, status.Repository.CapacityMeasuredAt); err != nil {
+		t.Fatalf("capacity measured_at = %q: %v", status.Repository.CapacityMeasuredAt, err)
 	}
 }

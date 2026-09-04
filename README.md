@@ -6,7 +6,48 @@
 
 **少存重复内容，更容易找到，并且能够证明恢复结果。**
 
-> 当前版本：`v0.1.0-prealpha.1` core preview。主要核心流程已经在当前开发配置中实现并测试，但这还不是生产发行版：没有正式安装包、模型自动安装、生产仓库资格或完整多平台发行保证。
+想先快速了解使用方式和当前边界，可看 [RestoreWeave Wiki](docs/wiki/README.md)；详细规则仍以 [docs/README.md](docs/README.md) 及其中链接的规范/ADR 为准。
+
+> 当前 `main`：`v0.1.0-prealpha.1` 之后的未发行 core preview。已经实测跑通“配置 → 预览 → 精确保存与整文件去重 → 关键词/可选 BGE 搜索 → 多标签与 Notes → 精确恢复”。这还不是生产发行版：LinkGroup、正式安装包、生产仓库资格和完整多平台发行保证仍未完成。
+
+![RestoreWeave 内容优先主页：统一搜索、多标签、Notes、保护与索引状态](docs/assets/screenshots/unreleased/library-zh.png)
+
+_真实运行中的 WebUI，使用仓库内文档构造的脱敏演示数据。_
+
+## 5 分钟启动 WebUI
+
+需要 Go 1.26（或 `go.mod` 声明的版本）以及 Vite 7 支持的 Node.js：
+
+```bash
+git clone https://github.com/ailiheizi/restoreweave.git
+cd restoreweave
+
+go build -tags=purego -o bin/restoreweaved ./server/cmd/restoreweaved
+go build -o bin/rw ./client/cmd/rw
+bin/rw config init --path ./restoreweave.toml
+```
+
+在生成的配置中启用本地 API：
+
+```toml
+[api]
+enabled = true
+listen = "127.0.0.1:4534"
+```
+
+分别启动 daemon 和开发前端：
+
+```bash
+# 终端 1
+bin/restoreweaved --config ./restoreweave.toml --socket /tmp/restoreweaved.sock
+
+# 终端 2
+cd web
+npm ci
+npm run dev
+```
+
+打开 `http://127.0.0.1:5173/`。当前 API 只按 loopback convenience adapter 设计；不要直接暴露到公网。远程部署仍需 TLS、身份认证、授权、审计和独立资格验证。
 
 ## 核心是什么
 
@@ -38,7 +79,7 @@ RestoreWeave 不是网盘文件系统，也不是 OpenList、媒体服务器或�
 - 使用持久化 TOML 配置；兼容读取旧 YAML 配置。
 - 配置 catalog、repository、vectors、models 和 publication signing material 的明确路径。
 - 相对路径按配置文件所在目录解析，不偷偷使用守护进程当前目录。
-- 配置 CLI 分别提供 `rw config init --path <file>`、`rw config validate --path <file>` 和 `rw config show --path <file>`；daemon 使用 `restoreweaved --config <file>`，并支持环境变量覆盖。
+- 配置 CLI 分别提供 `rw config init --path <file>`、`rw config validate --path <file>` 和 `rw config show --path <file> --effective`；daemon 使用 `restoreweaved --config <file>`，并支持环境变量覆盖。
 - 对配置计算摘要，并把配置身份绑定到计划、快照、Description 和索引/语义 generation。
 - 查看 daemon、catalog、repository、索引、计划、任务和 provider 的状态或诊断结果。
 
@@ -62,6 +103,10 @@ RestoreWeave 不是网盘文件系统，也不是 OpenList、媒体服务器或�
 - 保护预览会区分逻辑字节和真正需要新增的仓库字节。
 - 当前默认是整文件精确去重；chunk dedup 不是核心完成条件，也没有被伪装成现有能力。
 
+![添加来源前的真实存储计划：逻辑大小、新增空间和预计复用的重复内容](docs/assets/screenshots/unreleased/protection-plan-zh.png)
+
+_确认前只生成计划，不写入文件字节；重复内容收益是精确的保存前估算。_
+
 ### Notes、标签和提取信息
 
 - 为同一个文件保存多个可编辑、带修订号的 Notes。
@@ -71,7 +116,7 @@ RestoreWeave 不是网盘文件系统，也不是 OpenList、媒体服务器或�
 - 默认首页按内容展示；原始目录只是来源证明和恢复投影，可在“按来源路径浏览”中查看，不承担日常组织。
 - 用户、导入、提取和模型生成的文字都在同一个 Notes 区域展示，并带有来源、producer 或可编辑状态等提示。
 - 后台仍保留带修订、来源、语言、producer、前一修订和语义分段的描述记录，用于搜索、恢复和审计；它不是第二个用户界面概念。
-- AI 描述生成不是默认流程，只有用户主动请求时才运行；ingest 不会自动生成。
+- 当前默认不捆绑 AI 描述生成器。只有显式配置并认可 provider 后，生成操作才可由用户按需触发；ingest 不会自动生成。
 - 内置基础提取器可处理 UTF-8 文本、ID3/FLAC/OGG 音频标签和 EPUB OPF 元数据。
 - Processor 结果带 provenance；失败、超时和不可用状态不会取得文件身份或恢复权限。
 
@@ -133,7 +178,7 @@ RestoreWeave 不是网盘文件系统，也不是 OpenList、媒体服务器或�
 -> 搜索文件并添加多个 Notes
 -> 用描述性语句进行 BGE 语义搜索
 -> 查看 SHA-256 与保护状态
--> 在 Settings 中配置存储路径、本地 BGE/在线替换 profile、Notes、恢复与服务选项
+-> 在 Settings 中配置存储路径、本地 BGE/在线替换 profile、恢复与服务选项
 -> 保存时校验并原子更新同一份 TOML；需要时明确提示重启
 -> Preview restore
 -> 恢复到新的空目录并校验
@@ -200,7 +245,7 @@ RestoreWeave 保持较少的物理实体，但它们职责不同：
 | --- | --- |
 | 配置、扫描、计划、SHA-256 身份、整文件去重、精确保护 | 已在当前开发配置实现并测试 |
 | Notes 展示、后台描述记录与 lexical/structured search | 已在当前字段范围实现并测试 |
-| BGE-small-zh + ONNX + zvec | 在显式 provision 的真实 bundle 上实现并测试；尚未随安装包提供 |
+| BGE-small-zh + ONNX + zvec | 在显式 provision 的真实 bundle 上实现并测试；已有可校验的候选离线包组装器，尚无正式安装包 |
 | 签名恢复、clean reader、篡改拒绝、fencing、reconciliation | 已在 admitted development profile 实现并测试 |
 | SavedView、ExportManifest、materialize/verify | 本地范围实现并测试；未完成发行资格 |
 | React WebUI 与 loopback API | 可用的核心便利界面；尚非远程管理平台 |
@@ -210,46 +255,9 @@ RestoreWeave 保持较少的物理实体，但它们职责不同：
 | GC | 只有 `NON_DESTRUCTIVE_ONLY` reachability 计划，没有删除执行器 |
 | `RW-MVP-1` | 尚未完成或 release-qualified |
 
-## 快速启动 WebUI
-
-要求 Go 1.26（或 `go.mod` 声明的版本）以及 Vite 7 支持的 Node.js：
-
-```bash
-git clone https://github.com/ailiheizi/restoreweave.git
-cd restoreweave
-
-go build -tags=purego -o bin/restoreweaved ./server/cmd/restoreweaved
-go build -o bin/rw ./client/cmd/rw
-bin/rw config init --path ./restoreweave.toml
-```
-
-在生成的配置中启用本地 API：
-
-```toml
-[api]
-enabled = true
-listen = "127.0.0.1:4534"
-```
-
-在终端 1 启动 daemon：
-
-```bash
-bin/restoreweaved --config ./restoreweave.toml --socket /tmp/restoreweaved.sock
-```
-
-在终端 2 启动前端：
-
-```bash
-cd web
-npm ci
-npm run dev
-```
-
-打开 `http://127.0.0.1:5173/`。当前 API 只按 loopback convenience adapter 设计；不要把它直接暴露到公网。远程部署仍需要 TLS、身份认证、授权、审计和独立资格验证。
-
 ## BGE 模型
 
-个人配置默认选择 `BAAI/bge-small-zh-v1.5`，但模型、ONNX Runtime 和 zvec native bundle 目前不会随仓库自动下载。需要自行准备经过摘要验证的平台 bundle：
+个人配置默认选择 `BAAI/bge-small-zh-v1.5`。模型、ONNX Runtime 和 zvec native bundle 不会在 daemon 启动或首次查询时偷偷下载；可以从设置页或 CLI 显式调用固定开发安装器，也可以导入已经保管好的离线 bundle archive。安装器会校验固定摘要并原子发布到：
 
 ```text
 <paths.models>/bge-small-zh-v1.5/<goos>-<goarch>/
@@ -261,7 +269,17 @@ Darwin ARM64 的默认位置示例：
 ~/.local/share/restoreweave/models/bge-small-zh-v1.5/darwin-arm64/
 ```
 
-也可以用 `--semantic-bundle` 显式指定。缺少 bundle 时 daemon 会诚实报告 semantic unavailable，不会使用 fixture vector 冒充真实模型。
+CLI 的在线开发安装入口是 `rw semantic bundle install`；离线入口是 `rw semantic bundle install --archive /absolute/path/to/bundle.tar.gz`。也可以用 daemon 的 `--semantic-bundle` 显式指定运维提供的 bundle。缺少 bundle 时 daemon 会诚实报告 semantic unavailable，不会使用 fixture vector 冒充真实模型。安装器和 CLI 路径已有自动化测试；设置页仍是开发便利入口，尚未取得完整的浏览器安装、重启和真实查询发行证据。
+
+开发者可用 `scripts/package-offline.sh` 把已构建的 daemon、CLI、`web/dist`
+和离线 semantic archive 组装为一个带逐文件 SHA-256、MIT License 及独立
+第三方 NOTICE/SBOM 证据的候选 `.tar.gz`。产物会明确标记
+`CANDIDATE_ONLY_NOT_SUPPORTED`；它不是正式安装包，也不替代 Linux/NAS
+clean-host 验证。
+
+脚本会拒绝不含精确 `-tags=purego`、未链接固定 zvec-go 版本或 module sum、
+以及 GOOS/GOARCH 与产物平台标签不一致的 daemon；因此离线包不会把 fixture
+或 semantic-unavailable 构建冒充为真实 in-process zvec candidate。
 
 当前从源码构建 daemon 时必须保留上面的 `-tags=purego`，这样真实 zvec backend 才会编入程序；不带该标签的开发构建只保留明确不可用的占位实现。未来正式安装包应直接包含正确变体，不要求用户理解构建标签。
 
@@ -271,10 +289,10 @@ Darwin ARM64 的默认位置示例：
 
 近期工作只聚焦把现有核心变成可发行产品：
 
-1. **正式后台任务：** 对现有同计划有界 retry worker 完成发行资格；为用户主动、换路线或通用 reprocessing 另行定义签名 successor contract。
+1. **后台任务发行验收：** 同计划有界 retry worker 已实现并测试；还需在目标发行主机完成资源、升级和长期运行验收。用户主动、换路线或通用 reprocessing 仍需另行定义签名 successor contract。
 2. **离线安装包：** 打包 daemon、WebUI、ONNX Runtime、BGE model/tokenizer 和 zvec，安装后不依赖首次查询下载。
 3. **生产仓库资格：** 用代表性 corpus 比较并选定一个 lossless repository profile，完整验证 encryption、损坏、repair、搬迁、迁移、回滚、clean reader 和实际净节省。
-4. **完整日常体验：** 在 WebUI 中补齐可写配置、诊断、SavedView、ExportManifest、备份/升级/恢复引导，并让普通流程不要求用户处理内部 ID。
+4. **完整日常体验：** 在 WebUI 中补齐 SavedView、ExportManifest、备份/升级/恢复引导，并让这些普通流程不要求用户处理内部 ID。
 5. **发行验证：** 在 Linux 和 NAS-like 数据集上完成搜索覆盖率、语义延迟、存储占用、恢复时间、升级/回滚和 clean-install 验收。
 
 更远的可选方向只有在出现真实需求后才进入核心队列：人工审核的源数据迁移与容量释放、更多 extractor/OCR/ASR/CLIP、其他 embedding 或 repository profile、多仓库与分层，以及企业远程管理、RBAC 和 HA。RWKV/Transformer 压缩只能作为未来显式、可逆、可迁移且有回退的研究 profile。
@@ -304,7 +322,7 @@ npm ci
 npm run build
 ```
 
-当前仓库包含 400 多个 Go 测试入口，包括真实 daemon/CLI、语义 bundle、索引重建、恢复、篡改、迁移和跨进程场景。测试证明的是当前明确范围，不代表所有平台和生产环境已经获得支持。
+当前仓库包含数百个 Go 测试入口，包括真实 daemon/CLI、语义 bundle、索引重建、恢复、篡改、迁移和跨进程场景。测试证明的是当前明确范围，不代表所有平台和生产环境已经获得支持。
 
 ## 文档与许可
 

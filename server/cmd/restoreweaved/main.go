@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -54,6 +55,7 @@ func run() error {
 		semanticBundle = flag.String("semantic-bundle", os.Getenv("RESTOREWEAVE_SEMANTIC_BUNDLE"),
 			"operator-provided custom semantic bundle root (overrides configured paths.models profile; not the release-pinned default; disables fixed bundle installation)")
 		apiListen               = flag.String("api-listen", "", "HTTP /api/v1 listen address (overrides api.listen; empty uses config)")
+		webRoot                 = flag.String("web-root", "", "explicit absolute pre-built WebUI root served on the loopback API listener")
 		apiToken                = flag.String("api-token", os.Getenv("RESTOREWEAVE_API_TOKEN"), "Bearer token for HTTP /api/v1")
 		onnxWorkerProcessBundle = flag.String("onnx-worker-process", "",
 			"private host-supervisor ONNX worker bundle root")
@@ -77,6 +79,7 @@ func run() error {
 		semanticBundle:         *semanticBundle,
 		semanticBundleOverride: semanticBundleOverride,
 		apiListen:              *apiListen,
+		webRoot:                *webRoot,
 		apiToken:               *apiToken,
 	})
 }
@@ -92,6 +95,7 @@ type daemonOptions struct {
 	semanticBundle         string
 	semanticBundleOverride bool
 	apiListen              string
+	webRoot                string
 	apiToken               string
 }
 
@@ -267,6 +271,8 @@ func runWithOptions(ctx context.Context, options daemonOptions) error {
 	if options.recoveryReader {
 		return runRecoveryReader(ctx, options)
 	}
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	resolved, err := rwconfig.LoadEffective(rwconfig.LoadOptions{
 		Path: options.configPath,
@@ -290,7 +296,7 @@ func runWithOptions(ctx context.Context, options daemonOptions) error {
 	catalogPath := resolved.Config.Paths.Catalog
 	repositoryPath := resolved.Config.Paths.Repository
 
-	store, err := sqlite.Open(ctx, catalogPath, sqlite.Options{})
+	store, err := sqlite.Open(runCtx, catalogPath, sqlite.Options{})
 	if err != nil {
 		return fmt.Errorf("open catalog: %w", err)
 	}
@@ -304,7 +310,7 @@ func runWithOptions(ctx context.Context, options daemonOptions) error {
 	if err != nil {
 		return fmt.Errorf("open repository: %w", err)
 	}
-	commits, err := repo.ListRecordDigests(ctx, repository.RecordPublicationCommit)
+	commits, err := repo.ListRecordDigests(runCtx, repository.RecordPublicationCommit)
 	if err != nil {
 		return fmt.Errorf("inspect publication commits: %w", err)
 	}
@@ -331,7 +337,7 @@ func runWithOptions(ctx context.Context, options daemonOptions) error {
 		bundleRoot = filepath.Join(resolved.Config.Paths.Models, search.SemanticBundleBGEProfileID, runtime.GOOS+"-"+runtime.GOARCH)
 	}
 	bundleCapability := semanticBundleCapability(bundleRoot, options.semanticBundleOverride)
-	semanticOption, semanticCleanup, semanticErr := configureSemanticBinding(ctx, resolved, store, bundleRoot, options.semanticBundleOverride)
+	semanticOption, semanticCleanup, semanticErr := configureSemanticBinding(runCtx, resolved, store, bundleRoot, options.semanticBundleOverride)
 	if semanticErr != nil {
 		log.Printf("semantic capability unavailable: %v", semanticErr)
 	}
@@ -371,49 +377,82 @@ func runWithOptions(ctx context.Context, options daemonOptions) error {
 				}, nil
 			},
 		))
+		dispatcherOptions = append(dispatcherOptions, controlplane.WithSemanticBundleArchiveInstaller(modelsRoot,
+			func(installCtx context.Context, root, archivePath string) (controlplane.SemanticBundleInstallReceipt, error) {
+				beforeRoot := filepath.Join(root, search.SemanticBundleBGEProfileID, runtime.GOOS+"-"+runtime.GOARCH)
+				before, beforeErr := search.LoadSemanticBundle(beforeRoot)
+				admission, installErr := search.InstallDefaultSemanticBundleFromArchive(installCtx, root, archivePath)
+				if installErr != nil {
+					return controlplane.SemanticBundleInstallReceipt{}, installErr
+				}
+				changed := beforeErr != nil || before.ProfileDigest != admission.ProfileDigest
+				return controlplane.SemanticBundleInstallReceipt{
+					Admission:   admission,
+					Destination: beforeRoot,
+					Changed:     changed,
+				}, nil
+			},
+		))
 	}
 	if semanticOption != nil {
 		dispatcherOptions = append(dispatcherOptions, semanticOption)
 	}
 	dispatcher := controlplane.NewDispatcher(store, catalogPath, options.socketPath, dispatcherOptions...)
 	if semanticOption != nil {
-		if workspace, workspaceErr := store.GetWorkspaceByName(ctx, "default"); workspaceErr == nil {
-			if warmErr := dispatcher.WarmSemanticGeneration(ctx, workspace.ID); warmErr != nil {
+		if workspace, workspaceErr := store.GetWorkspaceByName(runCtx, "default"); workspaceErr == nil {
+			if warmErr := dispatcher.WarmSemanticGeneration(runCtx, workspace.ID); warmErr != nil {
 				log.Printf("semantic generation warm-up unavailable: %v", warmErr)
 			}
 		} else if !errors.Is(workspaceErr, sqlite.ErrNotFound) {
 			log.Printf("semantic workspace lookup: %v", workspaceErr)
 		}
 	}
-	go func() {
-		_ = exactLane.RunProcessorRetryWorker(ctx, exact.ProcessorRetryWorkerOptions{
-			Owner:   fmt.Sprintf("restoreweaved-%d", os.Getpid()),
-			OnError: func(err error) { log.Printf("processor retry worker: %v", err) },
-		})
-	}()
-	server, err := controlplane.NewServer(dispatcher, options.socketPath,
-		controlplane.WithErrorHandler(func(err error) { log.Printf("%v", err) }))
-	if err != nil {
-		return err
-	}
-
-	serveDone := make(chan struct{})
-	go func() {
-		defer close(serveDone)
-		if err := server.Serve(ctx); err != nil {
-			log.Printf("serve: %v", err)
-		}
-	}()
 	apiAddress, err := resolveAPIAddress(options.apiListen, resolved.Config.API)
 	if err != nil {
 		return err
 	}
+	if strings.TrimSpace(options.webRoot) != "" && apiAddress == "" {
+		return errors.New("--web-root requires an enabled loopback API listener")
+	}
 	var apiServer *http.Server
+	var apiListener net.Listener
 	if apiAddress != "" {
-		apiServer = &http.Server{Addr: apiAddress, Handler: api.Handler(dispatcher.Handle, api.Options{Token: options.apiToken})}
+		handler, handlerErr := api.HandlerWithStatic(dispatcher.Handle, api.Options{Token: options.apiToken}, options.webRoot)
+		if handlerErr != nil {
+			return fmt.Errorf("load WebUI: %w", handlerErr)
+		}
+		apiServer, apiListener, err = prepareAPIHTTPServer(apiAddress, handler)
+		if err != nil {
+			return err
+		}
+	}
+	server, err := controlplane.NewServer(dispatcher, options.socketPath,
+		controlplane.WithErrorHandler(func(err error) { log.Printf("%v", err) }))
+	if err != nil {
+		if apiListener != nil {
+			_ = apiListener.Close()
+		}
+		return err
+	}
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		if err := server.Serve(runCtx); err != nil {
+			log.Printf("serve: %v", err)
+		}
+	}()
+	retryDone := make(chan struct{})
+	go func() {
+		defer close(retryDone)
+		_ = exactLane.RunProcessorRetryWorker(runCtx, exact.ProcessorRetryWorkerOptions{
+			Owner:   fmt.Sprintf("restoreweaved-%d", os.Getpid()),
+			OnError: func(err error) { log.Printf("processor retry worker: %v", err) },
+		})
+	}()
+	if apiServer != nil {
 		go func() {
 			log.Printf("restoreweaved API listening on %s", apiAddress)
-			if err := apiServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			if err := apiServer.Serve(apiListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Printf("api: %v", err)
 			}
 		}()
@@ -422,13 +461,29 @@ func runWithOptions(ctx context.Context, options daemonOptions) error {
 
 	<-ctx.Done()
 	log.Printf("shutting down")
+	cancel()
 	if apiServer != nil {
-		_ = apiServer.Shutdown(context.Background())
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if shutdownErr := apiServer.Shutdown(shutdownCtx); shutdownErr != nil {
+			_ = apiServer.Close()
+		}
+		shutdownCancel()
 	}
 	if err := server.Close(); err != nil {
 		return fmt.Errorf("close control plane: %w", err)
 	}
-	<-serveDone
+	shutdownDeadline := time.NewTimer(5 * time.Second)
+	defer shutdownDeadline.Stop()
+	select {
+	case <-serveDone:
+	case <-shutdownDeadline.C:
+		return errors.New("control plane shutdown timed out")
+	}
+	select {
+	case <-retryDone:
+	case <-shutdownDeadline.C:
+		return errors.New("processor retry worker shutdown timed out")
+	}
 	return nil
 }
 
@@ -444,6 +499,17 @@ func resolveAPIAddress(override string, configured rwconfig.APIConfig) (string, 
 		return "", fmt.Errorf("start local HTTP adapter: %w", err)
 	}
 	return address, nil
+}
+
+// prepareAPIHTTPServer binds synchronously; serving starts only after all
+// daemon startup checks have succeeded.
+func prepareAPIHTTPServer(address string, handler http.Handler) (*http.Server, net.Listener, error) {
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return nil, nil, fmt.Errorf("bind local HTTP adapter on %s: %w", address, err)
+	}
+	server := &http.Server{Addr: address, Handler: handler}
+	return server, listener, nil
 }
 
 func runRecoveryReader(ctx context.Context, options daemonOptions) error {

@@ -14,15 +14,17 @@
 # Usage:
 #   scripts/qualification-spike.sh --corpus-dir DIR --work-dir DIR [--size-mb N]
 #
-#   --corpus-dir DIR  where the deterministic corpus is generated (existing
-#                     content is replaced)
+#   --corpus-dir DIR  where the deterministic corpus is generated (must not exist)
+#   --existing-corpus DIR  use an existing corpus read-only
+#   --corpus-manifest FILE verify an operator-supplied manifest against the corpus
 #   --work-dir DIR    where repos, logs and results are written
 #                     (results.tsv, results.md, corpus-file-list.txt)
 #   --size-mb N       target corpus size in MB (default 150, matching the
 #                     original spike corpus of 151.5 MB)
 #
 # Dependencies: bash, awk, dd, date, du, diff, find, grep, head, mkdir, rm,
-#   seq, printf, wc. No python/jq/curl required.
+#   seq, printf, wc, and the repository's Go toolchain. No python/jq/curl
+#   required.
 #
 # Engine binaries: $KOPIA_BIN / $RESTIC_BIN / $PLAKAR_BIN override the binary
 #   paths; otherwise the engines are looked up in $PATH. An engine that is
@@ -43,11 +45,13 @@ set -euo pipefail
 
 # ---- options ---------------------------------------------------------------
 CORPUS_DIR=""
+EXISTING_CORPUS=""
+CORPUS_MANIFEST=""
 WORK_DIR=""
 SIZE_MB=150
 
 usage() {
-    echo "usage: $0 --corpus-dir DIR --work-dir DIR [--size-mb N]" >&2
+    echo "usage: $0 (--corpus-dir DIR | --existing-corpus DIR) --work-dir DIR [--corpus-manifest FILE] [--size-mb N]" >&2
     echo "       (KOPIA_BIN / RESTIC_BIN / PLAKAR_BIN override engine paths)" >&2
     exit 2
 }
@@ -55,6 +59,8 @@ usage() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --corpus-dir) CORPUS_DIR="$2"; shift 2 ;;
+        --existing-corpus) EXISTING_CORPUS="$2"; shift 2 ;;
+        --corpus-manifest) CORPUS_MANIFEST="$2"; shift 2 ;;
         --work-dir)   WORK_DIR="$2";   shift 2 ;;
         --size-mb)    SIZE_MB="$2";    shift 2 ;;
         -h|--help)    usage ;;
@@ -62,7 +68,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ -n "$CORPUS_DIR" && -n "$WORK_DIR" ]] || usage
+[[ -n "$WORK_DIR" && ( -n "$CORPUS_DIR" || -n "$EXISTING_CORPUS" ) && !( -n "$CORPUS_DIR" && -n "$EXISTING_CORPUS" ) ]] || usage
+[[ -z "$CORPUS_MANIFEST" || -f "$CORPUS_MANIFEST" ]] || { echo "error: corpus manifest must be a readable file" >&2; exit 2; }
+[[ -z "$CORPUS_MANIFEST" || -n "$EXISTING_CORPUS" ]] || { echo "error: --corpus-manifest requires --existing-corpus" >&2; exit 2; }
 [[ "$SIZE_MB" =~ ^[0-9]+$ ]] || { echo "error: --size-mb must be an integer" >&2; exit 2; }
 
 KOPIA_BIN="${KOPIA_BIN:-kopia}"
@@ -70,27 +78,51 @@ RESTIC_BIN="${RESTIC_BIN:-restic}"
 PLAKAR_BIN="${PLAKAR_BIN:-plakar}"
 
 # ---- helpers ---------------------------------------------------------------
-abs_path() {
-    case "$1" in /*) echo "$1" ;; *) echo "$(pwd)/$1" ;; esac
+resolve_existing_dir() {
+    local path="$1"
+    [[ -d "$path" && ! -L "$path" ]] || return 1
+    (cd "$path" && pwd -P)
 }
-CORPUS_DIR=$(abs_path "$CORPUS_DIR")
-WORK_DIR=$(abs_path "$WORK_DIR")
+resolve_new_path() {
+    local path="$1" parent base
+    parent=$(dirname "$path")
+    base=$(basename "$path")
+    [[ "$base" != "." && "$base" != ".." && -d "$parent" && ! -L "$parent" ]] || return 1
+    parent=$(cd "$parent" && pwd -P) || return 1
+    printf '%s/%s\n' "$parent" "$base"
+}
+if [[ -n "$EXISTING_CORPUS" ]]; then
+    CORPUS_DIR=$(resolve_existing_dir "$EXISTING_CORPUS") || { echo "error: existing corpus must be a real directory, not a symlink" >&2; exit 2; }
+else
+    CORPUS_DIR=$(resolve_new_path "$CORPUS_DIR") || { echo "error: generated corpus parent must be an existing real directory" >&2; exit 2; }
+fi
+if [[ -e "$WORK_DIR" || -L "$WORK_DIR" ]]; then
+    WORK_DIR=$(resolve_existing_dir "$WORK_DIR") || { echo "error: work directory must be a real directory, not a symlink" >&2; exit 2; }
+else
+    WORK_DIR=$(resolve_new_path "$WORK_DIR") || { echo "error: work directory parent must be an existing real directory" >&2; exit 2; }
+fi
+if [[ "$WORK_DIR" == "$CORPUS_DIR" || "$WORK_DIR" == "$CORPUS_DIR"/* || "$CORPUS_DIR" == "$WORK_DIR"/* ]]; then echo "error: work directory overlaps corpus" >&2; exit 2; fi
+if [[ -z "$EXISTING_CORPUS" && -e "$CORPUS_DIR" ]]; then echo "error: generated corpus destination already exists" >&2; exit 2; fi
+if [[ -e "$WORK_DIR" && -n "$(find "$WORK_DIR" -mindepth 1 -print -quit 2>/dev/null)" ]]; then echo "error: work directory must be new or empty" >&2; exit 2; fi
 
 # nanosecond timing where possible, otherwise whole seconds
 NS_PROBE=$(date +%N 2>/dev/null) || NS_PROBE="%N"
 if [[ "$NS_PROBE" == "%N" || -z "$NS_PROBE" ]]; then
-    NS_SCALE=1
-    now_ns() { date +%s; }
+    now_tick() { date +%s; }
+    elapsed_ms_since() { printf '%s\n' "$((($(now_tick) - $1) * 1000))"; }
 else
-    NS_SCALE=1000000
-    now_ns() { date +%s%N; }
+    now_tick() { date +%s%N; }
+    elapsed_ms_since() { printf '%s\n' "$((($(now_tick) - $1) / 1000000))"; }
 fi
 
 fmt_sec() { awk -v ms="$1" 'BEGIN{printf "%.3f", ms/1000}'; }
 ratio_of() { awk -v r="$1" -v c="$2" 'BEGIN{ if (c>0) printf "%.3f", r/c; else printf "n/a" }'; }
+utc_now() { LC_ALL=C date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 
 TSV="$WORK_DIR/results.tsv"
 LOG_BASE="$WORK_DIR"
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+MANIFEST_RUNNER="$REPO_ROOT/server/internal/repository/savingsreport"
 
 # locate the restored corpus root inside a restore target:
 #   kopia/plakar restore the snapshot contents at the target root,
@@ -102,10 +134,80 @@ restored_corpus_dir() {
     if [[ -n "$r" ]]; then printf '%s' "$r"; else printf '%s' "$1"; fi
 }
 
+write_tsv_row() {
+    [[ "$#" -eq 27 ]] || { echo "internal error: qualification row has $# fields, want 27" >&2; return 1; }
+    local separator="" value
+    for value in "$@"; do
+        value=${value//$'\t'/ }
+        value=${value//$'\r'/ }
+        value=${value//$'\n'/ }
+        printf '%s%s' "$separator" "$value" >>"$TSV"
+        separator=$'\t'
+    done
+    printf '\n' >>"$TSV"
+}
+
 write_fail_row() { # engine version step
-    printf '%s\t%s\t%s\tFAILED\tFAILED\tFAILED\tFAILED\tFAILED\tFAILED\tFAILED\n' \
-        "$1" "$2" "$CORPUS_BYTES" >>"$TSV"
+    write_tsv_row \
+        "$1" "$2" "$CORPUS_BYTES" FAILED FAILED FAILED FAILED FAILED FAILED FAILED \
+        "$RUN_UTC" "$HOST_OS" "$HOST_ARCH" "$CORPUS_KIND" "$CORPUS_LABEL" "$CORPUS_DIGEST" \
+        FAILED "$3" "$CORPUS_BYTES" UNMEASURED UNMEASURED UNMEASURED \
+        UNMEASURED UNMEASURED UNMEASURED UNMEASURED UNMEASURED
     echo "[$1] FAILED at step '$3' (see $LOG_BASE/$1.log)" >&2
+}
+
+write_measured_row() { # engine version repo_kib backup restore verify verify_ok diff_ok
+    local repo_kib="$3" run_status=SUCCEEDED failure_step=""
+    if [[ "$7" != YES ]]; then
+        run_status=FAILED
+        failure_step=verify
+    fi
+    if [[ "$8" != YES ]]; then
+        run_status=FAILED
+        failure_step="${failure_step:+$failure_step,}diff"
+    fi
+    write_tsv_row \
+        "$1" "$2" "$CORPUS_BYTES" "$repo_kib" "$(ratio_of "$repo_kib" "$CORPUS_KIB")" \
+        "$4" "$5" "$6" "$7" "$8" \
+        "$RUN_UTC" "$HOST_OS" "$HOST_ARCH" "$CORPUS_KIND" "$CORPUS_LABEL" "$CORPUS_DIGEST" \
+        "$run_status" "$failure_step" "$CORPUS_BYTES" UNMEASURED UNMEASURED "$((repo_kib * 1024))" \
+        UNMEASURED UNMEASURED UNMEASURED UNMEASURED UNMEASURED
+}
+
+bind_corpus_manifest() {
+    local summary manifest_files manifest_bytes
+    if [[ -n "$CORPUS_MANIFEST" ]]; then
+        summary=$(go run -tags=savingsreport "$MANIFEST_RUNNER" \
+            -manifest-only -manifest-in "$CORPUS_MANIFEST" -corpus "$CORPUS_DIR" \
+            -manifest-out "$WORK_DIR/corpus.manifest.json") || return 1
+    else
+        summary=$(go run -tags=savingsreport "$MANIFEST_RUNNER" \
+            -manifest-only -corpus "$CORPUS_DIR" \
+            -manifest-out "$WORK_DIR/corpus.manifest.json") || return 1
+    fi
+    CORPUS_DIGEST=$(printf '%s\n' "$summary" | awk -F= '$1 == "corpus_manifest_digest" { print $2 }')
+    manifest_files=$(printf '%s\n' "$summary" | awk -F= '$1 == "corpus_files" { print $2 }')
+    manifest_bytes=$(printf '%s\n' "$summary" | awk -F= '$1 == "logical_bytes" { print $2 }')
+    [[ -n "$CORPUS_DIGEST" && "$manifest_files" == "$CORPUS_FILES" && "$manifest_bytes" == "$CORPUS_BYTES" ]] || {
+        echo "error: corpus manifest summary does not match shell inventory" >&2
+        return 1
+    }
+}
+
+# Re-check the immutable input binding at every engine boundary.  The initial
+# check prevents an already-drifted operator corpus from being used, while
+# this check prevents a previous engine (or an outside writer) from changing
+# the input that the next engine would measure.  Engine processes are not
+# trusted to provide snapshot isolation for the source directory.
+verify_bound_corpus() {
+    local verification_manifest="$WORK_DIR/.corpus-manifest-verify.json"
+    if ! go run -tags=savingsreport "$MANIFEST_RUNNER" \
+        -manifest-only -manifest-in "$WORK_DIR/corpus.manifest.json" \
+        -corpus "$CORPUS_DIR" -manifest-out "$verification_manifest" >/dev/null; then
+        echo "error: verify corpus manifest before next engine" >&2
+        return 1
+    fi
+    rm -f "$verification_manifest"
 }
 
 # ---- corpus generation (pure bash + awk + dd, deterministic) ---------------
@@ -121,7 +223,7 @@ generate_corpus() {
         printf "%d %d %d %d\n", br, dl, rc, zc
     }')"
 
-    rm -rf "$root"
+    [[ ! -e "$root" ]] || { echo "error: generated corpus destination already exists" >&2; return 2; }
     mkdir -p "$root"
 
     # (a) 3 dirs x 20 text files: shared lorem block + per-file header/footer
@@ -253,11 +355,11 @@ eng_kopia() {
 
     step="backup"
     local b0 bms
-    b0=$(now_ns)
+    b0=$(now_tick)
     if ! "$KOPIA_BIN" snapshot create "$CORPUS_DIR" >>"$log" 2>&1; then
         write_fail_row "$e" "$ver" "$step"; return 0
     fi
-    bms=$((($(now_ns) - b0) / NS_SCALE))
+    bms=$(elapsed_ms_since "$b0")
 
     step="snapshot list"
     if ! "$KOPIA_BIN" snapshot list >"$list" 2>>"$log"; then
@@ -266,25 +368,30 @@ eng_kopia() {
 
     step="repo size"
     local repo_kib
-    repo_kib=$(du -sk "$repo" 2>>"$log" | awk '{print $1}') || repo_kib=0
+    if ! repo_kib=$(du -sk "$repo" 2>>"$log" | awk '{print $1}'); then
+        write_fail_row "$e" "$ver" "$step"; return 0
+    fi
+    if [[ ! "$repo_kib" =~ ^[0-9]+$ ]]; then
+        write_fail_row "$e" "$ver" "$step (invalid measurement)"; return 0
+    fi
 
     step="restore"
     local sid r0 rms
     sid=$(grep -oE 'k[0-9a-f]{32}' "$list" | head -1) || true
     if [[ -z "$sid" ]]; then write_fail_row "$e" "$ver" "$step (no snapshot id)"; return 0; fi
-    r0=$(now_ns)
+    r0=$(now_tick)
     if ! "$KOPIA_BIN" snapshot restore "$sid" "$rdir" >>"$log" 2>&1; then
         write_fail_row "$e" "$ver" "$step"; return 0
     fi
-    rms=$((($(now_ns) - r0) / NS_SCALE))
+    rms=$(elapsed_ms_since "$r0")
 
     step="verify"
     local v0 vms vok=NO
-    v0=$(now_ns)
+    v0=$(now_tick)
     if "$KOPIA_BIN" snapshot "$KOPIA_VERIFY_CMD" >>"$log" 2>&1; then
         vok=YES
     fi
-    vms=$((($(now_ns) - v0) / NS_SCALE))
+    vms=$(elapsed_ms_since "$v0")
 
     step="diff"
     local dok=NO rroot
@@ -293,9 +400,12 @@ eng_kopia() {
         dok=YES
     fi
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$e" "$ver" "$CORPUS_BYTES" "$repo_kib" "$(ratio_of "$repo_kib" "$CORPUS_KIB")" \
-        "$(fmt_sec "$bms")" "$(fmt_sec "$rms")" "$(fmt_sec "$vms")" "$vok" "$dok" >>"$TSV"
+    if ! verify_bound_corpus; then
+        write_fail_row "$e" "$ver" "corpus manifest after engine"
+        return 0
+    fi
+    write_measured_row "$e" "$ver" "$repo_kib" \
+        "$(fmt_sec "$bms")" "$(fmt_sec "$rms")" "$(fmt_sec "$vms")" "$vok" "$dok"
     echo "[$e] $ver: repo=${repo_kib}KiB backup=$(fmt_sec "$bms")s restore=$(fmt_sec "$rms")s verify=$(fmt_sec "$vms")s verify_ok=$vok diff_ok=$dok"
 }
 
@@ -323,11 +433,11 @@ eng_restic() {
 
     step="backup"
     local b0 bms
-    b0=$(now_ns)
+    b0=$(now_tick)
     if ! "$RESTIC_BIN" backup "$CORPUS_DIR" >>"$log" 2>&1; then
         write_fail_row "$e" "$ver" "$step"; return 0
     fi
-    bms=$((($(now_ns) - b0) / NS_SCALE))
+    bms=$(elapsed_ms_since "$b0")
 
     step="snapshot list"
     if ! "$RESTIC_BIN" snapshots >"$list" 2>>"$log"; then
@@ -336,23 +446,28 @@ eng_restic() {
 
     step="repo size"
     local repo_kib
-    repo_kib=$(du -sk "$repo" 2>>"$log" | awk '{print $1}') || repo_kib=0
+    if ! repo_kib=$(du -sk "$repo" 2>>"$log" | awk '{print $1}'); then
+        write_fail_row "$e" "$ver" "$step"; return 0
+    fi
+    if [[ ! "$repo_kib" =~ ^[0-9]+$ ]]; then
+        write_fail_row "$e" "$ver" "$step (invalid measurement)"; return 0
+    fi
 
     step="restore"
     local r0 rms
-    r0=$(now_ns)
+    r0=$(now_tick)
     if ! "$RESTIC_BIN" restore latest --target "$rdir" >>"$log" 2>&1; then
         write_fail_row "$e" "$ver" "$step"; return 0
     fi
-    rms=$((($(now_ns) - r0) / NS_SCALE))
+    rms=$(elapsed_ms_since "$r0")
 
     step="verify"
     local v0 vms vok=NO
-    v0=$(now_ns)
+    v0=$(now_tick)
     if "$RESTIC_BIN" "$RESTIC_CHECK_CMD" >>"$log" 2>&1; then
         vok=YES
     fi
-    vms=$((($(now_ns) - v0) / NS_SCALE))
+    vms=$(elapsed_ms_since "$v0")
 
     step="diff"
     local dok=NO rroot
@@ -361,9 +476,12 @@ eng_restic() {
         dok=YES
     fi
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$e" "$ver" "$CORPUS_BYTES" "$repo_kib" "$(ratio_of "$repo_kib" "$CORPUS_KIB")" \
-        "$(fmt_sec "$bms")" "$(fmt_sec "$rms")" "$(fmt_sec "$vms")" "$vok" "$dok" >>"$TSV"
+    if ! verify_bound_corpus; then
+        write_fail_row "$e" "$ver" "corpus manifest after engine"
+        return 0
+    fi
+    write_measured_row "$e" "$ver" "$repo_kib" \
+        "$(fmt_sec "$bms")" "$(fmt_sec "$rms")" "$(fmt_sec "$vms")" "$vok" "$dok"
     echo "[$e] $ver: repo=${repo_kib}KiB backup=$(fmt_sec "$bms")s restore=$(fmt_sec "$rms")s verify=$(fmt_sec "$vms")s verify_ok=$vok diff_ok=$dok"
 }
 
@@ -399,11 +517,11 @@ eng_plakar() {
 
     step="backup"
     local b0 bms
-    b0=$(now_ns)
+    b0=$(now_tick)
     if ! "$PLAKAR_BIN" "${opts[@]}" backup "$CORPUS_DIR" >>"$log" 2>&1; then
         write_fail_row "$e" "$ver" "$step"; return 0
     fi
-    bms=$((($(now_ns) - b0) / NS_SCALE))
+    bms=$(elapsed_ms_since "$b0")
 
     step="snapshot list"
     if ! "$PLAKAR_BIN" "${opts[@]}" ls >"$list" 2>>"$log"; then
@@ -412,23 +530,28 @@ eng_plakar() {
 
     step="repo size"
     local repo_kib
-    repo_kib=$(du -sk "$repo" 2>>"$log" | awk '{print $1}') || repo_kib=0
+    if ! repo_kib=$(du -sk "$repo" 2>>"$log" | awk '{print $1}'); then
+        write_fail_row "$e" "$ver" "$step"; return 0
+    fi
+    if [[ ! "$repo_kib" =~ ^[0-9]+$ ]]; then
+        write_fail_row "$e" "$ver" "$step (invalid measurement)"; return 0
+    fi
 
     step="restore"
     local r0 rms
-    r0=$(now_ns)
+    r0=$(now_tick)
     if ! "$PLAKAR_BIN" "${opts[@]}" restore -to "$rdir" >>"$log" 2>&1; then
         write_fail_row "$e" "$ver" "$step"; return 0
     fi
-    rms=$((($(now_ns) - r0) / NS_SCALE))
+    rms=$(elapsed_ms_since "$r0")
 
     step="verify"
     local v0 vms vok=NO
-    v0=$(now_ns)
+    v0=$(now_tick)
     if "$PLAKAR_BIN" "${opts[@]}" "$PLAKAR_CHECK_CMD" >>"$log" 2>&1; then
         vok=YES
     fi
-    vms=$((($(now_ns) - v0) / NS_SCALE))
+    vms=$(elapsed_ms_since "$v0")
 
     step="diff"
     local dok=NO rroot
@@ -437,9 +560,12 @@ eng_plakar() {
         dok=YES
     fi
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$e" "$ver" "$CORPUS_BYTES" "$repo_kib" "$(ratio_of "$repo_kib" "$CORPUS_KIB")" \
-        "$(fmt_sec "$bms")" "$(fmt_sec "$rms")" "$(fmt_sec "$vms")" "$vok" "$dok" >>"$TSV"
+    if ! verify_bound_corpus; then
+        write_fail_row "$e" "$ver" "corpus manifest after engine"
+        return 0
+    fi
+    write_measured_row "$e" "$ver" "$repo_kib" \
+        "$(fmt_sec "$bms")" "$(fmt_sec "$rms")" "$(fmt_sec "$vms")" "$vok" "$dok"
     echo "[$e] $ver: repo=${repo_kib}KiB backup=$(fmt_sec "$bms")s restore=$(fmt_sec "$rms")s verify=$(fmt_sec "$vms")s verify_ok=$vok diff_ok=$dok"
 }
 
@@ -449,16 +575,20 @@ render_md() {
         echo "# Repository Engine Qualification Spike — scripted re-run"
         echo ""
         echo "Generated by scripts/qualification-spike.sh on $(LC_ALL=C date '+%Y-%m-%d %H:%M:%S %Z')."
-        echo "Corpus: $CORPUS_DIR (target ${SIZE_MB} MB, $CORPUS_FILES files, $CORPUS_BYTES bytes). Raw values in results.tsv."
+        echo "Corpus: $CORPUS_DIR ($CORPUS_SCOPE, $CORPUS_FILES files, $CORPUS_BYTES bytes). Raw values in results.tsv."
+        echo ""
+        echo "Report contract: UTC=$RUN_UTC; host=$HOST_OS/$HOST_ARCH; corpus_kind=$CORPUS_KIND; corpus_label=$CORPUS_LABEL; corpus_digest=$CORPUS_DIGEST."
+        echo "The canonical per-file SHA-256 input inventory is corpus.manifest.json."
+        echo "Each TSV row records run_status/failure_step and logical, dedup, compression, repository-growth, catalog/index/model/temp overhead, and net-savings bytes. Unknown metrics are UNMEASURED; this probe is candidate evidence only and selects no engine."
         echo ""
         awk -F '\t' '
             BEGIN {
-                print "| Engine | Version | Corpus bytes | Repo KiB | Ratio | Backup s | Restore s | Verify s | Verify OK | Diff OK |"
-                print "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |"
+                print "| Engine | Version | Corpus bytes | Repo KiB | Ratio | Backup s | Restore s | Verify s | Verify OK | Diff OK | Status | Failure step |"
+                print "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- |"
             }
             NR > 1 {
-                printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n",
-                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+                printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n",
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $17, $18
             }
         ' "$TSV"
     } >"$WORK_DIR/results.md"
@@ -466,17 +596,28 @@ render_md() {
 
 # ---- main ------------------------------------------------------------------
 mkdir -p "$WORK_DIR"
-printf 'engine\tversion\tcorpus_bytes\trepo_kib\tratio\tbackup_sec\trestore_sec\tverify_sec\tverify_ok\tdiff_ok\n' >"$TSV"
+RUN_UTC=$(utc_now)
+HOST_OS=$(uname -s)
+HOST_ARCH=$(uname -m)
+CORPUS_KIND="$( [[ -n "$EXISTING_CORPUS" ]] && printf operator-supplied || printf generated-probe )"
+CORPUS_SCOPE="$( [[ -n "$EXISTING_CORPUS" ]] && printf 'operator-supplied corpus' || printf 'generated target %s MB' "$SIZE_MB" )"
+CORPUS_LABEL="${CORPUS_LABEL:-$(basename "$CORPUS_DIR")}"; CORPUS_DIGEST=UNMEASURED
+printf 'engine\tversion\tcorpus_bytes\trepo_kib\tratio\tbackup_sec\trestore_sec\tverify_sec\tverify_ok\tdiff_ok\trun_utc\thost_os\thost_arch\tcorpus_kind\tcorpus_label\tcorpus_digest\trun_status\tfailure_step\tlogical_bytes\tdedup_bytes\tcompression_bytes\trepository_growth_bytes\tcatalog_overhead_bytes\tindex_overhead_bytes\tmodel_overhead_bytes\ttemp_overhead_bytes\tnet_savings_bytes\n' >"$TSV"
 
 echo "=== corpus generation ==="
-generate_corpus
+if [[ -z "$EXISTING_CORPUS" ]]; then generate_corpus; fi
 corpus_stats
+bind_corpus_manifest
 
 echo ""
 echo "=== engine runs ==="
+verify_bound_corpus
 eng_kopia
+verify_bound_corpus
 eng_restic
+verify_bound_corpus
 eng_plakar
+verify_bound_corpus
 
 echo ""
 echo "=== results (results.tsv) ==="

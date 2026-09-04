@@ -130,7 +130,7 @@ The former in-tree go-fuse adapter, command ABI, CLI verbs, and dependency have 
 
 ### D7 — Processors and repository
 
-Status (2026-08-19): **candidate foundation implemented; qualification open**. Not blocked on FUSE. Raw and local-zstd drivers pass independent SHA-256 readback; local zstd also passes compression, whole-file dedup, corruption, relocation, profile-isolation, and signed-restore tests. Encryption, chunking, GC/repair, corpus measurements, mature-engine qualification, and reader closure remain. Isolated Tika/libarchive/ffprobe need Linux bubblewrap only if they join the default pack; otherwise keep them out. Cover-art extraction belongs here as an isolated processor, not as a new in-process ID3 picture parser.
+Status (2026-09-03): **candidate foundation implemented; qualification open**. Not blocked on FUSE. Raw and local-zstd drivers pass independent SHA-256 readback; local zstd also passes compression, whole-file dedup, corruption, relocation, profile-isolation, repair, migration, and signed-restore tests. Encryption admission, broader crash/migration rollback, representative corpus measurements, supported-host packaging, mature-engine qualification, and complete reader closure remain. Whole-file deduplication is sufficient; chunking is optional and unselected, while destructive GC is disabled with only `NON_DESTRUCTIVE_ONLY` planning. Isolated Tika/libarchive/ffprobe need Linux bubblewrap only if they join the default pack; otherwise keep them out. Cover-art extraction belongs here as an isolated processor, not as a new in-process ID3 picture parser.
 
 ### D8 — Later
 

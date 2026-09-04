@@ -2,9 +2,11 @@ package search
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,6 +15,65 @@ import (
 	"github.com/ailiheizi/restoreweave/server/internal/store/sqlite"
 	"github.com/ailiheizi/restoreweave/server/testutil"
 )
+
+func TestFailedRebuildRevokesLexicalReadinessUntilSuccessfulRetry(t *testing.T) {
+	ctx := context.Background()
+	store := testutil.OpenStore(t, filepath.Join(t.TempDir(), "catalog.sqlite"))
+	seed := testutil.SeedNamespace(t, store)
+	engineDir := t.TempDir()
+	indexer := &Indexer{Store: store, Engine: &Engine{Dir: engineDir}}
+	if _, err := indexer.Rebuild(ctx, seed.WorkspaceID, "snapshot:lexical-health", seed.RootID); err != nil {
+		t.Fatalf("initial rebuild: %v", err)
+	}
+	if indexer.LexicalUnavailable() || indexer.LexicalFailure() != "" {
+		t.Fatal("successful rebuild left lexical health failed")
+	}
+
+	brokenDir := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(brokenDir, []byte("occupied"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	indexer.Engine.Dir = brokenDir
+	if _, err := indexer.Rebuild(ctx, seed.WorkspaceID, "snapshot:lexical-failed", seed.RootID); err == nil {
+		t.Fatal("failed rebuild returned nil error")
+	}
+	if !indexer.LexicalUnavailable() || indexer.LexicalFailure() == "" {
+		t.Fatal("failed rebuild did not revoke lexical readiness")
+	}
+	// The previously published FTS file remains present, but its stale
+	// generation must not be advertised as current while the latest rebuild is
+	// known to have failed.
+	indexer.Engine.Dir = engineDir
+	if _, err := indexer.Rebuild(ctx, seed.WorkspaceID, "snapshot:lexical-retry", seed.RootID); err != nil {
+		t.Fatalf("successful retry: %v", err)
+	}
+	if indexer.LexicalUnavailable() || indexer.LexicalFailure() != "" {
+		t.Fatal("successful retry did not clear lexical health failure")
+	}
+}
+
+func TestLexicalFailureIsScopedToWorkspace(t *testing.T) {
+	indexer := &Indexer{}
+	indexer.setLexicalWorkspaceFailure("workspace:failed", "engine unavailable")
+
+	if !indexer.LexicalUnavailableForWorkspace("workspace:failed") {
+		t.Fatal("failed workspace was not marked unavailable")
+	}
+	if got := indexer.LexicalFailureForWorkspace("workspace:failed"); got != "engine unavailable" {
+		t.Fatalf("failure = %q, want engine unavailable", got)
+	}
+	if indexer.LexicalUnavailableForWorkspace("workspace:healthy") {
+		t.Fatal("failure leaked into another workspace")
+	}
+	if got := indexer.LexicalFailureForWorkspace("workspace:healthy"); got != "" {
+		t.Fatalf("healthy workspace failure = %q, want empty", got)
+	}
+
+	indexer.setLexicalWorkspaceFailure("workspace:failed", "")
+	if indexer.LexicalUnavailableForWorkspace("workspace:failed") {
+		t.Fatal("successful retry did not clear workspace failure")
+	}
+}
 
 func TestSemanticQueryCannotRestoreReadinessFromPartialHits(t *testing.T) {
 	ctx := context.Background()
@@ -351,6 +412,122 @@ func mustSearchID(t *testing.T, prefix string) string {
 		t.Fatal(err)
 	}
 	return id
+}
+
+func TestIndexerPinnedGenerationRequiresNonEmptyMatchingWorkspace(t *testing.T) {
+	ctx := context.Background()
+	catalogPath := filepath.Join(t.TempDir(), "catalog.sqlite")
+	store := testutil.OpenStore(t, catalogPath)
+	seed := testutil.SeedNamespace(t, store)
+	engine := &Engine{Dir: t.TempDir()}
+	generationID := mustSearchID(t, sqlite.IDPrefixIndexGeneration)
+	dbPath, err := engine.Build(ctx, generationID, []Document{{
+		SubjectID: seed.FileEntryID,
+		Name:      "query.txt",
+		EntryType: string(sqlite.EntryFile),
+	}})
+	if err != nil {
+		t.Fatalf("build lexical: %v", err)
+	}
+	if err := store.InsertIndexGeneration(ctx, &sqlite.IndexGeneration{
+		ID: generationID, WorkspaceID: seed.WorkspaceID, SnapshotRef: "snapshot:workspace-bound",
+		NamespaceRootID: seed.RootID, DBPath: dbPath, Dimension: DimensionLexical,
+	}); err != nil {
+		t.Fatalf("insert lexical generation: %v", err)
+	}
+
+	// Simulate a malformed legacy or externally corrupted catalog row. The
+	// supported writer rejects an empty workspace, but a pinned query must
+	// still fail closed if one is encountered during readback.
+	rawDB, err := sql.Open("sqlite", catalogPath)
+	if err != nil {
+		t.Fatalf("open raw catalog: %v", err)
+	}
+	defer rawDB.Close()
+	if _, err := rawDB.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+		t.Fatalf("disable raw foreign keys: %v", err)
+	}
+	if _, err := rawDB.ExecContext(ctx, `
+UPDATE index_generations SET workspace_id = '' WHERE generation_id = ?`, generationID); err != nil {
+		t.Fatalf("corrupt generation workspace: %v", err)
+	}
+
+	if _, _, err := (&Indexer{Store: store, Engine: engine}).Query(ctx, QueryRequest{
+		WorkspaceID: seed.WorkspaceID, GenerationID: generationID,
+		Dimension: DimensionLexical, Text: "query",
+	}); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("empty generation workspace error = %v, want ErrUnavailable", err)
+	}
+}
+
+func TestIndexerEmptyProviderCandidatesRequireUsableLexicalAuthority(t *testing.T) {
+	ctx := context.Background()
+	store := testutil.OpenStore(t, filepath.Join(t.TempDir(), "catalog.sqlite"))
+	seed := testutil.SeedNamespace(t, store)
+	engine := &Engine{Dir: t.TempDir()}
+
+	lexicalID := mustSearchID(t, sqlite.IDPrefixIndexGeneration)
+	lexicalPath, err := engine.Build(ctx, lexicalID, []Document{{
+		SubjectID: seed.FileEntryID,
+		Name:      "query.txt",
+		EntryType: string(sqlite.EntryFile),
+	}})
+	if err != nil {
+		t.Fatalf("build lexical: %v", err)
+	}
+	if err := store.InsertIndexGeneration(ctx, &sqlite.IndexGeneration{
+		ID: lexicalID, WorkspaceID: seed.WorkspaceID, SnapshotRef: "snapshot:filter-authority",
+		NamespaceRootID: seed.RootID, DBPath: lexicalPath, Dimension: DimensionLexical,
+	}); err != nil {
+		t.Fatalf("insert lexical generation: %v", err)
+	}
+
+	semanticID := mustSearchID(t, sqlite.IDPrefixIndexGeneration)
+	semanticPath, err := engine.BuildTokens(ctx, semanticID, []TokenDocument{{
+		SubjectID: seed.FileEntryID,
+		Token:     fixtureToken("sem1", "query"),
+		Space:     SemanticFixtureProfileV1,
+		Name:      "query.txt",
+		EntryType: string(sqlite.EntryFile),
+	}})
+	if err != nil {
+		t.Fatalf("build semantic: %v", err)
+	}
+	if err := store.InsertIndexGeneration(ctx, &sqlite.IndexGeneration{
+		ID: semanticID, WorkspaceID: seed.WorkspaceID, SnapshotRef: "snapshot:filter-authority",
+		NamespaceRootID: seed.RootID, DBPath: semanticPath, Dimension: DimensionSemantic,
+	}); err != nil {
+		t.Fatalf("insert semantic generation: %v", err)
+	}
+	indexer := &Indexer{Store: store, Engine: engine, EnableFixtureDimensions: true}
+	query := QueryRequest{
+		WorkspaceID: seed.WorkspaceID, GenerationID: semanticID,
+		Dimension: DimensionSemantic, Text: "no-provider-candidate",
+		Filters: Filters{EntryType: string(sqlite.EntryFile)},
+	}
+
+	if err := engine.RemoveFile(lexicalPath); err != nil {
+		t.Fatalf("remove lexical projection: %v", err)
+	}
+	if _, _, err := indexer.Query(ctx, query); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("empty candidates with missing lexical authority error = %v, want ErrUnavailable", err)
+	}
+
+	wrongSchemaID := mustSearchID(t, sqlite.IDPrefixIndexGeneration)
+	wrongSchemaPath, err := engine.BuildTokens(ctx, wrongSchemaID, nil)
+	if err != nil {
+		t.Fatalf("build wrong-schema projection: %v", err)
+	}
+	if err := store.InsertIndexGeneration(ctx, &sqlite.IndexGeneration{
+		ID: mustSearchID(t, sqlite.IDPrefixIndexGeneration), WorkspaceID: seed.WorkspaceID,
+		SnapshotRef: "snapshot:filter-authority", NamespaceRootID: seed.RootID,
+		DBPath: wrongSchemaPath, Dimension: DimensionLexical, CreatedAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("insert wrong-schema lexical generation: %v", err)
+	}
+	if _, _, err := indexer.Query(ctx, query); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("empty candidates with wrong-schema lexical authority error = %v, want ErrUnavailable", err)
+	}
 }
 
 func TestIndexerNonLexicalQueriesUseLexicalFilterAllowlist(t *testing.T) {

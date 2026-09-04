@@ -6,6 +6,14 @@
 - Added detailed Chinese and English public README guides.
 - Reconciled public capability and roadmap wording with the tested core preview.
 - Marked the removed Inbox, OpenSubsonic, and OPDS adapters as historical.
+- Added read-only repository capacity reporting and honest per-item tag, lexical,
+  and semantic index-status projections.
+- Added the explicit fixed BGE bundle installer, deterministic candidate-only
+  offline artifact assembly, and real semantic qualification evidence.
+- Strengthened bounded processor retry, process-crash takeover, repository
+  migration, encryption-boundary, and representative-corpus test evidence.
+- Refined the responsive WebUI and added sanitized Chinese and English product
+  screenshots for the current unreleased preview.
 
 ## v0.1.0-prealpha.1 - 2026-08-25
 

@@ -6,7 +6,48 @@
 
 **Store fewer duplicate bytes. Find content more easily. Restore with proof.**
 
-> Current version: `v0.1.0-prealpha.1` core preview. The main core workflow is implemented and tested for the current development profile, but this is not a production release. There is no supported installer, automatic model installation, qualified production repository, or complete multi-platform release guarantee yet.
+For a short tour of the workflow and current boundaries, see the [RestoreWeave Wiki](docs/wiki/README.md). The detailed requirements and ADRs linked from [docs/README.md](docs/README.md) remain authoritative.
+
+> Current `main`: an unreleased core preview after `v0.1.0-prealpha.1`. The tested workflow is “configure → preview → exact save and whole-file dedup → lexical/optional BGE search → multiple tags and Notes → exact restore.” This is not a production release: LinkGroup, supported installers, production repository qualification, and complete multi-platform guarantees remain open.
+
+![RestoreWeave content-first library with unified search, multiple tags, Notes, protection, and index status](docs/assets/screenshots/unreleased/library-en.png)
+
+_A real running WebUI populated only with sanitized demo data built from this repository's documents._
+
+## Start the WebUI in 5 minutes
+
+Use Go 1.26 (or the version declared by `go.mod`) and a Node.js version supported by Vite 7:
+
+```bash
+git clone https://github.com/ailiheizi/restoreweave.git
+cd restoreweave
+
+go build -tags=purego -o bin/restoreweaved ./server/cmd/restoreweaved
+go build -o bin/rw ./client/cmd/rw
+bin/rw config init --path ./restoreweave.toml
+```
+
+Enable the local API in the generated config:
+
+```toml
+[api]
+enabled = true
+listen = "127.0.0.1:4534"
+```
+
+Start the daemon and development frontend in separate terminals:
+
+```bash
+# Terminal 1
+bin/restoreweaved --config ./restoreweave.toml --socket /tmp/restoreweaved.sock
+
+# Terminal 2
+cd web
+npm ci
+npm run dev
+```
+
+Open `http://127.0.0.1:5173/`. The API is currently a loopback convenience adapter; do not expose it directly to the public network. Remote deployment still requires TLS, authentication, authorization, audit, and separate qualification.
 
 ## What the core is
 
@@ -38,7 +79,7 @@ The list below is organized around user-visible work. Except where marked as a c
 - Persisted TOML configuration, with read compatibility for older YAML profiles.
 - Explicit catalog, repository, vector, model, and publication-signing-material locations.
 - Relative paths resolve against the config file, never an accidental daemon working directory.
-- The config CLI provides separate `rw config init --path <file>`, `rw config validate --path <file>`, and `rw config show --path <file>` commands; the daemon uses `restoreweaved --config <file>`, with environment overrides also available.
+- The config CLI provides separate `rw config init --path <file>`, `rw config validate --path <file>`, and `rw config show --path <file> --effective` commands; the daemon uses `restoreweaved --config <file>`, with environment overrides also available.
 - A configuration digest bound to plans, snapshots, Descriptions, and index/semantic generations.
 - Status and diagnostics for the daemon, catalog, repository, indexes, plans, jobs, and providers.
 
@@ -62,6 +103,10 @@ The list below is organized around user-visible work. Except where marked as a c
 - Protection preview separates logical bytes from bytes that actually need new repository placement.
 - Exact whole-file deduplication is the current default. Chunk deduplication is not presented as an existing feature or a core-completion requirement.
 
+![A real pre-save storage plan showing logical size, new bytes, and duplicate bytes expected to be reused](docs/assets/screenshots/unreleased/protection-plan-en.png)
+
+_The preview records a plan but writes no file bytes; duplicate savings are an exact pre-save estimate._
+
 ### Notes, tags, and extracted information
 
 - Multiple editable, revisioned Notes can be attached to one file.
@@ -71,7 +116,7 @@ The list below is organized around user-visible work. Except where marked as a c
 - The default library is content-first. Original directories remain provenance and a recovery projection under the secondary source-path browser, not the primary organization.
 - User-authored, imported, extracted, and model-produced text appears in the same Notes surface, with source, producer, or editability labels where relevant.
 - The backend still retains revisioned description records with source, language, producer, predecessor revision, and semantic segments for search, recovery, and audit; this is not a second user-facing concept.
-- AI description generation is never implicit: it runs only when explicitly requested, and ingest does not generate it automatically.
+- The default build does not bundle an AI description generator. Generation can run on demand only after an admitted provider is explicitly configured; ingest never triggers it automatically.
 - Basic built-in extraction covers UTF-8 text, ID3/FLAC/OGG audio tags, and EPUB OPF metadata.
 - Processor results carry provenance. Failure, timeout, or unavailability never grants content-identity or recovery authority.
 
@@ -133,7 +178,7 @@ open Add content
 -> search and add multiple Notes
 -> run a descriptive BGE semantic query
 -> inspect SHA-256 and protection state
--> configure storage paths, local BGE/online replacement profiles, Notes, recovery, and service options in Settings
+-> configure storage paths, local BGE/online replacement profiles, recovery, and service options in Settings
 -> validate and atomically update the same TOML profile, with an explicit restart notice when required
 -> Preview restore
 -> restore to a new empty directory and verify
@@ -200,7 +245,7 @@ Catalog, repository, and index are separate logical layers; they do not require 
 | --- | --- |
 | Config, scan, plans, SHA-256 identity, whole-file dedup, exact protection | Implemented and tested for the development profile |
 | Notes presentation, backend description records, and lexical/structured search | Implemented and tested for the stated field scope |
-| BGE-small-zh + ONNX + zvec | Implemented and tested with an explicitly provisioned real bundle; not packaged yet |
+| BGE-small-zh + ONNX + zvec | Implemented and tested with an explicitly provisioned real bundle; a verifiable candidate offline assembler exists, but no supported package does |
 | Signed recovery, clean reader, tamper rejection, fencing, reconciliation | Implemented and tested for the admitted development profile |
 | SavedView, ExportManifest, materialize/verify | Implemented and tested for local scope; not release-qualified |
 | React WebUI and loopback API | Usable core convenience surface; not a remote administration platform |
@@ -210,46 +255,9 @@ Catalog, repository, and index are separate logical layers; they do not require 
 | GC | `NON_DESTRUCTIVE_ONLY` reachability planning; no deletion executor |
 | `RW-MVP-1` | Not complete or release-qualified |
 
-## Quick WebUI start
-
-Use Go 1.26 (or the version declared by `go.mod`) and a Node.js version supported by Vite 7:
-
-```bash
-git clone https://github.com/ailiheizi/restoreweave.git
-cd restoreweave
-
-go build -tags=purego -o bin/restoreweaved ./server/cmd/restoreweaved
-go build -o bin/rw ./client/cmd/rw
-bin/rw config init --path ./restoreweave.toml
-```
-
-Enable the local API in the generated config:
-
-```toml
-[api]
-enabled = true
-listen = "127.0.0.1:4534"
-```
-
-Start the daemon in terminal 1:
-
-```bash
-bin/restoreweaved --config ./restoreweave.toml --socket /tmp/restoreweaved.sock
-```
-
-Start the frontend in terminal 2:
-
-```bash
-cd web
-npm ci
-npm run dev
-```
-
-Open `http://127.0.0.1:5173/`. The current API is designed only as a loopback convenience adapter. Do not expose it directly to the public network. Remote deployment still requires TLS, authentication, authorization, audit, and separate qualification.
-
 ## BGE model
 
-The personal profile selects `BAAI/bge-small-zh-v1.5`, but the model, ONNX Runtime, and native zvec bundle are not downloaded automatically from this repository. Provision a digest-verified platform bundle yourself:
+The personal profile selects `BAAI/bge-small-zh-v1.5`. The model, ONNX Runtime, and native zvec bundle are never downloaded silently at daemon startup or on the first query. You can explicitly invoke the fixed development installer from Settings or the CLI, or import a retained offline bundle archive. The installer verifies the pinned digests and atomically publishes the bundle under:
 
 ```text
 <paths.models>/bge-small-zh-v1.5/<goos>-<goarch>/
@@ -261,7 +269,19 @@ Example default location for Darwin ARM64:
 ~/.local/share/restoreweave/models/bge-small-zh-v1.5/darwin-arm64/
 ```
 
-You can also pass `--semantic-bundle`. Without the bundle, the daemon honestly reports semantic search unavailable; it never substitutes fixture vectors for a real model.
+The online development entry point is `rw semantic bundle install`; the offline entry point is `rw semantic bundle install --archive /absolute/path/to/bundle.tar.gz`. You can also pass the daemon an operator-provided bundle with `--semantic-bundle`. Without a bundle, the daemon honestly reports semantic search unavailable; it never substitutes fixture vectors for a real model. The installer and CLI path have automated coverage; Settings remains a development convenience and does not yet carry complete browser install, restart, and real-query release evidence.
+
+Developers may use `scripts/package-offline.sh` to combine prebuilt daemon,
+CLI, `web/dist`, and an offline semantic archive into one candidate `.tar.gz`
+with per-file SHA-256 values, the MIT license, and separated third-party
+NOTICE/SBOM evidence. The artifact is explicitly marked
+`CANDIDATE_ONLY_NOT_SUPPORTED`; it is not a supported installer and does not
+replace Linux/NAS clean-host qualification.
+
+The script rejects daemons without the exact `-tags=purego` build, without the
+pinned zvec-go version or module sum, or whose GOOS/GOARCH differs from the
+artifact platform labels. This prevents fixture or semantic-unavailable builds
+from being presented as a real in-process-zvec candidate.
 
 When building the daemon from source today, keep the `-tags=purego` flag shown above so the real zvec backend is compiled in. A development build without that tag contains only the explicitly unavailable placeholder. A future supported package should ship the correct variant without exposing build tags to users.
 
@@ -271,10 +291,10 @@ The model, ONNX Runtime, zvec, and Go binding each retain their own license, NOT
 
 Near-term work is limited to turning the existing core into a releasable product:
 
-1. **Formal background work:** release-qualify the existing bounded same-plan retry worker, and define a separate signed successor contract for user-triggered, rerouted, or general reprocessing.
+1. **Background-worker release acceptance:** the bounded same-plan retry worker is implemented and tested; target release hosts still need resource, upgrade, and long-running acceptance. User-triggered, rerouted, or general reprocessing still requires a separate signed successor contract.
 2. **Offline packaging:** package the daemon, WebUI, ONNX Runtime, BGE model/tokenizer, and zvec without first-query downloads.
 3. **Production repository qualification:** use representative corpora to select one lossless repository profile and fully test encryption, corruption, repair, relocation, migration, rollback, clean reading, and real net savings.
-4. **Complete daily experience:** expose writable configuration, diagnostics, SavedViews, ExportManifests, backup/upgrade/recovery guidance in the WebUI, and remove internal IDs from ordinary workflows.
+4. **Complete daily experience:** expose SavedViews, ExportManifests, backup/upgrade/recovery guidance in the WebUI, and remove internal IDs from those ordinary workflows.
 5. **Release qualification:** measure search coverage, semantic latency, storage growth, recovery time, upgrade/rollback, and clean-install behavior on Linux and NAS-like corpora.
 
 Longer-term options enter the core queue only when concrete demand exists: reviewed source migration and capacity release, more extractors/OCR/ASR/CLIP, alternate embedding or repository profiles, multiple repositories and tiering, and enterprise remote management, RBAC, and HA. RWKV/Transformer compression can only be a future explicit research profile that is reversible, migratable, and has a safe fallback.
@@ -304,7 +324,7 @@ npm ci
 npm run build
 ```
 
-The repository currently contains more than 400 Go test entry points, including real daemon/CLI, semantic-bundle, index-rebuild, recovery, tamper, migration, and cross-process scenarios. The tests prove their declared scope; they do not imply support for every platform or production environment.
+The repository contains hundreds of Go test entry points, including real daemon/CLI, semantic-bundle, index-rebuild, recovery, tamper, migration, and cross-process scenarios. The tests prove their declared scope; they do not imply support for every platform or production environment.
 
 ## Documentation and license
 

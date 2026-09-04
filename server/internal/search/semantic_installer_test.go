@@ -774,6 +774,178 @@ func semanticInstallerTestSpecs(t *testing.T, platform semanticBundleInstallPlat
 	return specs, values
 }
 
+func TestPackageSemanticBundleArchiveIsDeterministicAndInstallsOffline(t *testing.T) {
+	sourceRoot, descriptor := testSemanticBundle(t)
+	writeOfflineBundleManifest(t, sourceRoot, descriptor)
+	admission, err := AdmitSemanticBundle(sourceRoot, descriptor)
+	if err != nil {
+		t.Fatalf("admit source: %v", err)
+	}
+	archiveRoot := t.TempDir()
+	firstPath := filepath.Join(archiveRoot, "bundle.tar.gz")
+	first, err := PackageSemanticBundleArchive(context.Background(), firstPath, sourceRoot, admission)
+	if err != nil {
+		t.Fatalf("package archive: %v", err)
+	}
+	secondPath := filepath.Join(archiveRoot, "bundle-copy.tar.gz")
+	second, err := PackageSemanticBundleArchive(context.Background(), secondPath, sourceRoot, admission)
+	if err != nil {
+		t.Fatalf("package second archive: %v", err)
+	}
+	firstBytes, err := os.ReadFile(firstPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBytes, err := os.ReadFile(secondPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(firstBytes, secondBytes) || first.SHA256 != second.SHA256 || first.Size != uint64(len(firstBytes)) {
+		t.Fatalf("archive is not deterministic: first=%+v second=%+v bytes=%v/%v", first, second, len(firstBytes), len(secondBytes))
+	}
+	if first.ProfileDigest != admission.ProfileDigest || first.PlatformOS != runtime.GOOS || first.PlatformArch != runtime.GOARCH {
+		t.Fatalf("archive identity = %+v, admission = %+v", first, admission)
+	}
+
+	modelsRoot := filepath.Join(t.TempDir(), "models")
+	installed, err := installSemanticBundleFromArchive(context.Background(), modelsRoot, firstPath, false)
+	if err != nil {
+		t.Fatalf("offline install: %v", err)
+	}
+	destination := filepath.Join(modelsRoot, SemanticBundleBGEProfileID, runtime.GOOS+"-"+runtime.GOARCH)
+	if installed.ProfileDigest != admission.ProfileDigest {
+		t.Fatalf("installed profile = %q, want %q", installed.ProfileDigest, admission.ProfileDigest)
+	}
+	model, err := ReadSemanticBundleAsset(context.Background(), destination, installed, "model")
+	if err != nil {
+		t.Fatalf("read installed model: %v", err)
+	}
+	if !bytes.Equal(model, []byte("bge-model-fixture")) {
+		t.Fatalf("installed model = %q", model)
+	}
+}
+
+func TestInstallSemanticBundleArchiveRejectsTamperTraversalAndWrongPlatform(t *testing.T) {
+	sourceRoot, descriptor := testSemanticBundle(t)
+	writeOfflineBundleManifest(t, sourceRoot, descriptor)
+	if _, err := AdmitSemanticBundle(sourceRoot, descriptor); err != nil {
+		t.Fatalf("admit source: %v", err)
+	}
+	assetBytes := make(map[string][]byte, len(descriptor.assets()))
+	for _, entry := range descriptor.assets() {
+		payload, readErr := os.ReadFile(filepath.Join(sourceRoot, filepath.FromSlash(entry.Asset.Path)))
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		assetBytes[entry.Asset.Path] = payload
+	}
+	archiveBytes := func(t *testing.T, d SemanticBundleDescriptor, assets map[string][]byte, extra ...semanticInstallerTarNamedEntry) []byte {
+		t.Helper()
+		manifest, marshalErr := json.Marshal(d)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		entries := []semanticInstallerTarNamedEntry{{name: SemanticBundleManifestName, entry: semanticInstallerTarEntry{kind: tar.TypeReg, data: manifest}}}
+		for _, entry := range d.assets() {
+			entries = append(entries, semanticInstallerTarNamedEntry{name: entry.Asset.Path, entry: semanticInstallerTarEntry{kind: tar.TypeReg, data: assets[entry.Asset.Path]}})
+		}
+		entries = append(entries, extra...)
+		return semanticInstallerTarGzSequence(t, entries)
+	}
+	tests := []struct {
+		name  string
+		bytes []byte
+	}{
+		{
+			name:  "traversal",
+			bytes: semanticInstallerTarGz(t, map[string]semanticInstallerTarEntry{"../escape": {kind: tar.TypeReg, data: []byte("escape")}}),
+		},
+		{
+			name: "tampered asset",
+			bytes: func() []byte {
+				mutated := map[string][]byte{}
+				for name, payload := range assetBytes {
+					mutated[name] = append([]byte(nil), payload...)
+				}
+				mutated[descriptor.Model.Path] = []byte("tampered")
+				return archiveBytes(t, descriptor, mutated)
+			}(),
+		},
+		{
+			name: "wrong platform",
+			bytes: func() []byte {
+				mutated := descriptor
+				mutated.PlatformArch = "unsupported-architecture"
+				return archiveBytes(t, mutated, assetBytes)
+			}(),
+		},
+		{
+			name:  "symlink entry",
+			bytes: archiveBytes(t, descriptor, assetBytes, semanticInstallerTarNamedEntry{name: "unexpected", entry: semanticInstallerTarEntry{kind: tar.TypeSymlink, data: []byte("target")}}),
+		},
+		{
+			name:  "unlisted regular file",
+			bytes: archiveBytes(t, descriptor, assetBytes, semanticInstallerTarNamedEntry{name: "unexpected.bin", entry: semanticInstallerTarEntry{kind: tar.TypeReg, data: []byte("unexpected")}}),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			archivePath := filepath.Join(t.TempDir(), "bundle.tar.gz")
+			if err := os.WriteFile(archivePath, test.bytes, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			modelsRoot := filepath.Join(t.TempDir(), "models")
+			if _, err := installSemanticBundleFromArchive(context.Background(), modelsRoot, archivePath, false); err == nil {
+				t.Fatal("hostile archive was accepted")
+			}
+			destination := filepath.Join(modelsRoot, SemanticBundleBGEProfileID, runtime.GOOS+"-"+runtime.GOARCH)
+			if _, statErr := os.Lstat(destination); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("hostile archive published destination: %v", statErr)
+			}
+		})
+	}
+	floodEntries := make([]semanticInstallerTarNamedEntry, 0, semanticInstallerArchiveMaxEntries+1)
+	for i := 0; i < semanticInstallerArchiveMaxEntries+1; i++ {
+		floodEntries = append(floodEntries, semanticInstallerTarNamedEntry{
+			name:  fmt.Sprintf("zero-%02d", i),
+			entry: semanticInstallerTarEntry{kind: tar.TypeReg},
+		})
+	}
+	t.Run("entry flood", func(t *testing.T) {
+		archivePath := filepath.Join(t.TempDir(), "bundle.tar.gz")
+		if err := os.WriteFile(archivePath, semanticInstallerTarGzSequence(t, floodEntries), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		modelsRoot := filepath.Join(t.TempDir(), "models")
+		if _, err := installSemanticBundleFromArchive(context.Background(), modelsRoot, archivePath, false); err == nil {
+			t.Fatal("entry-flood archive was accepted")
+		}
+		destination := filepath.Join(modelsRoot, SemanticBundleBGEProfileID, runtime.GOOS+"-"+runtime.GOARCH)
+		if _, statErr := os.Lstat(destination); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("entry-flood archive published destination: %v", statErr)
+		}
+	})
+	t.Run("archive symlink", func(t *testing.T) {
+		archiveDir := t.TempDir()
+		outside := filepath.Join(archiveDir, "outside.tar.gz")
+		if err := os.WriteFile(outside, archiveBytes(t, descriptor, assetBytes), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		archivePath := filepath.Join(archiveDir, "bundle.tar.gz")
+		if err := os.Symlink(outside, archivePath); err != nil {
+			t.Fatal(err)
+		}
+		modelsRoot := filepath.Join(t.TempDir(), "models")
+		if _, err := installSemanticBundleFromArchive(context.Background(), modelsRoot, archivePath, false); err == nil {
+			t.Fatal("archive symlink was accepted")
+		}
+		destination := filepath.Join(modelsRoot, SemanticBundleBGEProfileID, runtime.GOOS+"-"+runtime.GOARCH)
+		if _, statErr := os.Lstat(destination); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("archive symlink published destination: %v", statErr)
+		}
+	})
+}
+
 func TestSemanticInstallerRejectsTwoCoreLibraryVersions(t *testing.T) {
 	archive := semanticInstallerTarGz(t, map[string]semanticInstallerTarEntry{
 		"libonnxruntime.1.29.0.dylib": {kind: tar.TypeReg, data: []byte("one")},
@@ -838,8 +1010,21 @@ func TestInstallSemanticBundleFromDirectoryIsOfflineAndIdempotent(t *testing.T) 
 	if second.ProfileDigest != first.ProfileDigest || second.Descriptor != first.Descriptor {
 		t.Fatalf("repeat admission changed: first=%+v second=%+v", first, second)
 	}
-	if _, err := LoadSemanticBundle(sourceRoot); err != nil {
-		t.Fatalf("source was changed by install: %v", err)
+	// The installed tree is the retained offline custody copy.  Once the
+	// source directory is removed, it must remain loadable and profile-bound;
+	// no network or source fallback is permitted on a later read.
+	if err := os.RemoveAll(sourceRoot); err != nil {
+		t.Fatalf("remove offline source: %v", err)
+	}
+	retained, err := LoadSemanticBundle(destination)
+	if err != nil {
+		t.Fatalf("retained offline bundle: %v", err)
+	}
+	if retained.ProfileDigest != first.ProfileDigest {
+		t.Fatalf("retained profile = %q, want %q", retained.ProfileDigest, first.ProfileDigest)
+	}
+	if _, err := ReadSemanticBundleAsset(context.Background(), destination, retained, "model"); err != nil {
+		t.Fatalf("retained model readback: %v", err)
 	}
 }
 

@@ -84,7 +84,7 @@ func TestSemanticBundleInstallStrictInputAndIndependentCapability(t *testing.T) 
 		t.Fatalf("semantic dimension = %+v, want unavailable until restart/rebuild", semantic)
 	}
 
-	for _, input := range []string{`{"url":"https://example.invalid"}`, `null`, `[]`} {
+	for _, input := range []string{`{"url":"https://example.invalid"}`, `{"archive_path":" /tmp/bundle.tar.gz"}`, `{"archive_path":"bundle.tar.gz"}`, `null`, `[]`} {
 		bad := dispatcher.Handle(context.Background(), command.Envelope{
 			Operation: command.OpSemanticBundleInstall, Input: []byte(input),
 		})
@@ -94,6 +94,36 @@ func TestSemanticBundleInstallStrictInputAndIndependentCapability(t *testing.T) 
 	}
 	if callbackCalls != 1 {
 		t.Fatalf("invalid inputs invoked callback %d times", callbackCalls)
+	}
+}
+
+func TestSemanticBundleInstallArchiveInputUsesOfflineInstaller(t *testing.T) {
+	store := testutil.OpenStore(t, filepath.Join(t.TempDir(), "catalog.sqlite"))
+	modelsRoot := filepath.Join(t.TempDir(), "models")
+	const archivePath = "/var/lib/restoreweave/bge.tar.gz"
+	var onlineCalls, offlineCalls int
+	dispatcher := NewDispatcher(store, "catalog.sqlite", "/tmp/rw.sock",
+		WithSemanticBundleInstaller(modelsRoot, func(context.Context, string) (SemanticBundleInstallReceipt, error) {
+			onlineCalls++
+			return SemanticBundleInstallReceipt{}, errors.New("online installer must not be selected")
+		}),
+		WithSemanticBundleArchiveInstaller(modelsRoot, func(_ context.Context, root, path string) (SemanticBundleInstallReceipt, error) {
+			offlineCalls++
+			if root != modelsRoot || path != archivePath {
+				return SemanticBundleInstallReceipt{}, errors.New("offline installer received wrong paths")
+			}
+			return controlPlaneTestSemanticBundle(t, modelsRoot)
+		}),
+	)
+	result := dispatcher.Handle(context.Background(), command.Envelope{
+		Operation: command.OpSemanticBundleInstall,
+		Input:     []byte(`{"archive_path":"/var/lib/restoreweave/bge.tar.gz"}`),
+	})
+	if result.Status != command.StatusSucceeded {
+		t.Fatalf("offline install = %s, reasons=%+v", result.Status, result.Reasons)
+	}
+	if onlineCalls != 0 || offlineCalls != 1 {
+		t.Fatalf("installer calls online=%d offline=%d", onlineCalls, offlineCalls)
 	}
 }
 

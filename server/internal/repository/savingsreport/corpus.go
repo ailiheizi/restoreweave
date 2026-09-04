@@ -11,6 +11,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -59,7 +60,10 @@ type CandidateEvidence struct {
 	Profile              repository.ProfileDescription `json:"profile"`
 	Capabilities         repository.CapabilityProfile  `json:"capabilities"`
 	Corpus               CorpusManifest                `json:"corpus"`
+	Repository           CorpusManifest                `json:"repository_manifest"`
+	Correlation          string                        `json:"correlation"`
 	Report               repository.SavingsReport      `json:"report"`
+	Deployment           DeploymentSavings             `json:"deployment"`
 	DurationMilliseconds int64                         `json:"duration_ms"`
 	Unmeasured           []string                      `json:"unmeasured"`
 	MeasurementNotes     map[string]string             `json:"measurement_notes"`
@@ -133,6 +137,116 @@ func BuildCorpusManifest(root string) (CorpusManifest, error) {
 	}
 	manifest.Digest = digest
 	return manifest, nil
+}
+
+// ReadCorpusManifest reads an operator-supplied manifest and validates its
+// schema, entry shape, and canonical digest. Unknown JSON fields and trailing
+// JSON values are rejected so a manifest cannot silently change meaning.
+func ReadCorpusManifest(path string) (CorpusManifest, error) {
+	if strings.TrimSpace(path) == "" {
+		return CorpusManifest{}, errors.New("corpus manifest path is required")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return CorpusManifest{}, fmt.Errorf("open corpus manifest: %w", err)
+	}
+	defer file.Close()
+	var manifest CorpusManifest
+	decoder := json.NewDecoder(file)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&manifest); err != nil {
+		return CorpusManifest{}, fmt.Errorf("decode corpus manifest: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return CorpusManifest{}, errors.New("corpus manifest contains trailing JSON")
+		}
+		return CorpusManifest{}, fmt.Errorf("read corpus manifest: %w", err)
+	}
+	if err := validateCorpusManifest(manifest); err != nil {
+		return CorpusManifest{}, err
+	}
+	return manifest, nil
+}
+
+// VerifyCorpusManifest proves that the current corpus is exactly the corpus
+// described by an external manifest. It fails closed on missing/extra paths,
+// byte or digest drift, and any symlink/non-regular object encountered while
+// scanning.
+func VerifyCorpusManifest(root string, expected CorpusManifest) error {
+	if err := validateCorpusManifest(expected); err != nil {
+		return err
+	}
+	observed, err := BuildCorpusManifest(root)
+	if err != nil {
+		return fmt.Errorf("scan corpus for manifest verification: %w", err)
+	}
+	if !manifestEqual(expected, observed) {
+		return fmt.Errorf("corpus does not match operator manifest %q", expected.Digest)
+	}
+	return nil
+}
+
+func validateCorpusManifest(manifest CorpusManifest) error {
+	if manifest.Schema != corpusManifestSchema {
+		return fmt.Errorf("unsupported corpus manifest schema %q", manifest.Schema)
+	}
+	if len(manifest.Entries) == 0 {
+		return errors.New("corpus manifest contains no entries")
+	}
+	previous := ""
+	seen := make(map[string]struct{}, len(manifest.Entries))
+	for i, entry := range manifest.Entries {
+		if !isCanonicalCorpusPath(entry.Path) {
+			return fmt.Errorf("corpus manifest entry %d has unsafe path %q", i, entry.Path)
+		}
+		if entry.Bytes < 0 {
+			return fmt.Errorf("corpus manifest entry %q has negative length", entry.Path)
+		}
+		if len(entry.SHA256) != sha256.Size*2 {
+			return fmt.Errorf("corpus manifest entry %q has invalid sha256", entry.Path)
+		}
+		if strings.ToLower(entry.SHA256) != entry.SHA256 {
+			return fmt.Errorf("corpus manifest entry %q has non-canonical sha256", entry.Path)
+		}
+		if _, err := hex.DecodeString(entry.SHA256); err != nil {
+			return fmt.Errorf("corpus manifest entry %q has invalid sha256: %w", entry.Path, err)
+		}
+		if _, ok := seen[entry.Path]; ok {
+			return fmt.Errorf("corpus manifest contains duplicate path %q", entry.Path)
+		}
+		if i > 0 && entry.Path <= previous {
+			return errors.New("corpus manifest entries are not canonically sorted")
+		}
+		seen[entry.Path] = struct{}{}
+		previous = entry.Path
+	}
+	digest, err := manifestDigest(manifest)
+	if err != nil {
+		return fmt.Errorf("digest corpus manifest: %w", err)
+	}
+	if manifest.Digest != digest {
+		return errors.New("corpus manifest canonical digest mismatch")
+	}
+	return nil
+}
+
+// isCanonicalCorpusPath accepts only the slash-separated form emitted by
+// BuildCorpusManifest. Keeping the check here (before any filesystem access)
+// prevents an operator manifest from having multiple textual spellings for
+// the same member and makes its digest unambiguous.
+func isCanonicalCorpusPath(value string) bool {
+	if value == "" || strings.Contains(value, "\\") ||
+		filepath.IsAbs(filepath.FromSlash(value)) || path.Clean(value) != value {
+		return false
+	}
+	for _, component := range strings.Split(value, "/") {
+		if component == "" || component == "." || component == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 func hashFile(root, path string) (string, int64, error) {
@@ -353,18 +467,23 @@ func sameOrNested(parent, child string) bool {
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
-func candidateEvidence(manifest CorpusManifest, driver repository.Driver, profile repository.ProfileDescription, report repository.SavingsReport, started time.Time) CandidateEvidence {
-	// The runner owns only the repository root; the operational catalog is an
-	// external dependency and must remain visibly unmeasured in candidate
-	// evidence rather than looking like a measured zero.
-	unmeasured := []string{"catalog"}
-	for name, category := range map[string]repository.SavingsOverheadCategory{
-		"index":     report.Overhead.Index,
-		"model":     report.Overhead.Model,
-		"temporary": report.Overhead.Temporary,
-	} {
-		if category.Status == repository.SavingsCategoryUnmeasured {
-			unmeasured = append(unmeasured, name)
+func candidateEvidence(manifest CorpusManifest, driver repository.Driver, profile repository.ProfileDescription, report repository.SavingsReport, started time.Time, deployment ...DeploymentSavings) CandidateEvidence {
+	// Optional deployment paths are measured independently from the repository;
+	// omitted categories remain visibly unmeasured rather than becoming zero.
+	selectedDeployment := DeploymentSavings{
+		External: DeploymentOverhead{
+			Catalog: unmeasuredCategory(), Index: unmeasuredCategory(),
+			Model: unmeasuredCategory(), Temporary: unmeasuredCategory(),
+		},
+		Net: unmeasuredCategory(),
+	}
+	if len(deployment) > 0 {
+		selectedDeployment = deployment[0]
+	}
+	unmeasured := make([]string, 0, 4)
+	for _, item := range allDeploymentCategories(selectedDeployment.External) {
+		if item.category.Status == repository.SavingsCategoryUnmeasured {
+			unmeasured = append(unmeasured, item.name)
 		}
 	}
 	sort.Strings(unmeasured)
@@ -381,15 +500,28 @@ func candidateEvidence(manifest CorpusManifest, driver repository.Driver, profil
 		Profile:              profile,
 		Capabilities:         capabilities,
 		Corpus:               manifest,
+		Repository:           selectedDeployment.RepositoryManifest,
+		Correlation:          selectedDeployment.Correlation,
 		Report:               report,
+		Deployment:           selectedDeployment,
 		DurationMilliseconds: time.Since(started).Milliseconds(),
 		Unmeasured:           unmeasured,
 		MeasurementNotes: map[string]string{
 			"identity":       "sha256+length",
 			"deduplication":  "whole-file-exact",
 			"recovery":       "readback-verified",
-			"catalog":        "UNMEASURED_OUTSIDE_REPOSITORY_BOUNDARY",
+			"catalog":        categoryNote(selectedDeployment.External.Catalog),
+			"index":          categoryNote(selectedDeployment.External.Index),
+			"model":          categoryNote(selectedDeployment.External.Model),
+			"temporary":      categoryNote(selectedDeployment.External.Temporary),
 			"destructive_gc": "NOT_MEASURED_AND_NOT_ENABLED",
 		},
 	}
+}
+
+func categoryNote(category repository.SavingsOverheadCategory) string {
+	if category.Status == repository.SavingsCategoryMeasured {
+		return "MEASURED"
+	}
+	return string(repository.SavingsCategoryUnmeasured)
 }

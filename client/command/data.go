@@ -48,6 +48,12 @@ type RepositoryStatus struct {
 	CompressionProfile string `json:"compression_profile,omitempty"`
 	OK                 bool   `json:"ok"`
 	Snapshots          int    `json:"snapshots"`
+	CapacityState      string `json:"capacity_state,omitempty"`
+	CapacityTotal      uint64 `json:"capacity_total,omitempty"`
+	CapacityFree       uint64 `json:"capacity_free,omitempty"`
+	CapacityUsed       uint64 `json:"capacity_used,omitempty"`
+	CapacityMeasuredAt string `json:"capacity_measured_at,omitempty"`
+	CapacityReason     string `json:"capacity_reason,omitempty"`
 }
 
 type IdentifyStatus struct {
@@ -416,30 +422,41 @@ type ContentRootData struct {
 }
 
 type ContentItemData struct {
-	SubjectRef  string `json:"subject_ref"`
-	EntryID     string `json:"entry_id,omitempty"`
-	Name        string `json:"name"`
-	Path        string `json:"path"`
-	EntryType   string `json:"entry_type"`
-	ContentID   string `json:"content_id,omitempty"`
-	LogicalSize *int64 `json:"logical_size,omitempty"`
+	SubjectRef  string              `json:"subject_ref"`
+	EntryID     string              `json:"entry_id,omitempty"`
+	Name        string              `json:"name"`
+	Path        string              `json:"path"`
+	EntryType   string              `json:"entry_type"`
+	ContentID   string              `json:"content_id,omitempty"`
+	LogicalSize *int64              `json:"logical_size,omitempty"`
+	IndexStatus *ContentIndexStatus `json:"index_status,omitempty"`
+}
+
+// ContentIndexStatus is a read-only view of disposable discovery projections.
+// It is deliberately not durable state: callers must tolerate missing or
+// unavailable generations while exact content remains readable.
+type ContentIndexStatus struct {
+	Lexical  string `json:"lexical,omitempty"`
+	Semantic string `json:"semantic,omitempty"`
+	Tags     string `json:"tags,omitempty"`
 }
 
 // NamespaceEntryData is the client-visible projection of one namespace entry.
 // Raw byte names are never placed here; they appear only in readlink targets.
 type NamespaceEntryData struct {
-	ID                   string `json:"entry_id"`
-	SubjectRef           string `json:"subject_ref"`
-	RootID               string `json:"root_id"`
-	ParentID             string `json:"parent_id,omitempty"`
-	DisplayName          string `json:"display_name"`
-	EntryType            string `json:"entry_type"`
-	ContentID            string `json:"content_id,omitempty"`
-	FileVersionID        string `json:"file_version_id,omitempty"`
-	HardlinkGroupID      string `json:"hardlink_group_id,omitempty"`
-	LogicalSize          *int64 `json:"logical_size,omitempty"`
-	AllocatedSize        *int64 `json:"allocated_size,omitempty"`
-	SymlinkTargetDisplay string `json:"symlink_target_display,omitempty"`
+	ID                   string              `json:"entry_id"`
+	SubjectRef           string              `json:"subject_ref"`
+	RootID               string              `json:"root_id"`
+	ParentID             string              `json:"parent_id,omitempty"`
+	DisplayName          string              `json:"display_name"`
+	EntryType            string              `json:"entry_type"`
+	ContentID            string              `json:"content_id,omitempty"`
+	FileVersionID        string              `json:"file_version_id,omitempty"`
+	HardlinkGroupID      string              `json:"hardlink_group_id,omitempty"`
+	LogicalSize          *int64              `json:"logical_size,omitempty"`
+	AllocatedSize        *int64              `json:"allocated_size,omitempty"`
+	SymlinkTargetDisplay string              `json:"symlink_target_display,omitempty"`
+	IndexStatus          *ContentIndexStatus `json:"index_status,omitempty"`
 }
 
 // NamespaceStatData is the namespace.stat payload.
@@ -590,6 +607,7 @@ type SearchHitData struct {
 	ConstructAxes []string            `json:"construct_axes,omitempty"`
 	Dimensions    []string            `json:"dimensions,omitempty"`
 	Segments      []SearchSegmentData `json:"segments,omitempty"`
+	IndexStatus   *ContentIndexStatus `json:"index_status,omitempty"`
 }
 
 // SearchSegmentData preserves the description segment and provenance that
@@ -641,6 +659,13 @@ type SearchRebuildData struct {
 	SemanticGenerationRef string             `json:"semantic_generation_ref,omitempty"`
 	SemanticState         string             `json:"semantic_state"`
 	SemanticFailure       string             `json:"semantic_failure,omitempty"`
+}
+
+// SemanticBundleInstallInput selects the explicit installation source for the
+// fixed local BGE bundle. An empty object keeps the existing online installer;
+// archive_path selects a locally retained offline package.
+type SemanticBundleInstallInput struct {
+	ArchivePath string `json:"archive_path,omitempty"`
 }
 
 // SemanticBundleInstallData reports admission of the fixed local BGE bundle.

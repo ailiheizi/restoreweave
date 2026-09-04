@@ -140,6 +140,7 @@ func NewRootCommand() *exitCommand {
 	root.AddCommand(newViewCommand(env))
 	root.AddCommand(newExportCommand(env))
 	root.AddCommand(newSearchCommand(env))
+	root.AddCommand(newSemanticCommand(env))
 	root.AddCommand(newTagCommand(env))
 	root.AddCommand(newNoteCommand(env))
 	root.AddCommand(newAnnotationCommand(env))

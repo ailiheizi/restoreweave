@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestMigrateProfileCopiesVerifiedPayloadsAndRecordsWithoutMutatingSource(t *testing.T) {
@@ -412,6 +416,231 @@ func TestMigrateProfileInterruptedRetryReopensBothReaders(t *testing.T) {
 	}
 	if err := sourceAfterRetry.VerifyRecord(ctx, record); err != nil {
 		t.Fatalf("reopened source record: %v", err)
+	}
+}
+
+func TestMigrateProfileProcessCrashBeforePublishCanRetryAndReadersReopen(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		boundary     string
+		targetExists bool
+	}{
+		{name: "after payload", boundary: "after-payload"},
+		{name: "after record", boundary: "after-record"},
+		{name: "before publish", boundary: "before-publish", targetExists: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			root := t.TempDir()
+			sourceRoot := filepath.Join(root, "source")
+			targetRoot := filepath.Join(root, "target")
+			markerPath := filepath.Join(root, "migration-boundary.marker")
+			source, err := OpenDir(sourceRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payloads := [][]byte{
+				bytes.Repeat([]byte("process crash migration payload one\n"), 128),
+				bytes.Repeat([]byte("process crash migration payload two\n"), 96),
+			}
+			receipts := make([]Receipt, 0, len(payloads))
+			for _, payload := range payloads {
+				receipt, placeErr := source.Place(ctx, bytes.NewReader(payload))
+				if placeErr != nil {
+					t.Fatal(placeErr)
+				}
+				receipts = append(receipts, receipt)
+			}
+			records := make(map[RecordRole]RecordReceipt)
+			for _, role := range []RecordRole{RecordPreparedClosure, RecordPublicationCommit, RecordProcessorAttemptClosure, RecordPortableFactClosure} {
+				record, placeErr := source.PlaceRecord(ctx, role, strings.NewReader(fmt.Sprintf(`{"role":%q}`, role)))
+				if placeErr != nil {
+					t.Fatal(placeErr)
+				}
+				records[role] = record
+			}
+			if tc.targetExists {
+				if err := os.MkdirAll(targetRoot, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			cmd := exec.Command(os.Args[0], "-test.run=TestMigrateProfileProcessCrashHelperProcess")
+			cmd.Env = append(os.Environ(),
+				"RW_MIGRATION_CRASH_HELPER=1",
+				"RW_MIGRATION_CRASH_BOUNDARY="+tc.boundary,
+				"RW_MIGRATION_SOURCE_ROOT="+sourceRoot,
+				"RW_MIGRATION_TARGET_ROOT="+targetRoot,
+				"RW_MIGRATION_MARKER="+markerPath,
+			)
+			var helperOutput bytes.Buffer
+			cmd.Stdout = &helperOutput
+			cmd.Stderr = &helperOutput
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- cmd.Wait() }()
+			waitComplete := false
+			defer func() {
+				if !waitComplete {
+					_ = cmd.Process.Kill()
+					<-done
+				}
+			}()
+			deadline := time.NewTimer(15 * time.Second)
+			ticker := time.NewTicker(10 * time.Millisecond)
+			defer deadline.Stop()
+			defer ticker.Stop()
+			for {
+				select {
+				case err := <-done:
+					waitComplete = true
+					t.Fatalf("crash helper exited before marker: %v (%s)", err, helperOutput.String())
+				case <-ticker.C:
+					if _, err := os.Stat(markerPath); err == nil {
+						goto crash
+					} else if !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("stat crash marker: %v", err)
+					}
+				case <-deadline.C:
+					_ = cmd.Process.Kill()
+					<-done
+					waitComplete = true
+					t.Fatal("timed out waiting for crash helper marker")
+				}
+			}
+
+		crash:
+			if err := cmd.Process.Kill(); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-done; err == nil {
+				t.Fatal("crash helper unexpectedly exited cleanly")
+			}
+			waitComplete = true
+			if tc.targetExists {
+				entries, err := os.ReadDir(targetRoot)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(entries) != 0 {
+					t.Fatalf("crashed migration replaced existing empty target: %v", entries)
+				}
+			} else if _, err := os.Lstat(targetRoot); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("crashed migration published target state: %v", err)
+			}
+
+			verifyRepository := func(label string, repo DriverRecord) {
+				t.Helper()
+				payloadIDs, err := listRepositoryPayloadIDs(repo.Root())
+				if err != nil {
+					t.Fatalf("%s payload inventory: %v", label, err)
+				}
+				wantPayloads := make(map[string]bool, len(receipts))
+				for _, receipt := range receipts {
+					wantPayloads[receipt.ContentID] = true
+				}
+				if len(payloadIDs) != len(wantPayloads) {
+					t.Fatalf("%s payload inventory = %v, want %d entries", label, payloadIDs, len(wantPayloads))
+				}
+				for _, contentID := range payloadIDs {
+					if !wantPayloads[contentID] {
+						t.Fatalf("%s payload inventory contains unexpected %s", label, contentID)
+					}
+				}
+				for i, receipt := range receipts {
+					if err := repo.Verify(ctx, receipt.ContentID); err != nil {
+						t.Fatalf("%s payload %d verify: %v", label, i, err)
+					}
+					body, err := repo.Open(ctx, receipt.ContentID)
+					if err != nil {
+						t.Fatalf("%s payload %d open: %v", label, i, err)
+					}
+					got, readErr := io.ReadAll(body)
+					closeErr := body.Close()
+					if readErr != nil || closeErr != nil || !bytes.Equal(got, payloads[i]) || int64(len(got)) != receipt.Bytes {
+						t.Fatalf("%s payload %d read: bytes=%d want=%d readErr=%v closeErr=%v", label, i, len(got), receipt.Bytes, readErr, closeErr)
+					}
+				}
+				for role, record := range records {
+					digests, listErr := repo.ListRecordDigests(ctx, role)
+					if listErr != nil || len(digests) != 1 || digests[0] != record.Digest {
+						t.Fatalf("%s record %s inventory = %v, err=%v; want [%s]", label, role, digests, listErr, record.Digest)
+					}
+					if err := repo.VerifyRecord(ctx, record); err != nil {
+						t.Fatalf("%s record %s verify: %v", label, role, err)
+					}
+				}
+			}
+
+			sourceReader, err := OpenProfileReadOnly(RepositoryProfileDirectoryCASDev, sourceRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			verifyRepository("source after crash", sourceReader)
+			report, err := MigrateProfile(ctx, RepositoryProfileDirectoryCASDev, sourceRoot, RepositoryProfileLocalZstdV1, targetRoot)
+			if err != nil {
+				t.Fatalf("retry migration: %v", err)
+			}
+			if report.PayloadObjects != len(receipts) || report.PortableRecords != len(records) || report.SnapshotFiles != 0 || report.LogicalBytes != receipts[0].Bytes+receipts[1].Bytes || report.VerifiedTargetBytes <= 0 || report.SourceRoot != sourceRoot || report.TargetRoot != targetRoot {
+				t.Fatalf("retry migration report = %+v", report)
+			}
+			targetReader, err := OpenProfileReadOnly(RepositoryProfileLocalZstdV1, targetRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			verifyRepository("target after retry", targetReader)
+			sourceReader, err = OpenProfileReadOnly(RepositoryProfileDirectoryCASDev, sourceRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			verifyRepository("source reopened after retry", sourceReader)
+		})
+	}
+}
+
+func TestMigrateProfileProcessCrashHelperProcess(t *testing.T) {
+	if os.Getenv("RW_MIGRATION_CRASH_HELPER") != "1" {
+		return
+	}
+	ctx := context.Background()
+	_, err := migrateProfileWithHooks(ctx, RepositoryProfileDirectoryCASDev,
+		os.Getenv("RW_MIGRATION_SOURCE_ROOT"), RepositoryProfileLocalZstdV1,
+		os.Getenv("RW_MIGRATION_TARGET_ROOT"), "", nil, nil, migrationHooks{
+			afterPayload: func(string) error {
+				if os.Getenv("RW_MIGRATION_CRASH_BOUNDARY") != "after-payload" {
+					return nil
+				}
+				if err := os.WriteFile(os.Getenv("RW_MIGRATION_MARKER"), []byte("after-payload\n"), 0o600); err != nil {
+					return err
+				}
+				time.Sleep(time.Hour)
+				return nil
+			},
+			afterRecord: func(RecordRole, string) error {
+				if os.Getenv("RW_MIGRATION_CRASH_BOUNDARY") != "after-record" {
+					return nil
+				}
+				if err := os.WriteFile(os.Getenv("RW_MIGRATION_MARKER"), []byte("after-record\n"), 0o600); err != nil {
+					return err
+				}
+				time.Sleep(time.Hour)
+				return nil
+			},
+			beforePublish: func() error {
+				if os.Getenv("RW_MIGRATION_CRASH_BOUNDARY") != "before-publish" {
+					return nil
+				}
+				if err := os.WriteFile(os.Getenv("RW_MIGRATION_MARKER"), []byte("before-publish\n"), 0o600); err != nil {
+					return err
+				}
+				time.Sleep(time.Hour)
+				return nil
+			},
+		})
+	if err != nil {
+		t.Fatalf("crash helper migration: %v", err)
 	}
 }
 

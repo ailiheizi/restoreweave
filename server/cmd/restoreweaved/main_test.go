@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -294,6 +296,100 @@ func TestResolveAPIAddressKeepsCurrentAdapterOnLoopback(t *testing.T) {
 	if got, err := resolveAPIAddress("", rwconfig.APIConfig{}); err != nil || got != "" {
 		t.Fatalf("disabled address = %q, %v", got, err)
 	}
+}
+
+func TestPrepareAPIHTTPServerFailsClosedOnBindConflict(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	_, _, err = prepareAPIHTTPServer(occupied.Addr().String(), http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	if err == nil || !strings.Contains(err.Error(), "bind local HTTP adapter") {
+		t.Fatalf("bind conflict error = %v, want explicit bind failure", err)
+	}
+}
+
+func TestPrepareAPIHTTPServerServesAndCloses(t *testing.T) {
+	server, listener, err := prepareAPIHTTPServer("127.0.0.1:0", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		_ = server.Serve(listener)
+	}()
+	address := "http://" + listener.Addr().String()
+	var response *http.Response
+	for attempt := 0; attempt < 100; attempt++ {
+		response, err = http.Get(address)
+		if err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("API status = %d, want %d", response.StatusCode, http.StatusNoContent)
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-serveDone:
+	case <-time.After(time.Second):
+		t.Fatal("API serve goroutine did not stop")
+	}
+	if _, err := http.Get(address); err == nil {
+		t.Fatal("API listener remained reachable after shutdown")
+	}
+}
+
+func TestRunWithOptionsAPIBindFailureLeavesUnixSocketUnavailable(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config", "config.toml")
+	cfg := rwconfig.Default()
+	cfg.Paths = rwconfig.Paths{
+		Catalog:         filepath.Join(root, "catalog.sqlite"),
+		Repository:      filepath.Join(root, "repository"),
+		Vectors:         filepath.Join(root, "vectors"),
+		Models:          filepath.Join(root, "models"),
+		RecoveryRecords: filepath.Join(root, "recovery"),
+	}
+	if err := rwconfig.Save(configPath, cfg); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	socketPath := filepath.Join(root, "runtime", "restoreweaved.sock")
+	err = runWithOptions(context.Background(), daemonOptions{
+		configPath: configPath,
+		socketPath: socketPath,
+		apiListen:  occupied.Addr().String(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "bind local HTTP adapter") {
+		t.Fatalf("runWithOptions error = %v, want API bind failure", err)
+	}
+	if _, statErr := os.Stat(socketPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("Unix socket after API bind failure: %v", statErr)
+	}
+	conn, err := net.DialTimeout("tcp", occupied.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatalf("occupied API port was not left intact: %v", err)
+	}
+	conn.Close()
 }
 
 func TestConfigureSemanticBindingRequiresLocalZvecSelection(t *testing.T) {

@@ -245,7 +245,9 @@ func (d *Dispatcher) handleDescriptionCreate(ctx context.Context, env command.En
 	}); err != nil {
 		return descriptionWriteResult(env, started, err)
 	}
-	d.rebuildSearch(ctx, input.WorkspaceID)
+	if rebuildErr := d.rebuildSearch(ctx, input.WorkspaceID); rebuildErr != nil {
+		return degradedResult(env, started, command.DescriptionCreateData{Document: projectDescription(*document, segments)}, "description saved, but search index is unavailable: "+rebuildErr.Error())
+	}
 	return succeeded(env, started, command.DescriptionCreateData{Document: projectDescription(*document, segments)})
 }
 

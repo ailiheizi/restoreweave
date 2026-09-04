@@ -35,9 +35,10 @@ func (c *controlledClock) set(now time.Time) {
 
 type observingPublicationFencer struct {
 	PublicationFencer
-	renewed chan struct{}
-	once    sync.Once
-	calls   atomic.Int32
+	renewed    chan struct{}
+	once       sync.Once
+	calls      atomic.Int32
+	renewAfter time.Time
 }
 
 type releaseFailingPublicationFencer struct {
@@ -50,7 +51,7 @@ func (f *releaseFailingPublicationFencer) Release(context.Context, string, strin
 
 func (f *observingPublicationFencer) Acquire(ctx context.Context, domain, owner, leaseToken string, now, until time.Time) (int64, error) {
 	token, err := f.PublicationFencer.Acquire(ctx, domain, owner, leaseToken, now, until)
-	if err == nil && f.calls.Add(1) > 1 {
+	if err == nil && f.calls.Add(1) > 1 && now.After(f.renewAfter) {
 		f.once.Do(func() { close(f.renewed) })
 	}
 	return token, err
@@ -66,7 +67,7 @@ func TestPublicationFenceRenewsDuringLongPlacement(t *testing.T) {
 	addClosureTestAttempt(t, fixture, result)
 	clock := &controlledClock{now: time.Now().UTC().Add(time.Second)}
 	base := NewPublicationFencer(fixture.store, clock.nowFn)
-	fencer := &observingPublicationFencer{PublicationFencer: base, renewed: make(chan struct{})}
+	fencer := &observingPublicationFencer{PublicationFencer: base, renewed: make(chan struct{}), renewAfter: clock.nowFn()}
 	gate := &gatedChildRepository{Dir: fixture.repo, role: repository.RecordProcessorAttemptClosure, entered: make(chan struct{}), release: make(chan struct{})}
 	service := &Service{
 		Store: fixture.store, Repo: gate, SigningIdentity: fixture.service.SigningIdentity,
