@@ -14,6 +14,9 @@
   migration, encryption-boundary, and representative-corpus test evidence.
 - Refined the responsive WebUI and added sanitized Chinese and English product
   screenshots for the current unreleased preview.
+- Reworked the bilingual README into a compact product landing page and moved
+  detailed capability, storage, search, and recovery explanations into the
+  Wiki.
 
 ## v0.1.0-prealpha.1 - 2026-08-25
 

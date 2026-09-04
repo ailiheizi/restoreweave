@@ -11,6 +11,7 @@ this Wiki must not become a second source of truth.
 - [Storage and capacity](storage-and-capacity.md) — what a storage scheme is, how exact deduplication works, and how space is reported.
 - [Index status and search](index-status-and-search.md) — keyword, BGE, and future media indexes without confusing them with user tags.
 - [Recovery and boundaries](recovery-and-boundaries.md) — what remains safe when indexes or optional models are unavailable.
+- [Capability reference](capability-reference.md) — configuration, exact identity, notes, search, capacity, recovery, and current limits.
 
 ## The product in one sentence
 
